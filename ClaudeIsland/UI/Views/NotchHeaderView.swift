@@ -380,21 +380,19 @@ struct PetStateSignalIcon: View {
         case .idle:
             // A calm vertical breath: no chasing motion that could imply work.
             let active = abs(phase % 4 - 2)
-            return (0..<3).map { index in
-                (
-                    x: 5,
-                    y: CGFloat(index * 5),
-                    opacity: index == active ? 0.95 : 0.34
-                )
+            return (0..<3).map { index -> (x: CGFloat, y: CGFloat, opacity: Double) in
+                let y = CGFloat(index * 5)
+                let opacity: Double = index == active ? 0.95 : 0.34
+                return (x: 5, y: y, opacity: opacity)
             }
         case .working:
             // A short rising staircase, visibly different from the comet loop.
-            return (0..<3).map { index in
-                (
-                    x: CGFloat(index * 5),
-                    y: CGFloat(10 - index * 5),
-                    opacity: index == phase % 3 ? 1 : 0.30
-                )
+            let active = phase % 3
+            return (0..<3).map { index -> (x: CGFloat, y: CGFloat, opacity: Double) in
+                let x = CGFloat(index * 5)
+                let y = CGFloat(10 - index * 5)
+                let opacity: Double = index == active ? 1.0 : 0.30
+                return (x: x, y: y, opacity: opacity)
             }
         case .waiting:
             return []
