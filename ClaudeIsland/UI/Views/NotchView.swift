@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  NotchView.swift
 //  ClaudeIsland
 //
@@ -19,6 +20,8 @@ struct NotchView: View {
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var sessionMonitor = ClaudeSessionMonitor()
     @StateObject private var activityCoordinator = NotchActivityCoordinator.shared
+    @StateObject private var usageMonitor = UsageLimitMonitor.shared
+    @StateObject private var preferences = NotchPreferences.shared
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var previousPendingIds: Set<String> = []
     @State private var previousWaitingForInputIds: Set<String> = []
@@ -42,16 +45,36 @@ struct NotchView: View {
     /// Whether any Claude session is waiting for user input (done/ready state) within the display window
     private var hasWaitingForInput: Bool {
         let now = Date()
-        let displayDuration: TimeInterval = 30  // Show checkmark for 30 seconds
 
         return sessionMonitor.instances.contains { session in
             guard session.phase == .waitingForInput else { return false }
-            // Only show if within the 30-second display window
+            // Only show while the compact completion reminder is active.
             if let enteredAt = waitingForInputTimestamps[session.stableId] {
-                return now.timeIntervalSince(enteredAt) < displayDuration
+                return now.timeIntervalSince(enteredAt) <
+                    preferences.completionCompactDuration
             }
             return false
         }
+    }
+
+    private var compactTaskCount: Int {
+        sessionMonitor.instances.count
+    }
+
+    private var leftWingWidth: CGFloat {
+        CompactNotchMetrics.leftWingWidth
+    }
+
+    private var rightWingWidth: CGFloat {
+        CompactNotchMetrics.rightWingWidth(
+            for: preferences.compactStyle
+        )
+    }
+
+    private var physicalNotchSideClearance: CGFloat {
+        CompactNotchMetrics.userExtraWidth(
+            for: preferences.compactWidth
+        ) / 2
     }
 
     // MARK: - Sizing
@@ -67,13 +90,16 @@ struct NotchView: View {
     private var expansionWidth: CGFloat {
         // Permission indicator adds width on left side only
         let permissionIndicatorWidth: CGFloat = hasPendingPermission ? 18 : 0
+        let compactBaseWidth =
+            leftWingWidth +
+            rightWingWidth +
+            2 * physicalNotchSideClearance
 
         // Expand for processing activity
         if activityCoordinator.expandingActivity.show {
             switch activityCoordinator.expandingActivity.type {
             case .claude:
-                let baseWidth = 2 * max(0, closedNotchSize.height - 12) + 20
-                return baseWidth + permissionIndicatorWidth
+                return compactBaseWidth + permissionIndicatorWidth
             case .none:
                 break
             }
@@ -81,12 +107,19 @@ struct NotchView: View {
 
         // Expand for pending permissions (left indicator) or waiting for input (checkmark on right)
         if hasPendingPermission {
-            return 2 * max(0, closedNotchSize.height - 12) + 20 + permissionIndicatorWidth
+            return compactBaseWidth + permissionIndicatorWidth
         }
 
         // Waiting for input just shows checkmark on right, no extra left indicator
         if hasWaitingForInput {
-            return 2 * max(0, closedNotchSize.height - 12) + 20
+            return compactBaseWidth
+        }
+
+        // A persistent idle notch keeps the two animated edges visible. The
+        // detailed style adds only the task counter, so an empty project never
+        // produces an unnecessarily long island.
+        if preferences.idleBehavior == .alwaysVisible {
+            return compactBaseWidth
         }
 
         return 0
@@ -139,14 +172,16 @@ struct NotchView: View {
             VStack(spacing: 0) {
                 notchLayout
                     .frame(
-                        maxWidth: viewModel.status == .opened ? notchSize.width : nil,
+                        width: viewModel.status == .opened
+                            ? notchSize.width
+                            : closedContentWidth,
                         alignment: .top
                     )
                     .padding(
                         .horizontal,
                         viewModel.status == .opened
                             ? cornerRadiusInsets.opened.top
-                            : cornerRadiusInsets.closed.bottom
+                            : 0
                     )
                     .padding([.horizontal, .bottom], viewModel.status == .opened ? 12 : 0)
                     .background(.black)
@@ -171,6 +206,11 @@ struct NotchView: View {
                     .animation(.smooth, value: activityCoordinator.expandingActivity)
                     .animation(.smooth, value: hasPendingPermission)
                     .animation(.smooth, value: hasWaitingForInput)
+                    .animation(.smooth, value: preferences.compactStyle)
+                    .animation(
+                        .spring(response: 0.34, dampingFraction: 0.86),
+                        value: preferences.compactWidth
+                    )
                     .animation(.spring(response: 0.3, dampingFraction: 0.5), value: isBouncing)
                     .contentShape(Rectangle())
                     .onHover { hovering in
@@ -190,10 +230,8 @@ struct NotchView: View {
         .preferredColorScheme(.dark)
         .onAppear {
             sessionMonitor.startMonitoring()
-            // On non-notched devices, keep visible so users have a target to interact with
-            if !viewModel.hasPhysicalNotch {
-                isVisible = true
-            }
+            viewModel.updateVisibleSessionCount(sessionMonitor.instances.count)
+            updateIdleVisibility()
         }
         .onChange(of: viewModel.status) { oldStatus, newStatus in
             handleStatusChange(from: oldStatus, to: newStatus)
@@ -202,8 +240,12 @@ struct NotchView: View {
             handlePendingSessionsChange(sessions)
         }
         .onChange(of: sessionMonitor.instances) { _, instances in
+            viewModel.updateVisibleSessionCount(instances.count)
             handleProcessingChange()
             handleWaitingForInputChange(instances)
+        }
+        .onChange(of: preferences.idleBehavior) { _, _ in
+            updateIdleVisibility()
         }
     }
 
@@ -215,18 +257,39 @@ struct NotchView: View {
 
     /// Whether to show the expanded closed state (processing, pending permission, or waiting for input)
     private var showClosedActivity: Bool {
-        isProcessing || hasPendingPermission || hasWaitingForInput
+        isProcessing ||
+            hasPendingPermission ||
+            hasWaitingForInput ||
+            preferences.idleBehavior == .alwaysVisible
+    }
+
+    private var petMotion: VibePetMotion {
+        if hasPendingPermission { return .waiting }
+        if hasWaitingForInput { return .ready }
+        if isProcessing { return .working }
+        return .idle
     }
 
     @ViewBuilder
     private var notchLayout: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header row - always present, contains crab and spinner that persist across states
+            // Header row - always present, contains the pet and status indicator.
             headerRow
                 .frame(height: max(24, closedNotchSize.height))
 
             // Main content only when opened
             if viewModel.status == .opened {
+                if preferences.showUsageLimits,
+                   let usage = usageMonitor.snapshot {
+                    UsageLimitBar(snapshot: usage)
+                        .padding(.horizontal, 2)
+                        .padding(.bottom, 8)
+                        .transition(
+                            .move(edge: .top)
+                                .combined(with: .opacity)
+                        )
+                }
+
                 contentView
                     .frame(width: notchSize.width - 24) // Fixed width to prevent reflow
                     .transition(
@@ -246,11 +309,17 @@ struct NotchView: View {
     @ViewBuilder
     private var headerRow: some View {
         HStack(spacing: 0) {
-            // Left side - crab + optional permission indicator (visible when processing, pending, or waiting for input)
+            // Left side - pet + optional permission indicator.
             if showClosedActivity {
                 HStack(spacing: 4) {
-                    ClaudeCrabIcon(size: 14, animateLegs: isProcessing)
-                        .matchedGeometryEffect(id: "crab", in: activityNamespace, isSource: showClosedActivity)
+                    VibePetIcon(size: 19, motion: petMotion)
+                        .frame(
+                            width: CompactNotchMetrics.animationCanvasSize,
+                            height: CompactNotchMetrics.animationCanvasSize
+                        )
+                        .matchedGeometryEffect(id: "pet", in: activityNamespace, isSource: showClosedActivity)
+
+                    PetStateSignalIcon(motion: petMotion)
 
                     // Permission indicator only (amber) - waiting for input shows checkmark on right
                     if hasPendingPermission {
@@ -258,7 +327,12 @@ struct NotchView: View {
                             .matchedGeometryEffect(id: "status-indicator", in: activityNamespace, isSource: showClosedActivity)
                     }
                 }
-                .frame(width: viewModel.status == .opened ? nil : sideWidth + (hasPendingPermission ? 18 : 0))
+                .frame(
+                    width: viewModel.status == .opened
+                        ? nil
+                        : leftWingWidth +
+                            (hasPendingPermission ? 18 : 0)
+                )
                 .padding(.leading, viewModel.status == .opened ? 8 : 0)
             }
 
@@ -275,30 +349,87 @@ struct NotchView: View {
                 // Closed with activity: black spacer (with optional bounce)
                 Rectangle()
                     .fill(.black)
-                    .frame(width: closedNotchSize.width - cornerRadiusInsets.closed.top + (isBouncing ? 16 : 0))
+                    .frame(
+                        width: closedNotchSize.width +
+                            2 * physicalNotchSideClearance +
+                            (isBouncing ? 16 : 0)
+                    )
             }
 
-            // Right side - spinner when processing/pending, checkmark when waiting for input
+            // Right side - state animation, with an optional compact task count.
             if showClosedActivity {
-                if isProcessing || hasPendingPermission {
-                    ProcessingSpinner()
-                        .matchedGeometryEffect(id: "spinner", in: activityNamespace, isSource: showClosedActivity)
-                        .frame(width: viewModel.status == .opened ? 20 : sideWidth)
-                        .padding(.trailing, viewModel.status == .opened ? 0 : 4)
-                } else if hasWaitingForInput {
-                    // Checkmark for waiting-for-input on the right side
-                    ReadyForInputIndicatorIcon(size: 14, color: TerminalColors.green)
-                        .matchedGeometryEffect(id: "spinner", in: activityNamespace, isSource: showClosedActivity)
-                        .frame(width: viewModel.status == .opened ? 20 : sideWidth)
-                        .padding(.trailing, viewModel.status == .opened ? 0 : 4)
+                HStack(spacing: 5) {
+                    if viewModel.status != .opened,
+                       preferences.compactStyle == .detailed {
+                        HStack(spacing: 3) {
+                            Image(systemName: "square.stack.3d.up.fill")
+                                .font(.system(size: 7, weight: .semibold))
+                            Text("\(compactTaskCount)")
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(1)
+                        .foregroundStyle(.white.opacity(0.58))
+                        .accessibilityLabel(
+                            preferences.language.text(
+                                "\(compactTaskCount) tasks",
+                                "\(compactTaskCount) 个任务"
+                            )
+                        )
+                    }
+
+                    if isProcessing {
+                        PixelLoaderIcon(size: 19)
+                            .frame(
+                                width: CompactNotchMetrics.animationCanvasSize,
+                                height: CompactNotchMetrics.animationCanvasSize
+                            )
+                            .matchedGeometryEffect(
+                                id: "spinner",
+                                in: activityNamespace,
+                                isSource: showClosedActivity
+                            )
+                    } else if hasPendingPermission {
+                        WaitingPixelIndicatorIcon(size: 19)
+                            .frame(
+                                width: CompactNotchMetrics.animationCanvasSize,
+                                height: CompactNotchMetrics.animationCanvasSize
+                            )
+                            .matchedGeometryEffect(
+                                id: "spinner",
+                                in: activityNamespace,
+                                isSource: showClosedActivity
+                            )
+                    } else if hasWaitingForInput {
+                        ReadyForInputIndicatorIcon(
+                            size: 14,
+                            color: TerminalColors.green
+                        )
+                        .frame(
+                            width: CompactNotchMetrics.animationCanvasSize,
+                            height: CompactNotchMetrics.animationCanvasSize
+                        )
+                        .matchedGeometryEffect(
+                            id: "spinner",
+                            in: activityNamespace,
+                            isSource: showClosedActivity
+                        )
+                    } else {
+                        IdlePixelIndicatorIcon()
+                            .frame(
+                                width: CompactNotchMetrics.animationCanvasSize,
+                                height: CompactNotchMetrics.animationCanvasSize
+                            )
+                    }
                 }
+                .frame(
+                    width: viewModel.status == .opened
+                        ? 20
+                        : rightWingWidth
+                )
             }
         }
         .frame(height: closedNotchSize.height)
-    }
-
-    private var sideWidth: CGFloat {
-        max(0, closedNotchSize.height - 12) + 10
     }
 
     // MARK: - Opened Header Content
@@ -306,11 +437,11 @@ struct NotchView: View {
     @ViewBuilder
     private var openedHeaderContent: some View {
         HStack(spacing: 12) {
-            // Show static crab only if not showing activity in headerRow
-            // (headerRow handles crab + indicator when showClosedActivity is true)
+            // Show the idle pet here when the compact header is not active.
+            // The compact header owns the pet while an activity is visible.
             if !showClosedActivity {
-                ClaudeCrabIcon(size: 14)
-                    .matchedGeometryEffect(id: "crab", in: activityNamespace, isSource: !showClosedActivity)
+                VibePetIcon(size: 19)
+                    .matchedGeometryEffect(id: "pet", in: activityNamespace, isSource: !showClosedActivity)
                     .padding(.leading, 8)
             }
 
@@ -342,6 +473,11 @@ struct NotchView: View {
                 }
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(
+                preferences.language == .simplifiedChinese
+                    ? "快捷设置"
+                    : "Quick Controls"
+            )
         }
     }
 
@@ -378,6 +514,18 @@ struct NotchView: View {
 
     // MARK: - Event Handlers
 
+    private func updateIdleVisibility() {
+        if !viewModel.hasPhysicalNotch ||
+           preferences.idleBehavior == .alwaysVisible {
+            isVisible = true
+        } else if !isAnyProcessing &&
+                  !hasPendingPermission &&
+                  !hasWaitingForInput &&
+                  viewModel.status == .closed {
+            isVisible = false
+        }
+    }
+
     private func handleProcessingChange() {
         if isAnyProcessing || hasPendingPermission {
             // Show claude activity when processing or waiting for permission
@@ -393,7 +541,9 @@ struct NotchView: View {
 
             // Delay hiding the notch until animation completes
             // Don't hide on non-notched devices - users need a visible target
-            if viewModel.status == .closed && viewModel.hasPhysicalNotch {
+            if viewModel.status == .closed &&
+               viewModel.hasPhysicalNotch &&
+               preferences.idleBehavior == .smartHide {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     if !isAnyProcessing && !hasPendingPermission && !hasWaitingForInput && viewModel.status == .closed {
                         isVisible = false
@@ -407,13 +557,18 @@ struct NotchView: View {
         switch newStatus {
         case .opened, .popping:
             isVisible = true
-            // Clear waiting-for-input timestamps only when manually opened (user acknowledged)
-            if viewModel.openReason == .click || viewModel.openReason == .hover {
+            // A deliberate click acknowledges completion. Merely hovering must
+            // not consume the compact reminder and make the notch disappear.
+            if viewModel.openReason == .click {
                 waitingForInputTimestamps.removeAll()
             }
         case .closed:
             // Don't hide on non-notched devices - users need a visible target
-            guard viewModel.hasPhysicalNotch else { return }
+            guard viewModel.hasPhysicalNotch,
+                  preferences.idleBehavior == .smartHide else {
+                isVisible = true
+                return
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 if viewModel.status == .closed && !isAnyProcessing && !hasPendingPermission && !hasWaitingForInput && !activityCoordinator.expandingActivity.show {
                     isVisible = false
@@ -423,7 +578,13 @@ struct NotchView: View {
     }
 
     private func handlePendingSessionsChange(_ sessions: [SessionState]) {
-        let currentIds = Set(sessions.map { $0.stableId })
+        // Completion (`waitingForInput`) should stay compact. Only an actual
+        // permission decision is urgent enough to open the full panel.
+        let currentIds = Set(
+            sessions
+                .filter { $0.phase.isWaitingForApproval }
+                .map { $0.stableId }
+        )
         let newPendingIds = currentIds.subtracting(previousPendingIds)
 
         if !newPendingIds.isEmpty &&
@@ -455,6 +616,15 @@ struct NotchView: View {
 
         // Bounce the notch when a session newly enters waitingForInput state
         if !newWaitingIds.isEmpty {
+            // A completed task gets a compact, visible reminder. If an older
+            // notification auto-opened the panel, collapse it; never override
+            // a panel the user deliberately opened by click or hover.
+            isVisible = true
+            activityCoordinator.hideActivity()
+            if viewModel.status == .opened && viewModel.openReason == .notification {
+                viewModel.notchClose()
+            }
+
             // Get the sessions that just entered waitingForInput
             let newlyWaitingSessions = waitingForInputSessions.filter { newWaitingIds.contains($0.stableId) }
 
@@ -464,7 +634,7 @@ struct NotchView: View {
                 Task {
                     let shouldPlaySound = await shouldPlayNotificationSound(for: newlyWaitingSessions)
                     if shouldPlaySound {
-                        await MainActor.run {
+                        _ = await MainActor.run {
                             NSSound(named: soundName)?.play()
                         }
                     }
@@ -480,8 +650,11 @@ struct NotchView: View {
                 }
             }
 
-            // Schedule hiding the checkmark after 30 seconds
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [self] in
+            // Completion reminders dwell briefly, then leave the session card
+            // available without keeping the collapsed notch in alert mode.
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + preferences.completionCompactDuration
+            ) { [self] in
                 // Trigger a UI update to re-evaluate hasWaitingForInput
                 handleProcessingChange()
             }

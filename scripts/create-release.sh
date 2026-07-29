@@ -1,6 +1,7 @@
 #!/bin/bash
-# Create a release: notarize, create DMG, sign for Sparkle, upload to GitHub, update website
-set -e
+# Modified by lihao505 for Agent Notch, 2026.
+# Notarize, package, sign updates, and create an Agent Notch GitHub release.
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -9,307 +10,129 @@ EXPORT_PATH="$BUILD_DIR/export"
 RELEASE_DIR="$PROJECT_DIR/releases"
 KEYS_DIR="$PROJECT_DIR/.sparkle-keys"
 
-# GitHub repository (owner/repo format)
-GITHUB_REPO="farouqaldori/vibe-notch"
+GITHUB_REPO="${AGENT_NOTCH_GITHUB_REPO:-lihao505/agent-notch}"
+KEYCHAIN_PROFILE="${AGENT_NOTCH_KEYCHAIN_PROFILE:-AgentNotch}"
+APP_PATH="$EXPORT_PATH/Agent Notch.app"
+APP_FILE_NAME="AgentNotch"
 
-# Website repo for auto-updating appcast
-WEBSITE_DIR="${CLAUDE_ISLAND_WEBSITE:-$PROJECT_DIR/../ClaudeIsland-website}"
-WEBSITE_PUBLIC="$WEBSITE_DIR/public"
-
-APP_PATH="$EXPORT_PATH/Vibe Notch.app"
-APP_NAME="VibeNotch"
-KEYCHAIN_PROFILE="ClaudeIsland"
-
-echo "=== Creating Release ==="
-echo ""
-
-# Check if app exists
+if [ "$GITHUB_REPO" = "farouqaldori/vibe-notch" ]; then
+    echo "ERROR: refusing to publish Agent Notch artifacts to the upstream repository"
+    exit 1
+fi
 if [ ! -d "$APP_PATH" ]; then
-    echo "ERROR: App not found at $APP_PATH"
-    echo "Run ./scripts/build.sh first"
+    echo "ERROR: app not found at $APP_PATH"
+    echo "Run ./scripts/build.sh first."
+    exit 1
+fi
+if ! command -v gh >/dev/null 2>&1; then
+    echo "ERROR: GitHub CLI is required. Install and authenticate gh first."
+    exit 1
+fi
+if [ ! -f "$KEYS_DIR/eddsa_private_key" ]; then
+    echo "ERROR: missing Sparkle private key: $KEYS_DIR/eddsa_private_key"
+    echo "Run ./scripts/generate-keys.sh once and back up the key securely."
     exit 1
 fi
 
-# Get version from app
+PUBLIC_KEY=$(/usr/libexec/PlistBuddy -c "Print :SUPublicEDKey" "$APP_PATH/Contents/Info.plist")
+if [ -z "$PUBLIC_KEY" ] || [ "$PUBLIC_KEY" = "AGENT_NOTCH_SPARKLE_PUBLIC_KEY_NOT_CONFIGURED" ]; then
+    echo "ERROR: the app still contains the Sparkle public-key placeholder"
+    exit 1
+fi
+
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Contents/Info.plist")
 BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PATH/Contents/Info.plist")
+TAG="v$VERSION"
+DMG_PATH="$RELEASE_DIR/$APP_FILE_NAME-$VERSION.dmg"
+APPCAST_DIR="$RELEASE_DIR/appcast"
+DOWNLOAD_PREFIX="https://github.com/$GITHUB_REPO/releases/download/$TAG/"
 
-echo "Version: $VERSION (build $BUILD)"
-echo ""
+echo "=== Agent Notch $VERSION ($BUILD) ==="
+mkdir -p "$RELEASE_DIR" "$APPCAST_DIR"
 
-mkdir -p "$RELEASE_DIR"
-
-# ============================================
-# Step 1: Notarize the app
-# ============================================
-echo "=== Step 1: Notarizing ==="
-
-# Check if keychain profile exists
-if ! xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE" &>/dev/null; then
-    echo ""
-    echo "No keychain profile found. Set up credentials with:"
-    echo ""
-    echo "  xcrun notarytool store-credentials \"$KEYCHAIN_PROFILE\" \\"
-    echo "      --apple-id \"your@email.com\" \\"
-    echo "      --team-id \"2DKS5U9LV4\" \\"
-    echo "      --password \"xxxx-xxxx-xxxx-xxxx\""
-    echo ""
-    echo "Create an app-specific password at: https://appleid.apple.com"
-    echo ""
-    read -p "Skip notarization for now? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-    SKIP_NOTARIZATION=true
-    echo "WARNING: Skipping notarization. Users will see Gatekeeper warnings!"
-else
-    # Create zip for notarization
-    ZIP_PATH="$BUILD_DIR/$APP_NAME-$VERSION.zip"
-    echo "Creating zip for notarization..."
-    ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
-
-    echo "Submitting for notarization..."
-    xcrun notarytool submit "$ZIP_PATH" \
-        --keychain-profile "$KEYCHAIN_PROFILE" \
-        --wait
-
-    echo "Stapling notarization ticket..."
-    xcrun stapler staple "$APP_PATH"
-
-    rm "$ZIP_PATH"
-    echo "Notarization complete!"
+if ! xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE" >/dev/null 2>&1; then
+    echo "ERROR: notarization profile '$KEYCHAIN_PROFILE' is not configured"
+    echo "Create it with: xcrun notarytool store-credentials \"$KEYCHAIN_PROFILE\""
+    exit 1
 fi
 
-echo ""
+NOTARY_ZIP="$BUILD_DIR/$APP_FILE_NAME-$VERSION.zip"
+ditto -c -k --keepParent "$APP_PATH" "$NOTARY_ZIP"
+xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$KEYCHAIN_PROFILE" --wait
+xcrun stapler staple "$APP_PATH"
+rm -f "$NOTARY_ZIP"
 
-# ============================================
-# Step 2: Create DMG
-# ============================================
-echo "=== Step 2: Creating DMG ==="
-
-DMG_PATH="$RELEASE_DIR/$APP_NAME-$VERSION.dmg"
-
-# Remove existing DMG if present
-if [ -f "$DMG_PATH" ]; then
-    echo "Removing existing DMG..."
-    rm -f "$DMG_PATH"
-fi
-
-# Check if create-dmg is available (prettier DMG)
-if command -v create-dmg &> /dev/null; then
-    echo "Using create-dmg for prettier output..."
+rm -f "$DMG_PATH"
+if command -v create-dmg >/dev/null 2>&1; then
     create-dmg \
-        --volname "Vibe Notch" \
+        --volname "Agent Notch" \
         --window-size 600 400 \
         --icon-size 100 \
-        --icon "Vibe Notch.app" 150 200 \
+        --icon "Agent Notch.app" 150 200 \
         --app-drop-link 450 200 \
-        --hide-extension "Vibe Notch.app" \
+        --hide-extension "Agent Notch.app" \
         "$DMG_PATH" \
         "$APP_PATH"
 else
-    echo "Using hdiutil (install create-dmg for prettier DMG: brew install create-dmg)"
-    hdiutil create -volname "Vibe Notch" \
+    hdiutil create \
+        -volname "Agent Notch" \
         -srcfolder "$APP_PATH" \
         -ov -format UDZO \
         "$DMG_PATH"
 fi
 
-echo "DMG created: $DMG_PATH"
-echo ""
+xcrun notarytool submit "$DMG_PATH" --keychain-profile "$KEYCHAIN_PROFILE" --wait
+xcrun stapler staple "$DMG_PATH"
+xcrun stapler validate "$DMG_PATH"
 
-# ============================================
-# Step 3: Notarize the DMG
-# ============================================
-if [ -z "$SKIP_NOTARIZATION" ]; then
-    echo "=== Step 3: Notarizing DMG ==="
-
-    xcrun notarytool submit "$DMG_PATH" \
-        --keychain-profile "$KEYCHAIN_PROFILE" \
-        --wait
-
-    xcrun stapler staple "$DMG_PATH"
-    echo "DMG notarized!"
-    echo ""
-fi
-
-# ============================================
-# Step 4: Sign for Sparkle and generate appcast
-# ============================================
-echo "=== Step 4: Signing for Sparkle ==="
-
-# Find Sparkle tools
-SPARKLE_SIGN=""
-GENERATE_APPCAST=""
-
-POSSIBLE_PATHS=(
-    "$HOME/Library/Developer/Xcode/DerivedData/ClaudeIsland-*/SourcePackages/artifacts/sparkle/Sparkle/bin"
-)
-
-for path_pattern in "${POSSIBLE_PATHS[@]}"; do
-    for path in $path_pattern; do
-        if [ -x "$path/sign_update" ]; then
-            SPARKLE_SIGN="$path/sign_update"
-            GENERATE_APPCAST="$path/generate_appcast"
-            break 2
-        fi
-    done
+SPARKLE_BIN=""
+for candidate in \
+    "$PROJECT_DIR/.build/artifacts/sparkle/Sparkle/bin" \
+    "$HOME"/Library/Developer/Xcode/DerivedData/ClaudeIsland-*/SourcePackages/artifacts/sparkle/Sparkle/bin
+do
+    if [ -x "$candidate/generate_appcast" ]; then
+        SPARKLE_BIN="$candidate"
+        break
+    fi
 done
-
-if [ -z "$SPARKLE_SIGN" ]; then
-    echo "WARNING: Could not find Sparkle tools."
-    echo "Build the project in Xcode first to download Sparkle package."
-    echo ""
-    echo "Skipping Sparkle signing. You'll need to manually:"
-    echo "1. Sign the DMG with sign_update"
-    echo "2. Generate appcast with generate_appcast"
-else
-    # Check for private key
-    if [ ! -f "$KEYS_DIR/eddsa_private_key" ]; then
-        echo "WARNING: No private key found at $KEYS_DIR/eddsa_private_key"
-        echo "Run ./scripts/generate-keys.sh first"
-        echo ""
-        echo "Skipping Sparkle signing."
-    else
-        # Generate signature
-        echo "Signing DMG for Sparkle..."
-        SIGNATURE=$("$SPARKLE_SIGN" --ed-key-file "$KEYS_DIR/eddsa_private_key" "$DMG_PATH")
-
-        echo ""
-        echo "Sparkle signature:"
-        echo "$SIGNATURE"
-        echo ""
-
-        # Generate/update appcast
-        echo "Generating appcast..."
-        APPCAST_DIR="$RELEASE_DIR/appcast"
-        mkdir -p "$APPCAST_DIR"
-
-        # Copy DMG to appcast directory
-        cp "$DMG_PATH" "$APPCAST_DIR/"
-
-        # Generate appcast.xml
-        "$GENERATE_APPCAST" --ed-key-file "$KEYS_DIR/eddsa_private_key" "$APPCAST_DIR"
-
-        echo "Appcast generated at: $APPCAST_DIR/appcast.xml"
-    fi
+if [ -z "$SPARKLE_BIN" ]; then
+    echo "ERROR: Sparkle release tools were not found after building"
+    exit 1
 fi
 
-echo ""
+rm -rf "$APPCAST_DIR"
+mkdir -p "$APPCAST_DIR"
+cp "$DMG_PATH" "$APPCAST_DIR/"
+"$SPARKLE_BIN/generate_appcast" \
+    --ed-key-file "$KEYS_DIR/eddsa_private_key" \
+    --download-url-prefix "$DOWNLOAD_PREFIX" \
+    "$APPCAST_DIR"
 
-# ============================================
-# Step 5: Create GitHub Release
-# ============================================
-echo "=== Step 5: Creating GitHub Release ==="
-
-if ! command -v gh &> /dev/null; then
-    echo "WARNING: gh CLI not found. Install with: brew install gh"
-    echo "Skipping GitHub release."
-else
-    # Check if release already exists
-    if gh release view "v$VERSION" --repo "$GITHUB_REPO" &>/dev/null; then
-        echo "Release v$VERSION already exists. Updating..."
-        gh release upload "v$VERSION" "$DMG_PATH" --repo "$GITHUB_REPO" --clobber
-    else
-        echo "Creating release v$VERSION..."
-        gh release create "v$VERSION" "$DMG_PATH" \
-            --repo "$GITHUB_REPO" \
-            --title "Vibe Notch v$VERSION" \
-            --notes "## Vibe Notch v$VERSION
-
-### Installation
-1. Download \`$APP_NAME-$VERSION.dmg\`
-2. Open the DMG and drag Vibe Notch to Applications
-3. Launch Vibe Notch from Applications
-
-### Auto-updates
-After installation, Vibe Notch will automatically check for updates."
-    fi
-
-    GITHUB_DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/v$VERSION/$APP_NAME-$VERSION.dmg"
-    echo "GitHub release created: https://github.com/$GITHUB_REPO/releases/tag/v$VERSION"
-    echo "Download URL: $GITHUB_DOWNLOAD_URL"
+APPCAST_PATH="$APPCAST_DIR/appcast.xml"
+if [ ! -f "$APPCAST_PATH" ]; then
+    echo "ERROR: Sparkle did not generate appcast.xml"
+    exit 1
 fi
 
-echo ""
-
-# ============================================
-# Step 6: Update website appcast and deploy
-# ============================================
-echo "=== Step 6: Updating Website ==="
-
-if [ -d "$WEBSITE_PUBLIC" ] && [ -f "$RELEASE_DIR/appcast/appcast.xml" ]; then
-    # Copy appcast to website
-    cp "$RELEASE_DIR/appcast/appcast.xml" "$WEBSITE_PUBLIC/appcast.xml"
-
-    # Update the download URL in appcast to point to GitHub releases
-    if [ -n "$GITHUB_DOWNLOAD_URL" ]; then
-        sed -i '' "s|url=\"[^\"]*$APP_NAME-$VERSION.dmg\"|url=\"$GITHUB_DOWNLOAD_URL\"|g" "$WEBSITE_PUBLIC/appcast.xml"
-        echo "Updated appcast.xml with GitHub download URL"
-    fi
-
-    # Update src/config.ts with latest version and download URL (preserve other content)
-    CONFIG_FILE="$WEBSITE_DIR/src/config.ts"
-    if [ -n "$GITHUB_DOWNLOAD_URL" ]; then
-        if [ -f "$CONFIG_FILE" ]; then
-            # Update existing constants in-place
-            sed -i '' "s|export const LATEST_VERSION = .*|export const LATEST_VERSION = \"$VERSION\";|" "$CONFIG_FILE"
-            sed -i '' "s|export const DOWNLOAD_URL = .*|export const DOWNLOAD_URL = \"$GITHUB_DOWNLOAD_URL\";|" "$CONFIG_FILE"
-        else
-            # Create new config file
-            cat > "$CONFIG_FILE" << EOF
-// Auto-updated by create-release.sh
-export const LATEST_VERSION = "$VERSION";
-export const DOWNLOAD_URL = "$GITHUB_DOWNLOAD_URL";
-EOF
-        fi
-        echo "Updated src/config.ts with version $VERSION"
-    fi
-
-    # Deploy via Cloudflare Pages (manual wrangler deploy — the old GitHub
-    # repo is disabled, so git push is no longer an option).
-    cd "$WEBSITE_DIR" || exit 1
-
-    WRANGLER_PROJECT="${CLAUDE_ISLAND_WRANGLER_PROJECT:-vibenotch-website}"
-
-    read -p "Deploy website to Cloudflare Pages ($WRANGLER_PROJECT)? (Y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        if ! command -v wrangler >/dev/null 2>&1; then
-            echo "ERROR: wrangler not found. Install with: npm install -g wrangler"
-            echo "Skipping website deploy. Appcast updated locally at $WEBSITE_PUBLIC/appcast.xml"
-        else
-            echo "Building site..."
-            npm run build
-
-            echo "Deploying to Cloudflare Pages ($WRANGLER_PROJECT)..."
-            wrangler pages deploy dist --project-name="$WRANGLER_PROJECT"
-            echo "Website deployed!"
-        fi
-    else
-        echo "Skipped Cloudflare deploy."
-        echo "To deploy manually: cd $WEBSITE_DIR && npm run build && wrangler pages deploy dist --project-name=$WRANGLER_PROJECT"
-    fi
-
-    cd "$PROJECT_DIR"
-else
-    echo "Website directory not found or appcast not generated"
-    echo "Skipping website update."
+if gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+    echo "ERROR: release $TAG already exists; bump the version before publishing"
+    exit 1
 fi
 
-echo ""
+RELEASE_ARGS=(release create "$TAG" "$DMG_PATH" "$APPCAST_PATH"
+    --repo "$GITHUB_REPO"
+    --title "Agent Notch $TAG"
+    --notes "Agent Notch $TAG
 
-echo "=== Release Complete ==="
-echo ""
-echo "Files created:"
-echo "  - DMG: $DMG_PATH"
-if [ -f "$RELEASE_DIR/appcast/appcast.xml" ]; then
-    echo "  - Appcast: $RELEASE_DIR/appcast/appcast.xml"
+See the repository release notes and known limitations before installing.
+The DMG is signed, notarized, and distributed with a Sparkle appcast.")
+
+if [ "${AGENT_NOTCH_PUBLISH:-0}" != "1" ]; then
+    RELEASE_ARGS+=(--draft)
 fi
-if [ -n "$GITHUB_DOWNLOAD_URL" ]; then
-    echo "  - GitHub: https://github.com/$GITHUB_REPO/releases/tag/v$VERSION"
-fi
-if [ -f "$WEBSITE_PUBLIC/appcast.xml" ]; then
-    echo "  - Website: $WEBSITE_PUBLIC/appcast.xml"
+
+gh "${RELEASE_ARGS[@]}"
+echo "=== Release created: https://github.com/$GITHUB_REPO/releases/tag/$TAG ==="
+if [ "${AGENT_NOTCH_PUBLISH:-0}" != "1" ]; then
+    echo "The release is a draft. Perform installation QA before publishing it."
 fi

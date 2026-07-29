@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ProcessExecutor.swift
 //  ClaudeIsland
 //
@@ -39,17 +40,10 @@ struct ProcessResult: Sendable {
     var isSuccess: Bool { exitCode == 0 }
 }
 
-/// Protocol for executing shell commands (enables testing)
-protocol ProcessExecuting: Sendable {
-    func run(_ executable: String, arguments: [String]) async throws -> String
-    func runWithResult(_ executable: String, arguments: [String]) async -> Result<ProcessResult, ProcessExecutorError>
-    func runSync(_ executable: String, arguments: [String]) -> Result<String, ProcessExecutorError>
-}
-
 /// Default implementation using Foundation.Process
-actor ProcessExecutor: ProcessExecuting {
-    /// Shared instance (nonisolated(unsafe) required for actor init in static context)
-    nonisolated(unsafe) static let shared = ProcessExecutor()
+actor ProcessExecutor {
+    /// Shared instance for asynchronous and synchronous process helpers.
+    nonisolated static let shared = ProcessExecutor()
 
     /// Logger for process execution (nonisolated static for cross-context access)
     nonisolated static let logger = Logger(subsystem: "com.claudeisland", category: "ProcessExecutor")
@@ -65,6 +59,56 @@ actor ProcessExecutor: ProcessExecuting {
         case .failure(let error):
             throw error
         }
+    }
+
+    /// Run a potentially chatty, long-lived command without buffering its
+    /// output. This avoids filling a Pipe while commands such as `codex exec`
+    /// are still running.
+    func runDiscardingOutput(
+        _ executable: String,
+        arguments: [String],
+        standardInput: String? = nil
+    ) async throws {
+        let result: Result<Void, ProcessExecutorError> = await withCheckedContinuation { continuation in
+            let process = Process()
+            let inputPipe = standardInput.map { _ in Pipe() }
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.standardInput = inputPipe
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { completed in
+                if completed.terminationStatus == 0 {
+                    continuation.resume(returning: .success(()))
+                } else {
+                    continuation.resume(returning: .failure(.executionFailed(
+                        command: executable,
+                        exitCode: completed.terminationStatus,
+                        stderr: nil
+                    )))
+                }
+            }
+
+            do {
+                try process.run()
+                if let standardInput, let inputPipe {
+                    inputPipe.fileHandleForWriting.write(Data(standardInput.utf8))
+                    inputPipe.fileHandleForWriting.closeFile()
+                }
+            } catch let error as NSError {
+                inputPipe?.fileHandleForWriting.closeFile()
+                if error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+                    continuation.resume(returning: .failure(.commandNotFound(executable)))
+                } else {
+                    continuation.resume(returning: .failure(.launchFailed(
+                        command: executable,
+                        underlying: error
+                    )))
+                }
+            }
+        }
+
+        try result.get()
     }
 
     /// Run a command asynchronously and return a full Result with exit code and stderr

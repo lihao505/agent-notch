@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ConversationParser.swift
 //  ClaudeIsland
 //
@@ -15,6 +16,18 @@ struct UsageInfo: Equatable {
     var outputTokens: Int = 0
     var cacheReadTokens: Int = 0
     var cacheCreationTokens: Int = 0
+
+    nonisolated init(
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cacheReadTokens: Int = 0,
+        cacheCreationTokens: Int = 0
+    ) {
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheCreationTokens = cacheCreationTokens
+    }
 
     var totalTokens: Int {
         inputTokens + outputTokens
@@ -48,12 +61,13 @@ actor ConversationParser {
     /// Logger for conversation parser (nonisolated static for cross-context access)
     nonisolated static let logger = Logger(subsystem: "com.claudeisland", category: "Parser")
 
-    /// Shared ISO8601 date formatter (expensive to create, reused across all message parsing)
-    nonisolated private static let isoFormatter: ISO8601DateFormatter = {
+    /// ISO8601DateFormatter is not Sendable, so create it at the parse boundary
+    /// instead of sharing one mutable formatter across actor contexts.
+    nonisolated private static func parseISO8601(_ value: String) -> Date? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
+        return formatter.date(from: value)
+    }
 
     /// Cache of parsed conversation info, keyed by session file path
     private var cache: [String: CachedInfo] = [:]
@@ -122,10 +136,48 @@ actor ConversationParser {
             return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil)
         }
 
-        let info = parseContent(content)
+        var info = parseContent(content)
+        if info.summary == nil,
+           let codexTitle = Self.codexThreadTitle(sessionId: sessionId) {
+            info = ConversationInfo(
+                summary: codexTitle,
+                lastMessage: info.lastMessage,
+                lastMessageRole: info.lastMessageRole,
+                lastToolName: info.lastToolName,
+                firstUserMessage: info.firstUserMessage,
+                lastUserMessageDate: info.lastUserMessageDate,
+                usage: info.usage
+            )
+        }
         cache[sessionFile] = CachedInfo(modificationDate: modDate, info: info)
 
         return info
+    }
+
+    /// Codex Desktop stores the user-visible task title in a small local index.
+    /// Older synthetic transcripts may predate summary rows, so use this as a
+    /// title-only fallback instead of showing the cwd basename ("project").
+    nonisolated static func codexThreadTitle(sessionId: String) -> String? {
+        let index = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/session_index.jsonl")
+        guard let content = try? String(contentsOf: index, encoding: .utf8) else {
+            return nil
+        }
+
+        for line in content.split(separator: "\n").reversed() {
+            guard line.contains(sessionId),
+                  let data = line.data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  row["id"] as? String == sessionId,
+                  let rawTitle = row["thread_name"] as? String else {
+                continue
+            }
+            let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty {
+                return title
+            }
+        }
+        return nil
     }
 
     /// Parse JSONL content
@@ -139,8 +191,6 @@ actor ConversationParser {
         var firstUserMessage: String?
         var lastUserMessageDate: Date?
         var usage = UsageInfo()
-
-        let formatter = Self.isoFormatter
 
         // First pass: collect usage from all assistant messages
         for line in lines {
@@ -226,7 +276,7 @@ actor ConversationParser {
                     if let msgContent = message["content"] as? String {
                         if !msgContent.hasPrefix("<command-name>") && !msgContent.hasPrefix("<local-command") && !msgContent.hasPrefix("Caveat:") {
                             if let timestampStr = json["timestamp"] as? String {
-                                lastUserMessageDate = formatter.date(from: timestampStr)
+                                lastUserMessageDate = Self.parseISO8601(timestampStr)
                             }
                             foundLastUserMessage = true
                         }
@@ -555,7 +605,7 @@ actor ConversationParser {
 
         let timestamp: Date
         if let timestampStr = json["timestamp"] as? String {
-            timestamp = Self.isoFormatter.date(from: timestampStr) ?? Date()
+            timestamp = Self.parseISO8601(timestampStr) ?? Date()
         } else {
             timestamp = Date()
         }

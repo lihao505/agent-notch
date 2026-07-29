@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  HookInstaller.swift
 //  ClaudeIsland
 //
@@ -8,11 +9,13 @@
 import Foundation
 
 struct HookInstaller {
+    private static let bridgeInstallFingerprintKey = "agentBridgeInstallFingerprint"
 
     /// Install hook script and update settings.json on app launch
     static func installIfNeeded() {
         let hooksDir = ClaudePaths.hooksDir
-        let pythonScript = hooksDir.appendingPathComponent("claude-island-state.py")
+        let pythonScript = hooksDir.appendingPathComponent(ClaudePaths.hookScriptFileName)
+        let legacyScript = hooksDir.appendingPathComponent(ClaudePaths.legacyHookScriptFileName)
 
         try? FileManager.default.createDirectory(
             at: hooksDir,
@@ -27,8 +30,10 @@ struct HookInstaller {
                 ofItemAtPath: pythonScript.path
             )
         }
+        try? FileManager.default.removeItem(at: legacyScript)
 
         updateSettings(at: ClaudePaths.settingsFile)
+        installBundledBridgeIfNeeded()
     }
 
     private static func updateSettings(at settingsURL: URL) {
@@ -51,6 +56,7 @@ struct HookInstaller {
         ]
 
         var hooks = json["hooks"] as? [String: Any] ?? [:]
+        let managedPaths = managedHookScriptPaths()
 
         // Strip any existing Claude Island hooks from ALL event types first — even
         // events we no longer register. Fixes users who installed v1.3 on an older
@@ -59,7 +65,9 @@ struct HookInstaller {
         var cleanedHooks: [String: Any] = [:]
         for (event, value) in hooks {
             if let entries = value as? [[String: Any]] {
-                let cleaned = entries.compactMap { removingClaudeIslandHooks(from: $0) }
+                let cleaned = entries.compactMap {
+                    removingAgentNotchHooks(from: $0, managedPaths: managedPaths)
+                }
                 if !cleaned.isEmpty {
                     cleanedHooks[event] = cleaned
                 }
@@ -224,14 +232,14 @@ struct HookInstaller {
               let hooks = json["hooks"] as? [String: Any] else {
             return false
         }
+        let managedPaths = managedHookScriptPaths()
 
         for (_, value) in hooks {
             if let entries = value as? [[String: Any]] {
                 for entry in entries {
                     if let entryHooks = entry["hooks"] as? [[String: Any]] {
                         for hook in entryHooks {
-                            if let cmd = hook["command"] as? String,
-                               cmd.contains("claude-island-state.py") {
+                            if isAgentNotchHook(hook, managedPaths: managedPaths) {
                                 return true
                             }
                         }
@@ -245,20 +253,27 @@ struct HookInstaller {
     /// Uninstall hooks from settings.json and remove script
     static func uninstall() {
         let hooksDir = ClaudePaths.hooksDir
-        let pythonScript = hooksDir.appendingPathComponent("claude-island-state.py")
+        let pythonScript = hooksDir.appendingPathComponent(ClaudePaths.hookScriptFileName)
+        let legacyScript = hooksDir.appendingPathComponent(ClaudePaths.legacyHookScriptFileName)
         let settings = ClaudePaths.settingsFile
 
         try? FileManager.default.removeItem(at: pythonScript)
+        try? FileManager.default.removeItem(at: legacyScript)
+        _ = runBundledBridgeScript(named: "uninstall.sh")
+        UserDefaults.standard.removeObject(forKey: bridgeInstallFingerprintKey)
 
         guard let data = try? Data(contentsOf: settings),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               var hooks = json["hooks"] as? [String: Any] else {
             return
         }
+        let managedPaths = managedHookScriptPaths()
 
         for (event, value) in hooks {
             if var entries = value as? [[String: Any]] {
-                entries = entries.compactMap { removingClaudeIslandHooks(from: $0) }
+                entries = entries.compactMap {
+                    removingAgentNotchHooks(from: $0, managedPaths: managedPaths)
+                }
 
                 if entries.isEmpty {
                     hooks.removeValue(forKey: event)
@@ -300,12 +315,73 @@ struct HookInstaller {
         return "python"
     }
 
-    nonisolated private static func removingClaudeIslandHooks(from entry: [String: Any]) -> [String: Any]? {
+    /// Install or remove the bundled multi-agent adapter with the same Hooks
+    /// switch as the native Claude integration. The shell scripts own exact,
+    /// backed-up edits for Codex and CodeBuddy and deliberately refuse to take
+    /// over a conflicting PermissionRequest decision hook by default.
+    private static func installBundledBridgeIfNeeded() {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0"
+        let build = info?["CFBundleVersion"] as? String ?? "0"
+        let fingerprint = "\(version)-\(build)"
+        let installedBridge = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".multiagent-notch/bin/notch-bridge.py")
+
+        if UserDefaults.standard.string(forKey: bridgeInstallFingerprintKey) == fingerprint,
+           FileManager.default.isReadableFile(atPath: installedBridge.path) {
+            return
+        }
+
+        if runBundledBridgeScript(named: "install.sh") {
+            UserDefaults.standard.set(fingerprint, forKey: bridgeInstallFingerprintKey)
+        }
+    }
+
+    @discardableResult
+    private static func runBundledBridgeScript(named name: String) -> Bool {
+        guard let resources = Bundle.main.resourceURL else { return false }
+        let script = resources
+            .appendingPathComponent("AgentBridge", isDirectory: true)
+            .appendingPathComponent(name)
+        guard FileManager.default.isReadableFile(atPath: script.path) else { return false }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [script.path]
+        process.currentDirectoryURL = script.deletingLastPathComponent()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            // Keep the native Claude hook functional if an optional agent bridge
+            // cannot be installed on this machine.
+            return false
+        }
+    }
+
+    private static func managedHookScriptPaths() -> Set<String> {
+        let hooksDirectory = ClaudePaths.hooksDir.path
+        return Set([
+            (hooksDirectory as NSString).appendingPathComponent(ClaudePaths.hookScriptFileName),
+            (hooksDirectory as NSString).appendingPathComponent(ClaudePaths.legacyHookScriptFileName),
+        ].map { ($0 as NSString).standardizingPath })
+    }
+
+    nonisolated private static func removingAgentNotchHooks(
+        from entry: [String: Any],
+        managedPaths: Set<String>
+    ) -> [String: Any]? {
         guard var entryHooks = entry["hooks"] as? [[String: Any]] else {
             return entry
         }
 
-        entryHooks.removeAll(where: isClaudeIslandHook)
+        entryHooks.removeAll {
+            isAgentNotchHook($0, managedPaths: managedPaths)
+        }
         guard !entryHooks.isEmpty else { return nil }
 
         var updatedEntry = entry
@@ -313,8 +389,32 @@ struct HookInstaller {
         return updatedEntry
     }
 
-    nonisolated private static func isClaudeIslandHook(_ hook: [String: Any]) -> Bool {
-        let cmd = hook["command"] as? String ?? ""
-        return cmd.contains("claude-island-state.py")
+    nonisolated private static func isAgentNotchHook(
+        _ hook: [String: Any],
+        managedPaths: Set<String>
+    ) -> Bool {
+        guard let rawCommand = hook["command"] as? String else { return false }
+        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = command.split(
+            maxSplits: 1,
+            omittingEmptySubsequences: true,
+            whereSeparator: \.isWhitespace
+        )
+        guard parts.count == 2 else { return false }
+
+        let interpreter = URL(fileURLWithPath: String(parts[0])).lastPathComponent
+        guard interpreter == "python" || interpreter == "python3" else { return false }
+
+        var scriptPath = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if scriptPath.count >= 2,
+           let first = scriptPath.first,
+           let last = scriptPath.last,
+           (first == "'" && last == "'") || (first == "\"" && last == "\"") {
+            scriptPath.removeFirst()
+            scriptPath.removeLast()
+        }
+
+        let candidate = (scriptPath as NSString).standardizingPath
+        return managedPaths.contains(candidate)
     }
 }

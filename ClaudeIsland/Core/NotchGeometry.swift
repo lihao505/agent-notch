@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  NotchGeometry.swift
 //  ClaudeIsland
 //
@@ -37,14 +38,31 @@ struct NotchGeometry: Sendable {
         )
     }
 
-    /// Check if a point is in the notch area (with padding for easier interaction)
-    func isPointInNotch(_ point: CGPoint) -> Bool {
-        notchScreenRect.insetBy(dx: -10, dy: -5).contains(point)
+    /// Check if a point is in the notch area, including asymmetric compact
+    /// wings and a small interaction margin.
+    func isPointInNotch(
+        _ point: CGPoint,
+        leftExtension: CGFloat = 0,
+        rightExtension: CGFloat = 0
+    ) -> Bool {
+        var rect = notchScreenRect
+        rect.origin.x -= leftExtension + 8
+        rect.size.width += leftExtension + rightExtension + 16
+        rect = rect.insetBy(dx: 0, dy: -6)
+        return rect.contains(point)
     }
 
     /// Check if a point is in the opened panel area
     func isPointInOpenedPanel(_ point: CGPoint, size: CGSize) -> Bool {
         openedScreenRect(for: size).contains(point)
+    }
+
+    /// A forgiving hover boundary prevents rounded corners and one-frame
+    /// pointer gaps from collapsing the panel before the cursor is fully away.
+    func isPointNearOpenedPanel(_ point: CGPoint, size: CGSize) -> Bool {
+        openedScreenRect(for: size)
+            .insetBy(dx: -16, dy: -14)
+            .contains(point)
     }
 
     /// Check if a point is outside the opened panel (for closing)

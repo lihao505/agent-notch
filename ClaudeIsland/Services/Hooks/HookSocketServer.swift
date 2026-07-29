@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  HookSocketServer.swift
 //  ClaudeIsland
 //
@@ -18,6 +19,7 @@ struct HookEvent: Codable, Sendable {
     let cwd: String
     let event: String
     let status: String
+    let source: String?
     let pid: Int?
     let tty: String?
     let tool: String?
@@ -28,7 +30,7 @@ struct HookEvent: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
-        case cwd, event, status, pid, tty, tool
+        case cwd, event, status, source, pid, tty, tool
         case toolInput = "tool_input"
         case toolUseId = "tool_use_id"
         case notificationType = "notification_type"
@@ -36,11 +38,12 @@ struct HookEvent: Codable, Sendable {
     }
 
     /// Create a copy with updated toolUseId
-    init(sessionId: String, cwd: String, event: String, status: String, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?) {
+    init(sessionId: String, cwd: String, event: String, status: String, source: String?, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?) {
         self.sessionId = sessionId
         self.cwd = cwd
         self.event = event
         self.status = status
+        self.source = source
         self.pid = pid
         self.tty = tty
         self.tool = tool
@@ -78,7 +81,12 @@ struct HookEvent: Codable, Sendable {
 
     /// Whether this event expects a response (permission request)
     nonisolated var expectsResponse: Bool {
-        event == "PermissionRequest" && status == "waiting_for_approval"
+        guard status == "waiting_for_approval" else { return false }
+        if event == "PermissionRequest" {
+            return true
+        }
+        return event == "PreToolUse"
+            && (tool == "AskUserQuestion" || tool == "ExitPlanMode")
     }
 }
 
@@ -86,6 +94,12 @@ struct HookEvent: Codable, Sendable {
 struct HookResponse: Codable {
     let decision: String // "allow", "deny", or "ask"
     let reason: String?
+    let updatedInput: [String: AnyCodable]?
+
+    enum CodingKeys: String, CodingKey {
+        case decision, reason
+        case updatedInput = "updated_input"
+    }
 }
 
 /// Pending permission request waiting for user decision
@@ -213,16 +227,44 @@ class HookSocketServer {
     }
 
     /// Respond to a pending permission request by toolUseId
-    func respondToPermission(toolUseId: String, decision: String, reason: String? = nil) {
+    func respondToPermission(
+        toolUseId: String,
+        sessionId: String,
+        decision: String,
+        reason: String? = nil,
+        updatedInput: [String: AnyCodable]? = nil,
+        completion: @escaping @Sendable (Bool) -> Void = { _ in }
+    ) {
         queue.async { [weak self] in
-            self?.sendPermissionResponse(toolUseId: toolUseId, decision: decision, reason: reason)
+            guard let self else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let sent = self.sendPermissionResponse(
+                toolUseId: toolUseId,
+                decision: decision,
+                reason: reason,
+                updatedInput: updatedInput
+            )
+            || self.sendPermissionResponseBySession(
+                sessionId: sessionId,
+                decision: decision,
+                reason: reason,
+                updatedInput: updatedInput
+            )
+            DispatchQueue.main.async { completion(sent) }
         }
     }
 
     /// Respond to permission by sessionId (finds the most recent pending for that session)
     func respondToPermissionBySession(sessionId: String, decision: String, reason: String? = nil) {
         queue.async { [weak self] in
-            self?.sendPermissionResponseBySession(sessionId: sessionId, decision: decision, reason: reason)
+            _ = self?.sendPermissionResponseBySession(
+                sessionId: sessionId,
+                decision: decision,
+                reason: reason,
+                updatedInput: nil
+            )
         }
     }
 
@@ -441,6 +483,7 @@ class HookSocketServer {
                 cwd: event.cwd,
                 event: event.event,
                 status: event.status,
+                source: event.source,
                 pid: event.pid,
                 tty: event.tty,
                 tool: event.tool,
@@ -470,41 +513,47 @@ class HookSocketServer {
         eventHandler?(event)
     }
 
-    private func sendPermissionResponse(toolUseId: String, decision: String, reason: String?) {
+    @discardableResult
+    private func sendPermissionResponse(
+        toolUseId: String,
+        decision: String,
+        reason: String?,
+        updatedInput: [String: AnyCodable]? = nil
+    ) -> Bool {
         permissionsLock.lock()
         guard let pending = pendingPermissions.removeValue(forKey: toolUseId) else {
             permissionsLock.unlock()
             logger.debug("No pending permission for toolUseId: \(toolUseId.prefix(12), privacy: .public)")
-            return
+            return false
         }
         permissionsLock.unlock()
 
-        let response = HookResponse(decision: decision, reason: reason)
+        let response = HookResponse(
+            decision: decision,
+            reason: reason,
+            updatedInput: updatedInput
+        )
         guard let data = try? JSONEncoder().encode(response) else {
             close(pending.clientSocket)
-            return
+            return false
         }
 
         let age = Date().timeIntervalSince(pending.receivedAt)
         logger.info("Sending response: \(decision, privacy: .public) for \(pending.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public) (age: \(String(format: "%.1f", age), privacy: .public)s)")
 
-        data.withUnsafeBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else {
-                logger.error("Failed to get data buffer address")
-                return
-            }
-            let result = write(pending.clientSocket, baseAddress, data.count)
-            if result < 0 {
-                logger.error("Write failed with errno: \(errno)")
-            } else {
-                logger.debug("Write succeeded: \(result) bytes")
-            }
-        }
+        let writeSuccess = writePermissionResponse(data, to: pending.clientSocket)
 
         close(pending.clientSocket)
+        return writeSuccess
     }
 
-    private func sendPermissionResponseBySession(sessionId: String, decision: String, reason: String?) {
+    @discardableResult
+    private func sendPermissionResponseBySession(
+        sessionId: String,
+        decision: String,
+        reason: String?,
+        updatedInput: [String: AnyCodable]?
+    ) -> Bool {
         permissionsLock.lock()
         let matchingPending = pendingPermissions.values
             .filter { $0.sessionId == sessionId }
@@ -514,41 +563,72 @@ class HookSocketServer {
         guard let pending = matchingPending else {
             permissionsLock.unlock()
             logger.debug("No pending permission for session: \(sessionId.prefix(8), privacy: .public)")
-            return
+            return false
         }
 
         pendingPermissions.removeValue(forKey: pending.toolUseId)
         permissionsLock.unlock()
 
-        let response = HookResponse(decision: decision, reason: reason)
+        let response = HookResponse(
+            decision: decision,
+            reason: reason,
+            updatedInput: updatedInput
+        )
         guard let data = try? JSONEncoder().encode(response) else {
             close(pending.clientSocket)
             permissionFailureHandler?(sessionId, pending.toolUseId)
-            return
+            return false
         }
 
         let age = Date().timeIntervalSince(pending.receivedAt)
         logger.info("Sending response: \(decision, privacy: .public) for \(sessionId.prefix(8), privacy: .public) tool:\(pending.toolUseId.prefix(12), privacy: .public) (age: \(String(format: "%.1f", age), privacy: .public)s)")
 
-        var writeSuccess = false
-        data.withUnsafeBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else {
-                logger.error("Failed to get data buffer address")
-                return
-            }
-            let result = write(pending.clientSocket, baseAddress, data.count)
-            if result < 0 {
-                logger.error("Write failed with errno: \(errno)")
-            } else {
-                logger.debug("Write succeeded: \(result) bytes")
-                writeSuccess = true
-            }
-        }
+        let writeSuccess = writePermissionResponse(data, to: pending.clientSocket)
 
         close(pending.clientSocket)
 
         if !writeSuccess {
             permissionFailureHandler?(sessionId, pending.toolUseId)
+        }
+        return writeSuccess
+    }
+
+    /// Permission clients wait in recv(), so switch their accepted socket back
+    /// to blocking mode and write the complete small JSON response. A single
+    /// non-blocking write can return EAGAIN even for a tiny payload; treating
+    /// that as a completed approval is what made the notch buttons cosmetic.
+    private func writePermissionResponse(_ data: Data, to clientSocket: Int32) -> Bool {
+        let flags = fcntl(clientSocket, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(clientSocket, F_SETFL, flags & ~O_NONBLOCK)
+        }
+
+        return data.withUnsafeBytes { bytes -> Bool in
+            guard let baseAddress = bytes.baseAddress else {
+                logger.error("Failed to get permission response buffer")
+                return false
+            }
+
+            var offset = 0
+            while offset < data.count {
+                let written = write(
+                    clientSocket,
+                    baseAddress.advanced(by: offset),
+                    data.count - offset
+                )
+                if written > 0 {
+                    offset += written
+                    continue
+                }
+                if written < 0 && errno == EINTR {
+                    continue
+                }
+                logger.error("Permission response write failed at \(offset) of \(data.count) bytes, errno: \(errno)")
+                return false
+            }
+
+            logger.debug("Permission response write succeeded: \(data.count) bytes")
+            return true
         }
     }
 }

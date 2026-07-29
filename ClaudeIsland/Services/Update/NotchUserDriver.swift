@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  NotchUserDriver.swift
 //  ClaudeIsland
 //
@@ -55,6 +56,10 @@ class UpdateManager: NSObject, ObservableObject {
     // MARK: - Public API
 
     func checkForUpdates() {
+        guard AppDelegate.hasConfiguredUpdateSigningKey else {
+            state = .error(message: "Updates are not configured in this build")
+            return
+        }
         state = .checking
         if let updater = AppDelegate.shared?.updater {
             updater.checkForUpdates()

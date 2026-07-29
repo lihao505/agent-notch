@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ClaudeIslandApp.swift
 //  ClaudeIsland
 //
@@ -12,9 +13,10 @@ struct ClaudeIslandApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        // We use a completely custom window, so no default scene needed
         Settings {
-            EmptyView()
+            NotchStudioSettingsView()
         }
+        .defaultSize(width: 860, height: 620)
+        .windowResizability(.contentMinSize)
     }
 }

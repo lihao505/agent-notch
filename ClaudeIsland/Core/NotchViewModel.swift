@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  NotchViewModel.swift
 //  ClaudeIsland
 //
@@ -45,12 +46,14 @@ class NotchViewModel: ObservableObject {
     @Published var openReason: NotchOpenReason = .unknown
     @Published var contentType: NotchContentType = .instances
     @Published var isHovering: Bool = false
+    @Published private(set) var visibleSessionCount: Int = 0
 
     // MARK: - Dependencies
 
     private let screenSelector = ScreenSelector.shared
     private let soundSelector = SoundSelector.shared
     private let claudeDirSelector = ClaudeDirSelector.shared
+    let preferences = NotchPreferences.shared
 
     // MARK: - Geometry
 
@@ -64,28 +67,35 @@ class NotchViewModel: ObservableObject {
 
     /// Dynamic opened size based on content type
     var openedSize: CGSize {
+        let configuredWidth = min(
+            max(CGFloat(preferences.panelWidth), 480),
+            screenRect.width - 48
+        )
+        let configuredHeight = min(
+            max(CGFloat(preferences.panelHeight), 360),
+            windowHeight - 32
+        )
+
         switch contentType {
         case .chat:
-            // Large size for chat view
-            return CGSize(
-                width: min(screenRect.width * 0.5, 600),
-                height: 580
-            )
+            return CGSize(width: configuredWidth, height: configuredHeight)
         case .menu:
-            // Base height covers all static rows (Back, 3 picker rows, 3 toggles,
-            // Accessibility, Update, GitHub, Quit + 4 dividers + padding).
-            // Picker expansion deltas added on top when expanded.
+            // The in-notch control center is intentionally compact. Detailed
+            // preferences live in the standalone Notch Studio window.
             return CGSize(
-                width: min(screenRect.width * 0.4, 480),
-                height: 540
-                    + screenSelector.expandedPickerHeight
-                    + soundSelector.expandedPickerHeight
-                    + claudeDirSelector.expandedPickerHeight
+                width: configuredWidth,
+                height: min(configuredHeight, 390)
             )
         case .instances:
+            let usageHeight: CGFloat = preferences.showUsageLimits ? 44 : 0
+            let listHeight: CGFloat = visibleSessionCount == 0
+                ? 82
+                : CGFloat(visibleSessionCount) * 58 + 8
+            let contentDrivenHeight = max(180, 64 + usageHeight + listHeight)
+
             return CGSize(
-                width: min(screenRect.width * 0.4, 480),
-                height: 320
+                width: configuredWidth,
+                height: min(configuredHeight, contentDrivenHeight)
             )
         }
     }
@@ -127,6 +137,25 @@ class NotchViewModel: ObservableObject {
         claudeDirSelector.$isPickerExpanded
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+
+        preferences.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
+        // A control should take effect while the pointer is already over the
+        // notch too. Without this, changing a delay only affects a later
+        // enter/leave cycle and makes the setting look decorative.
+        preferences.$expandOnHover
+            .combineLatest(
+                preferences.$hoverDelay,
+                preferences.$collapseOnMouseLeave,
+                preferences.$collapseDelay
+            )
+            .dropFirst()
+            .sink { [weak self] _, _, _, _ in
+                self?.reschedulePointerTransition()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Event Handling
@@ -156,9 +185,35 @@ class NotchViewModel: ObservableObject {
     /// The chat session we're viewing (persists across close/open)
     private var currentChatSession: SessionState?
 
+    private var compactHitExtra: CGFloat {
+        CompactNotchMetrics.userExtraWidth(
+            for: preferences.compactWidth
+        ) / 2
+    }
+
+    private var compactLeftHitExtension: CGFloat {
+        CompactNotchMetrics.leftWingWidth + compactHitExtra
+    }
+
+    private var compactRightHitExtension: CGFloat {
+        CompactNotchMetrics.rightWingWidth(
+            for: preferences.compactStyle
+        ) + compactHitExtra
+    }
+
+    private func isPointInCompactNotch(_ location: CGPoint) -> Bool {
+        geometry.isPointInNotch(
+            location,
+            leftExtension: compactLeftHitExtension,
+            rightExtension: compactRightHitExtension
+        )
+    }
+
     private func handleMouseMove(_ location: CGPoint) {
-        let inNotch = geometry.isPointInNotch(location)
-        let inOpened = status == .opened && geometry.isPointInOpenedPanel(location, size: openedSize)
+        let inNotch = isPointInCompactNotch(location)
+        let inOpened =
+            status == .opened &&
+            geometry.isPointNearOpenedPanel(location, size: openedSize)
 
         let newHovering = inNotch || inOpened
 
@@ -167,19 +222,49 @@ class NotchViewModel: ObservableObject {
 
         isHovering = newHovering
 
-        // Cancel any pending hover timer
+        schedulePointerTransition()
+    }
+
+    /// Schedules the appropriate transition using the *current* preferences.
+    /// Both mouse movement and a live Settings change call this so Studio's
+    /// sliders are genuinely live controls rather than persisted-only values.
+    private func schedulePointerTransition() {
         hoverTimer?.cancel()
         hoverTimer = nil
 
-        // Start hover timer to auto-expand after 1 second
-        if isHovering && (status == .closed || status == .popping) {
+        if isHovering,
+           preferences.expandOnHover,
+           (status == .closed || status == .popping) {
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self = self, self.isHovering else { return }
                 self.notchOpen(reason: .hover)
             }
             hoverTimer = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + max(0, preferences.hoverDelay),
+                execute: workItem
+            )
+        } else if !isHovering,
+                  preferences.collapseOnMouseLeave,
+                  status == .opened {
+            // Wait until the pointer has stayed fully outside the expanded
+            // boundary. This avoids collapsing while crossing rounded edges
+            // or moving toward nearby menu-bar controls.
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self = self, !self.isHovering,
+                      self.status == .opened else { return }
+                self.notchClose()
+            }
+            hoverTimer = workItem
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + max(0, preferences.collapseDelay),
+                execute: workItem
+            )
         }
+    }
+
+    private func reschedulePointerTransition() {
+        schedulePointerTransition()
     }
 
     private func handleMouseDown() {
@@ -192,13 +277,14 @@ class NotchViewModel: ObservableObject {
                 // Re-post the click so it reaches the window/app behind us
                 repostClickAt(location)
             } else if geometry.notchScreenRect.contains(location) {
-                // Clicking notch while opened - only close if NOT in chat mode
-                if !isInChatMode {
-                    notchClose()
-                }
+                // Header controls (including Quick Controls) live beside the
+                // physical notch. Do not let the global mouse monitor close
+                // the panel before their SwiftUI button actions are delivered.
+                // Users can still close via outside click or mouse-leave.
+                return
             }
         case .closed, .popping:
-            if geometry.isPointInNotch(location) {
+            if isPointInCompactNotch(location) {
                 notchOpen(reason: .click)
             }
         }
@@ -278,6 +364,10 @@ class NotchViewModel: ObservableObject {
 
     func toggleMenu() {
         contentType = contentType == .menu ? .instances : .menu
+    }
+
+    func updateVisibleSessionCount(_ count: Int) {
+        visibleSessionCount = max(0, count)
     }
 
     func showChat(for session: SessionState) {

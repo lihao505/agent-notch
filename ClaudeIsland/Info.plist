@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Modified by lihao505 for Agent Notch, 2026. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Vibe Notch</string>
+    <string>Agent Notch</string>
     <key>CFBundleDisplayName</key>
-    <string>Vibe Notch</string>
+    <string>Agent Notch</string>
     <key>CFBundleIdentifier</key>
     <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleVersion</key>
@@ -15,14 +16,14 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright 2025. All rights reserved.</string>
+    <string>Copyright 2026 lihao505. Licensed under Apache-2.0.</string>
 
     <!-- Sparkle Update Configuration -->
     <key>SUFeedURL</key>
-    <string>https://vibenotch.app/appcast.xml</string>
+    <string>https://github.com/lihao505/agent-notch/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
-    <string>w5NwH5KRfE7LfeZ09J8lWx3UQrWTqUbfH4HHBa1OPRk=</string>
+    <string>n7FnG6HZeHLpPapu3pwnkZl/ghCUNUbjGBbeysfns80=</string>
     <key>SUEnableAutomaticChecks</key>
-    <true/>
+    <false/>
 </dict>
 </plist>

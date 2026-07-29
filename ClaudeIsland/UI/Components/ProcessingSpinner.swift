@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ProcessingSpinner.swift
 //  ClaudeIsland
 //
@@ -12,9 +13,13 @@ struct ProcessingSpinner: View {
     @State private var phase: Int = 0
 
     private let symbols = ["·", "✢", "✳", "∗", "✻", "✽"]
-    private let color = Color(red: 0.85, green: 0.47, blue: 0.34) // Claude orange
+    private let color: Color
 
     private let timer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
+
+    init(color: Color = Color(red: 0.85, green: 0.47, blue: 0.34)) {
+        self.color = color
+    }
 
     var body: some View {
         Text(symbols[phase % symbols.count])

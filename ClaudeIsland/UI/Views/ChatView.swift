@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ChatView.swift
 //  ClaudeIsland
 //
@@ -13,6 +14,7 @@ struct ChatView: View {
     let initialSession: SessionState
     let sessionMonitor: ClaudeSessionMonitor
     @ObservedObject var viewModel: NotchViewModel
+    @StateObject private var preferences = NotchPreferences.shared
 
     @State private var inputText: String = ""
     @State private var history: [ChatHistoryItem] = []
@@ -24,6 +26,8 @@ struct ChatView: View {
     @State private var newMessageCount: Int = 0
     @State private var previousHistoryCount: Int = 0
     @State private var isBottomVisible: Bool = true
+    @State private var isSendingMessage: Bool = false
+    @State private var sendErrorMessage: String?
     @FocusState private var isInputFocused: Bool
 
     init(sessionId: String, initialSession: SessionState, sessionMonitor: ClaudeSessionMonitor, viewModel: NotchViewModel) {
@@ -69,8 +73,8 @@ struct ChatView: View {
 
                 // Approval bar, interactive prompt, or Input bar
                 if let tool = approvalTool {
-                    if tool == "AskUserQuestion" {
-                        // Interactive tools - show prompt to answer in terminal
+                    if tool == "AskUserQuestion" || tool == "ExitPlanMode" {
+                        // Interactive tools - answer or review directly in the notch
                         interactivePromptBar
                             .transition(.asymmetric(
                                 insertion: .opacity.combined(with: .move(edge: .bottom)),
@@ -182,30 +186,93 @@ struct ChatView: View {
     @State private var isHeaderHovered = false
 
     private var chatHeader: some View {
-        Button {
-            viewModel.exitChat()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white.opacity(isHeaderHovered ? 1.0 : 0.6))
-                    .frame(width: 24, height: 24)
+        HStack(spacing: 8) {
+            Button {
+                viewModel.exitChat()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white.opacity(isHeaderHovered ? 1.0 : 0.6))
+                        .frame(width: 24, height: 24)
 
-                Text(session.displayTitle)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white.opacity(isHeaderHovered ? 1.0 : 0.85))
-                    .lineLimit(1)
+                    AgentBadge(source: session.source)
 
-                Spacer()
+                    Text(session.displayTitle)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white.opacity(isHeaderHovered ? 1.0 : 0.85))
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isHeaderHovered ? Color.white.opacity(0.08) : Color.clear)
-            )
+            .buttonStyle(.plain)
+
+            Menu {
+                Button {
+                    preferences.clearApprovalMode(for: sessionId)
+                } label: {
+                    Label(
+                        t("Follow default", "跟随默认"),
+                        systemImage: preferences.hasApprovalOverride(for: sessionId)
+                            ? "circle"
+                            : "checkmark"
+                    )
+                }
+
+                Divider()
+
+                ForEach(ApprovalMode.allCases) { mode in
+                    Button {
+                        preferences.setApprovalMode(mode, for: sessionId)
+                    } label: {
+                        Label(
+                            approvalModeTitle(mode),
+                            systemImage:
+                                preferences.hasApprovalOverride(for: sessionId)
+                                && preferences.approvalMode(for: sessionId) == mode
+                                ? "checkmark"
+                                : approvalModeIcon(mode)
+                        )
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: approvalModeIcon(
+                        preferences.approvalMode(for: sessionId)
+                    ))
+                    Text(approvalModeTitle(
+                        preferences.approvalMode(for: sessionId)
+                    ))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .opacity(0.55)
+                }
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.78))
+                .padding(.horizontal, 9)
+                .frame(height: 25)
+                .background(
+                    Capsule().fill(session.source.accentColor.opacity(0.16))
+                )
+                .overlay {
+                    Capsule().stroke(
+                        session.source.accentColor.opacity(0.25),
+                        lineWidth: 1
+                    )
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(isHeaderHovered ? session.source.accentColor.opacity(0.12) : Color.clear)
+        )
         .onHover { isHeaderHovered = $0 }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -221,6 +288,32 @@ struct ChatView: View {
             .allowsHitTesting(false)
         }
         .zIndex(1) // Render above message list
+    }
+
+    private func approvalModeTitle(_ mode: ApprovalMode) -> String {
+        switch mode {
+        case .ask:
+            return t("Once", "单次")
+        case .auto:
+            return t("Auto", "自动")
+        case .trusted:
+            return t("Trust", "信任")
+        }
+    }
+
+    private func approvalModeIcon(_ mode: ApprovalMode) -> String {
+        switch mode {
+        case .ask:
+            return "hand.raised.fill"
+        case .auto:
+            return "bolt.fill"
+        case .trusted:
+            return "lock.open.fill"
+        }
+    }
+
+    private func t(_ english: String, _ chinese: String) -> String {
+        preferences.language.text(english, chinese)
     }
 
     /// Whether the session is currently processing
@@ -282,7 +375,10 @@ struct ChatView: View {
 
                     // Processing indicator at bottom (first due to flip)
                     if isProcessing {
-                        ProcessingIndicatorView(turnId: lastUserMessageId)
+                        ProcessingIndicatorView(
+                            turnId: lastUserMessageId,
+                            color: session.source.accentColor
+                        )
                             .padding(.horizontal, 16)
                             .scaleEffect(x: 1, y: -1)
                             .transition(.asymmetric(
@@ -292,7 +388,11 @@ struct ChatView: View {
                     }
 
                     ForEach(history.reversed()) { item in
-                        MessageItemView(item: item, sessionId: sessionId)
+                        MessageItemView(
+                            item: item,
+                            sessionId: sessionId,
+                            accentColor: session.source.accentColor
+                        )
                             .padding(.horizontal, 16)
                             .scaleEffect(x: 1, y: -1)
                             .transition(.asymmetric(
@@ -353,14 +453,51 @@ struct ChatView: View {
 
     // MARK: - Input Bar
 
-    /// Can send messages only if session is in tmux
+    /// Claude/CLI agents receive keystrokes through tmux. Desktop-backed
+    /// sessions are resumed non-interactively through their local CLIs.
     private var canSendMessages: Bool {
-        session.isInTmux && session.tty != nil
+        guard !isSendingMessage else { return false }
+
+        if session.source == .codex || session.source == .codebuddy {
+            let executable = session.source == .codex
+                ? codexExecutablePath
+                : codeBuddyExecutablePath
+            guard executable != nil else { return false }
+            switch session.phase {
+            case .idle, .waitingForInput:
+                return true
+            default:
+                return false
+            }
+        }
+
+        return session.isInTmux && session.tty != nil
+    }
+
+    private var inputPlaceholder: String {
+        if canSendMessages {
+            return "Message \(session.source.displayName)..."
+        }
+        if isSendingMessage {
+            return "Sending to \(session.source.displayName)..."
+        }
+        if session.source == .codex {
+            return codexExecutablePath == nil
+                ? "Install Codex CLI to enable messaging"
+                : "Wait for Codex to finish"
+        }
+        if session.source == .codebuddy {
+            return codeBuddyExecutablePath == nil
+                ? "Install CodeBuddy CLI to enable messaging"
+                : "Wait for CodeBuddy to finish"
+        }
+        return "Open the agent in tmux to enable messaging"
     }
 
     private var inputBar: some View {
-        HStack(spacing: 10) {
-            TextField(canSendMessages ? "Message Claude..." : "Open Claude Code in tmux to enable messaging", text: $inputText)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                TextField(inputPlaceholder, text: $inputText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundColor(canSendMessages ? .white : .white.opacity(0.4))
@@ -380,15 +517,35 @@ struct ChatView: View {
                     sendMessage()
                 }
 
-            Button {
-                sendMessage()
-            } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 28))
-                    .foregroundColor(!canSendMessages || inputText.isEmpty ? .white.opacity(0.2) : .white.opacity(0.9))
+                Button {
+                    sendMessage()
+                } label: {
+                    if isSendingMessage {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(session.source.accentColor)
+                            .frame(width: 28, height: 28)
+                    } else {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(
+                                !canSendMessages || inputText.isEmpty
+                                    ? .white.opacity(0.2)
+                                    : session.source.accentColor
+                            )
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSendMessages || inputText.isEmpty)
             }
-            .buttonStyle(.plain)
-            .disabled(!canSendMessages || inputText.isEmpty)
+
+            if let sendErrorMessage {
+                Text(sendErrorMessage)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.red.opacity(0.85))
+                    .lineLimit(2)
+                    .padding(.horizontal, 4)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -419,12 +576,26 @@ struct ChatView: View {
 
     // MARK: - Interactive Prompt Bar
 
-    /// Bar for interactive tools like AskUserQuestion that need terminal input
+    /// Native structured UI for questions and plan review.
+    @ViewBuilder
     private var interactivePromptBar: some View {
-        ChatInteractivePromptBar(
-            isInTmux: session.isInTmux,
-            onGoToTerminal: { focusTerminal() }
-        )
+        if let permission = session.activePermission {
+            StructuredInteractivePromptBar(
+                context: permission,
+                isInTmux: session.isInTmux,
+                onSubmitAnswers: { answers in
+                    sessionMonitor.answerQuestions(
+                        sessionId: sessionId,
+                        answers: answers
+                    )
+                },
+                onApprovePlan: {
+                    sessionMonitor.approvePlan(sessionId: sessionId)
+                },
+                onDeny: { denyPermission() },
+                onGoToTerminal: { focusTerminal() }
+            )
+        }
     }
 
     // MARK: - Autoscroll Management
@@ -464,26 +635,115 @@ struct ChatView: View {
 
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-
-        inputText = ""
+        guard canSendMessages, !text.isEmpty else { return }
 
         // Resume autoscroll when user sends a message
         resumeAutoscroll()
         shouldScrollToBottom = true
+        isSendingMessage = true
+        sendErrorMessage = nil
 
         // Don't add to history here - it will be synced from JSONL when UserPromptSubmit event fires
         Task {
-            await sendToSession(text)
+            if let errorMessage = await sendToSession(text) {
+                sendErrorMessage = errorMessage
+            } else {
+                inputText = ""
+            }
+            isSendingMessage = false
         }
     }
 
-    private func sendToSession(_ text: String) async {
-        guard session.isInTmux else { return }
-        guard let tty = session.tty else { return }
+    private func sendToSession(_ text: String) async -> String? {
+        if session.source == .codex {
+            guard let executable = codexExecutablePath else {
+                return "Codex CLI was not found."
+            }
+            do {
+                try await ProcessExecutor.shared.runDiscardingOutput(
+                    executable,
+                    arguments: [
+                        "exec", "resume",
+                        "--all",
+                        "--skip-git-repo-check",
+                        sessionId,
+                        "-"
+                    ],
+                    standardInput: text
+                )
+                return nil
+            } catch {
+                return "Could not send to Codex: \(error.localizedDescription)"
+            }
+        }
+
+        if session.source == .codebuddy {
+            guard let executable = codeBuddyExecutablePath else {
+                return "CodeBuddy CLI was not found."
+            }
+            do {
+                try await ProcessExecutor.shared.runDiscardingOutput(
+                    executable,
+                    arguments: [
+                        "--resume", sessionId,
+                        "--print"
+                    ],
+                    standardInput: text
+                )
+                return nil
+            } catch {
+                return "Could not send to CodeBuddy: \(error.localizedDescription)"
+            }
+        }
+
+        guard session.isInTmux, let tty = session.tty else {
+            return "This agent is not connected through tmux."
+        }
 
         if let target = await findTmuxTarget(tty: tty) {
-            _ = await ToolApprovalHandler.shared.sendMessage(text, to: target)
+            let sent = await ToolApprovalHandler.shared.sendMessage(text, to: target)
+            return sent ? nil : "Could not send the message to tmux."
+        }
+        return "Could not find the agent's tmux pane."
+    }
+
+    private var codexExecutablePath: String? {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser.path
+        var candidates = [
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            "\(home)/.local/bin/codex"
+        ]
+
+        if let path = Foundation.ProcessInfo.processInfo.environment["PATH"] {
+            candidates.append(contentsOf: path
+                .split(separator: ":")
+                .map { "\($0)/codex" })
+        }
+
+        return candidates.first {
+            fileManager.isExecutableFile(atPath: $0)
+        }
+    }
+
+    private var codeBuddyExecutablePath: String? {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser.path
+        var candidates = [
+            "/opt/homebrew/bin/codebuddy",
+            "/usr/local/bin/codebuddy",
+            "\(home)/.local/bin/codebuddy"
+        ]
+
+        if let path = Foundation.ProcessInfo.processInfo.environment["PATH"] {
+            candidates.append(contentsOf: path
+                .split(separator: ":")
+                .map { "\($0)/codebuddy" })
+        }
+
+        return candidates.first {
+            fileManager.isExecutableFile(atPath: $0)
         }
     }
 
@@ -523,13 +783,14 @@ struct ChatView: View {
 struct MessageItemView: View {
     let item: ChatHistoryItem
     let sessionId: String
+    let accentColor: Color
 
     var body: some View {
         switch item.type {
         case .user(let text):
             UserMessageView(text: text)
         case .assistant(let text):
-            AssistantMessageView(text: text)
+            AssistantMessageView(text: text, accentColor: accentColor)
         case .toolCall(let tool):
             ToolCallView(tool: tool, sessionId: sessionId)
         case .thinking(let text):
@@ -619,6 +880,7 @@ struct UserMessageView: View {
 
 struct AssistantMessageView: View {
     let text: String
+    let accentColor: Color
 
     var body: some View {
         // Skip rendering when text is empty — otherwise the dot indicator
@@ -629,7 +891,7 @@ struct AssistantMessageView: View {
             HStack(alignment: .top, spacing: 6) {
                 // White dot indicator
                 Circle()
-                    .fill(Color.white.opacity(0.6))
+                    .fill(accentColor.opacity(0.9))
                     .frame(width: 6, height: 6)
                     .padding(.top, 5)
 
@@ -645,14 +907,18 @@ struct AssistantMessageView: View {
 
 struct ProcessingIndicatorView: View {
     private let baseTexts = ["Processing", "Working"]
-    private let color = Color(red: 0.85, green: 0.47, blue: 0.34) // Claude orange
+    private let color: Color
     private let baseText: String
 
     @State private var dotCount: Int = 1
     private let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
 
     /// Use a turnId to select text consistently per user turn
-    init(turnId: String = "") {
+    init(
+        turnId: String = "",
+        color: Color = Color(red: 0.85, green: 0.47, blue: 0.34)
+    ) {
+        self.color = color
         // Use hash of turnId to pick base text consistently for this turn
         let index = abs(turnId.hashValue) % baseTexts.count
         baseText = baseTexts[index]
@@ -664,7 +930,7 @@ struct ProcessingIndicatorView: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 6) {
-            ProcessingSpinner()
+            ProcessingSpinner(color: color)
                 .frame(width: 6)
 
             Text(baseText + dots)

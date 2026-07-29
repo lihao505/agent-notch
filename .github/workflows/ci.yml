@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release metadata
+        run: ./scripts/verify-release.sh
+      - name: Test Agent Bridge
+        run: python3 -B -m unittest discover -s AgentBridge/tests -v
+      - name: Build Debug
+        run: >
+          xcodebuild
+          -project ClaudeIsland.xcodeproj
+          -scheme ClaudeIsland
+          -configuration Debug
+          -destination 'platform=macOS'
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Build Release
+        run: >
+          xcodebuild
+          -project ClaudeIsland.xcodeproj
+          -scheme ClaudeIsland
+          -configuration Release
+          -destination 'platform=macOS'
+          CODE_SIGNING_ALLOWED=NO
+          build

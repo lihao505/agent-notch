@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ClaudePaths.swift
 //  ClaudeIsland
 //
@@ -10,14 +11,16 @@
 import Foundation
 
 enum ClaudePaths {
+    nonisolated static let hookScriptFileName = "agent-notch-state.py"
+    nonisolated static let legacyHookScriptFileName = "claude-island-state.py"
 
     /// Cached resolved directory to avoid filesystem checks on every access
-    private static var _cachedDir: URL?
+    nonisolated(unsafe) private static var _cachedDir: URL?
 
     /// Guards reads/writes to _cachedDir — accessed from the main actor
     /// (UI settings), the ConversationParser actor, and background watcher
     /// queues, so cross-thread access needs synchronization.
-    private static let cacheLock = NSLock()
+    nonisolated private static let cacheLock = NSLock()
 
     /// Root Claude config directory, resolved once and cached.
     ///
@@ -26,7 +29,7 @@ enum ClaudePaths {
     /// 2. AppSettings.claudeDirectoryName override (if changed from default)
     /// 3. ~/.config/claude/ (new default since Claude Code v2.1.30+, if projects/ exists)
     /// 4. ~/.claude/ (legacy fallback)
-    static var claudeDir: URL {
+    nonisolated static var claudeDir: URL {
         cacheLock.lock()
         if let cached = _cachedDir {
             cacheLock.unlock()
@@ -50,34 +53,34 @@ enum ClaudePaths {
         return resolved
     }
 
-    static var hooksDir: URL {
+    nonisolated static var hooksDir: URL {
         claudeDir.appendingPathComponent("hooks")
     }
 
-    static var settingsFile: URL {
+    nonisolated static var settingsFile: URL {
         claudeDir.appendingPathComponent("settings.json")
     }
 
-    static var projectsDir: URL {
+    nonisolated static var projectsDir: URL {
         claudeDir.appendingPathComponent("projects")
     }
 
     /// Shell-safe absolute path for hook commands in settings.json.
     /// Absolute paths keep custom directories and ~/.config/claude working;
     /// quoting keeps paths with spaces from being split by the shell.
-    static var hookScriptShellPath: String {
-        shellQuote(claudeDir.appendingPathComponent("hooks/claude-island-state.py").path)
+    nonisolated static var hookScriptShellPath: String {
+        shellQuote(hooksDir.appendingPathComponent(hookScriptFileName).path)
     }
 
     /// Invalidate the cached directory so the next access re-resolves.
     /// Call this when the user changes AppSettings.claudeDirectoryName.
-    static func invalidateCache() {
+    nonisolated static func invalidateCache() {
         cacheLock.lock()
         _cachedDir = nil
         cacheLock.unlock()
     }
 
-    private static func resolveClaudeDir() -> URL {
+    nonisolated private static func resolveClaudeDir() -> URL {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
 
@@ -92,7 +95,10 @@ enum ClaudePaths {
 
         // 2. User override via settings — accepts either an absolute path (chosen
         //    via the folder picker) or a legacy directory name under ~/
-        let settingsValue = AppSettings.claudeDirectoryName
+        let rawSettingsValue = UserDefaults.standard.string(
+            forKey: "claudeDirectoryName"
+        ) ?? ""
+        let settingsValue = rawSettingsValue.isEmpty ? ".claude" : rawSettingsValue
         if !settingsValue.isEmpty && settingsValue != ".claude" {
             if settingsValue.hasPrefix("/") {
                 return URL(fileURLWithPath: settingsValue)
@@ -111,7 +117,7 @@ enum ClaudePaths {
         return home.appendingPathComponent(".claude")
     }
 
-    private static func shellQuote(_ path: String) -> String {
+    nonisolated private static func shellQuote(_ path: String) -> String {
         "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

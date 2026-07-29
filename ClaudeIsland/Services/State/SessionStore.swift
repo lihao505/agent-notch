@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  SessionStore.swift
 //  ClaudeIsland
 //
@@ -8,7 +9,6 @@
 
 import Combine
 import Foundation
-import Mixpanel
 import os.log
 
 /// Central state manager for all Claude sessions
@@ -18,6 +18,19 @@ actor SessionStore {
 
     /// Logger for session store (nonisolated static for cross-context access)
     nonisolated static let logger = Logger(subsystem: "com.claudeisland", category: "Session")
+
+    /// Minimal on-disk representation used only to restore sessions whose
+    /// backing process is still alive after the menu bar app restarts.
+    private struct PersistedSession: Codable {
+        let sessionId: String
+        let cwd: String
+        let projectName: String
+        let source: String
+        let pid: Int
+        let tty: String?
+        let lastActivity: Date
+        let createdAt: Date
+    }
 
     // MARK: - State
 
@@ -35,6 +48,10 @@ actor SessionStore {
 
     /// Status check interval (3 seconds)
     private let statusCheckIntervalSeconds: UInt64 = 3
+
+    /// Restoration is deliberately deferred until monitoring starts, so the
+    /// actor is fully initialized before any filesystem or process inspection.
+    private var didRestorePersistedSessions = false
 
     // MARK: - Published State (for UI)
 
@@ -123,15 +140,12 @@ actor SessionStore {
 
     private func processHookEvent(_ event: HookEvent) async {
         let sessionId = event.sessionId
-        let isNewSession = sessions[sessionId] == nil
         var session = sessions[sessionId] ?? createSession(from: event)
 
-        // Track new session in Mixpanel
-        if isNewSession {
-            Mixpanel.mainInstance().track(event: "Session Started")
-        }
-
         session.pid = event.pid
+        if event.source != nil {
+            session.source = AgentSource(hookValue: event.source)
+        }
         if let pid = event.pid {
             let tree = ProcessTreeBuilder.shared.buildTree()
             session.isInTmux = ProcessTreeBuilder.shared.isInTmux(pid: pid, tree: tree)
@@ -149,7 +163,20 @@ actor SessionStore {
 
         let newPhase = event.determinePhase()
 
-        if session.phase.canTransition(to: newPhase) {
+        let isDuplicateInteractiveObservation: Bool
+        if case .waitingForApproval(let permission) = session.phase {
+            isDuplicateInteractiveObservation = event.event == "PreToolUse"
+                && event.status != "waiting_for_approval"
+                && event.toolUseId == permission.toolUseId
+        } else {
+            isDuplicateInteractiveObservation = false
+        }
+
+        if isDuplicateInteractiveObservation {
+            Self.logger.debug(
+                "Keeping interactive approval state for duplicate PreToolUse observation"
+            )
+        } else if session.phase.canTransition(to: newPhase) {
             session.phase = newPhase
         } else {
             Self.logger.debug("Invalid transition: \(String(describing: session.phase), privacy: .public) -> \(String(describing: newPhase), privacy: .public), ignoring")
@@ -176,14 +203,27 @@ actor SessionStore {
     }
 
     private func createSession(from event: HookEvent) -> SessionState {
-        SessionState(
+        let source = event.source == nil ? .claude : AgentSource(hookValue: event.source)
+        let codexTitle = source == .codex
+            ? ConversationParser.codexThreadTitle(sessionId: event.sessionId)
+            : nil
+        return SessionState(
             sessionId: event.sessionId,
             cwd: event.cwd,
             projectName: URL(fileURLWithPath: event.cwd).lastPathComponent,
+            source: source,
             pid: event.pid,
             tty: event.tty?.replacingOccurrences(of: "/dev/", with: ""),
             isInTmux: false,  // Will be updated
-            phase: .idle
+            phase: .idle,
+            conversationInfo: ConversationInfo(
+                summary: codexTitle,
+                lastMessage: nil,
+                lastMessageRole: nil,
+                lastToolName: nil,
+                firstUserMessage: nil,
+                lastUserMessageDate: nil
+            )
         )
     }
 
@@ -689,6 +729,7 @@ actor SessionStore {
         )
 
         sessions[payload.sessionId] = session
+        publishState()
 
         await emitToolCompletionEvents(
             sessionId: payload.sessionId,
@@ -906,6 +947,7 @@ actor SessionStore {
         }
 
         sessions[sessionId] = session
+        publishState()
     }
 
     // MARK: - Clear Processing
@@ -1047,7 +1089,12 @@ actor SessionStore {
     // MARK: - Periodic Status Check
 
     /// Start periodic status checking for all sessions
-    func startPeriodicStatusCheck() {
+    func startPeriodicStatusCheck() async {
+        if !didRestorePersistedSessions {
+            didRestorePersistedSessions = true
+            await restorePersistedSessions()
+        }
+
         guard statusCheckTask == nil else { return }
 
         let intervalSeconds = statusCheckIntervalSeconds
@@ -1118,6 +1165,133 @@ actor SessionStore {
     private func publishState() {
         let sortedSessions = Array(sessions.values).sorted { $0.projectName < $1.projectName }
         sessionsSubject.send(sortedSessions)
+        persistActiveSessions()
+    }
+
+    // MARK: - Active Session Persistence
+
+    private static var persistenceURL: URL {
+        let baseURL = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+
+        return baseURL
+            .appendingPathComponent("MultiAgent Notch", isDirectory: true)
+            .appendingPathComponent("active-sessions.json", isDirectory: false)
+    }
+
+    /// Persist only sessions with a live backing process. Completed sessions
+    /// are removed from this snapshot during the same three-second status pass
+    /// that removes them from the notch.
+    private func persistActiveSessions() {
+        let active = sessions.values.compactMap { session -> PersistedSession? in
+            guard session.phase != .ended,
+                  let pid = session.pid,
+                  isProcessRunning(pid: pid) else {
+                return nil
+            }
+
+            return PersistedSession(
+                sessionId: session.sessionId,
+                cwd: session.cwd,
+                projectName: session.projectName,
+                source: session.source.rawValue,
+                pid: pid,
+                tty: session.tty,
+                lastActivity: session.lastActivity,
+                createdAt: session.createdAt
+            )
+        }
+
+        let url = Self.persistenceURL
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(active).write(to: url, options: .atomic)
+        } catch {
+            Self.logger.error(
+                "Failed to persist active sessions: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    /// Restore cards only when their original process is still alive. A
+    /// permission request cannot safely survive an app/socket restart, so
+    /// restored sessions always begin idle and are refreshed from their JSONL.
+    private func restorePersistedSessions() async {
+        let url = Self.persistenceURL
+        guard let data = try? Data(contentsOf: url) else {
+            return
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        guard let persisted = try? decoder.decode([PersistedSession].self, from: data) else {
+            Self.logger.warning("Ignoring unreadable active session snapshot")
+            return
+        }
+
+        let processTree = ProcessTreeBuilder.shared.buildTree()
+        var restoredCount = 0
+        var restoredSessions: [(sessionId: String, cwd: String)] = []
+
+        for item in persisted where !sessions.keys.contains(item.sessionId) {
+            guard isProcessRunning(pid: item.pid) else {
+                continue
+            }
+
+            let source = AgentSource(rawValue: item.source) ?? .unknown
+            let codexTitle = source == .codex
+                ? ConversationParser.codexThreadTitle(sessionId: item.sessionId)
+                : nil
+            let session = SessionState(
+                sessionId: item.sessionId,
+                cwd: item.cwd,
+                projectName: item.projectName,
+                source: source,
+                pid: item.pid,
+                tty: item.tty,
+                isInTmux: ProcessTreeBuilder.shared.isInTmux(
+                    pid: item.pid,
+                    tree: processTree
+                ),
+                phase: .idle,
+                conversationInfo: ConversationInfo(
+                    summary: codexTitle,
+                    lastMessage: nil,
+                    lastMessageRole: nil,
+                    lastToolName: nil,
+                    firstUserMessage: nil,
+                    lastUserMessageDate: nil
+                ),
+                lastActivity: item.lastActivity,
+                createdAt: item.createdAt
+            )
+
+            sessions[item.sessionId] = session
+            restoredSessions.append((item.sessionId, item.cwd))
+            restoredCount += 1
+        }
+
+        publishState()
+        // A restored idle session may have no new JSONL rows, so an incremental
+        // sync would leave its title at the cwd fallback (for example "project").
+        // Load the existing transcript once to restore the real task title and
+        // chat before periodic incremental monitoring resumes.
+        for item in restoredSessions {
+            await loadHistoryFromFile(sessionId: item.sessionId, cwd: item.cwd)
+        }
+        if restoredCount > 0 {
+            Self.logger.info("Restored \(restoredCount) active sessions")
+        }
     }
 
     // MARK: - Queries

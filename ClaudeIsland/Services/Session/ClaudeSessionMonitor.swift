@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ClaudeSessionMonitor.swift
 //  ClaudeIsland
 //
@@ -90,15 +91,21 @@ class ClaudeSessionMonitor: ObservableObject {
                   let permission = session.activePermission else {
                 return
             }
+            let toolUseId = permission.toolUseId
 
             HookSocketServer.shared.respondToPermission(
-                toolUseId: permission.toolUseId,
+                toolUseId: toolUseId,
+                sessionId: sessionId,
                 decision: "allow"
-            )
-
-            await SessionStore.shared.process(
-                .permissionApproved(sessionId: sessionId, toolUseId: permission.toolUseId)
-            )
+            ) { delivered in
+                Task {
+                    await SessionStore.shared.process(
+                        delivered
+                            ? .permissionApproved(sessionId: sessionId, toolUseId: toolUseId)
+                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                    )
+                }
+            }
         }
     }
 
@@ -108,16 +115,81 @@ class ClaudeSessionMonitor: ObservableObject {
                   let permission = session.activePermission else {
                 return
             }
+            let toolUseId = permission.toolUseId
 
             HookSocketServer.shared.respondToPermission(
-                toolUseId: permission.toolUseId,
+                toolUseId: toolUseId,
+                sessionId: sessionId,
                 decision: "deny",
                 reason: reason
-            )
+            ) { delivered in
+                Task {
+                    await SessionStore.shared.process(
+                        delivered
+                            ? .permissionDenied(sessionId: sessionId, toolUseId: toolUseId, reason: reason)
+                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                    )
+                }
+            }
+        }
+    }
 
-            await SessionStore.shared.process(
-                .permissionDenied(sessionId: sessionId, toolUseId: permission.toolUseId, reason: reason)
-            )
+    /// Answer an interactive PreToolUse request. Claude Code requires the
+    /// original tool input to be echoed back together with the selected
+    /// answers, then explicitly allowed.
+    func answerQuestions(sessionId: String, answers: [String: String]) {
+        Task {
+            guard let session = await SessionStore.shared.session(for: sessionId),
+                  let permission = session.activePermission,
+                  permission.toolName == "AskUserQuestion" else {
+                return
+            }
+
+            var updatedInput = permission.toolInput ?? [:]
+            updatedInput["answers"] = AnyCodable(answers)
+            let toolUseId = permission.toolUseId
+            HookSocketServer.shared.respondToPermission(
+                toolUseId: toolUseId,
+                sessionId: sessionId,
+                decision: "allow",
+                updatedInput: updatedInput
+            ) { delivered in
+                Task {
+                    await SessionStore.shared.process(
+                        delivered
+                            ? .permissionApproved(sessionId: sessionId, toolUseId: toolUseId)
+                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                    )
+                }
+            }
+        }
+    }
+
+    /// ExitPlanMode also requires an echoed updatedInput when it is handled
+    /// through a PreToolUse integration.
+    func approvePlan(sessionId: String) {
+        Task {
+            guard let session = await SessionStore.shared.session(for: sessionId),
+                  let permission = session.activePermission,
+                  permission.toolName == "ExitPlanMode" else {
+                return
+            }
+
+            let toolUseId = permission.toolUseId
+            HookSocketServer.shared.respondToPermission(
+                toolUseId: toolUseId,
+                sessionId: sessionId,
+                decision: "allow",
+                updatedInput: permission.toolInput ?? [:]
+            ) { delivered in
+                Task {
+                    await SessionStore.shared.process(
+                        delivered
+                            ? .permissionApproved(sessionId: sessionId, toolUseId: toolUseId)
+                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                    )
+                }
+            }
         }
     }
 

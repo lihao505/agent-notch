@@ -1,94 +1,452 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  NotchHeaderView.swift
 //  ClaudeIsland
 //
 //  Header bar for the dynamic island
 //
 
-import Combine
+import AppKit
+import Foundation
 import SwiftUI
 
-struct ClaudeCrabIcon: View {
+enum VibePetMotion: Equatable {
+    case idle
+    case working
+    case waiting
+    case ready
+}
+
+private struct VibePetAnimation {
+    let frameNames: [String]
+    let frameDurations: [TimeInterval]
+
+    var duration: TimeInterval {
+        frameDurations.reduce(0, +)
+    }
+
+    func frameIndex(at date: Date) -> Int {
+        guard !frameNames.isEmpty, duration > 0 else { return 0 }
+
+        var elapsed = date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: duration)
+
+        for (index, frameDuration) in frameDurations.enumerated() {
+            if elapsed < frameDuration {
+                return min(index, frameNames.count - 1)
+            }
+            elapsed -= frameDuration
+        }
+
+        return frameNames.count - 1
+    }
+}
+
+@MainActor
+struct VibePetIcon: View {
     let size: CGFloat
-    let color: Color
-    var animateLegs: Bool = false
+    let motion: VibePetMotion
+    private static var frameCache: [String: NSImage] = [:]
+    private static let idlePauseRange = 18.0...36.0
+    private static let rareGlancePauseRange = 45.0...90.0
 
-    @State private var legPhase: Int = 0
+    @State private var idleHeldFrameIndex = Int.random(in: 0..<7)
+    @State private var idlePlaybackStartedAt: Date?
+    @State private var rareGlanceVisible = false
 
-    // Timer for leg animation
-    private let legTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
-
-    init(size: CGFloat = 16, color: Color = Color(red: 0.85, green: 0.47, blue: 0.34), animateLegs: Bool = false) {
+    init(
+        size: CGFloat = 19,
+        motion: VibePetMotion = .idle
+    ) {
         self.size = size
-        self.color = color
-        self.animateLegs = animateLegs
+        self.motion = motion
     }
 
     var body: some View {
-        Canvas { context, canvasSize in
-            let scale = size / 52.0  // Original viewBox height is 52
-            let xOffset = (canvasSize.width - 66 * scale) / 2
+        TimelineView(.animation(minimumInterval: timelineInterval)) { context in
+            let frameName = displayedFrameName(at: context.date)
 
-            // Left antenna
-            let leftAntenna = Path { p in
-                p.addRect(CGRect(x: 0, y: 13, width: 6, height: 13))
-            }.applying(CGAffineTransform(scaleX: scale, y: scale).translatedBy(x: xOffset / scale, y: 0))
-            context.fill(leftAntenna, with: .color(color))
+            if let frameImage = Self.frameImage(named: frameName) {
+                ZStack {
+                    Image(nsImage: frameImage)
+                        .renderingMode(.template)
+                        .resizable()
+                        .interpolation(.none)
+                        .antialiased(false)
+                        .aspectRatio(contentMode: .fit)
+                        .foregroundStyle(glowColor)
+                        .blur(radius: 2.6)
+                        .opacity(0.50)
 
-            // Right antenna
-            let rightAntenna = Path { p in
-                p.addRect(CGRect(x: 60, y: 13, width: 6, height: 13))
-            }.applying(CGAffineTransform(scaleX: scale, y: scale).translatedBy(x: xOffset / scale, y: 0))
-            context.fill(rightAntenna, with: .color(color))
+                    Image(nsImage: frameImage)
+                        .resizable()
+                        .interpolation(.none)
+                        .antialiased(false)
+                        .aspectRatio(contentMode: .fit)
+                        .shadow(
+                            color: glowColor.opacity(0.60),
+                            radius: 1.1
+                        )
+                        .shadow(
+                            color: glowColor.opacity(0.30),
+                            radius: 3.2
+                        )
+                }
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: size, height: size)
+        .task(id: motion) {
+            await runIdlePlaybackSchedule()
+        }
+        .task(id: motion) {
+            await runRareGlanceSchedule()
+        }
+        .accessibilityHidden(true)
+    }
 
-            // Animated legs - alternating up/down pattern for walking effect
-            // Legs stay attached to body (y=39), only height changes
-            let baseLegPositions: [CGFloat] = [6, 18, 42, 54]
-            let baseLegHeight: CGFloat = 13
+    private static func frameImage(named name: String) -> NSImage? {
+        if let cached = frameCache[name] {
+            return cached
+        }
 
-            // Height offsets: positive = longer leg (down), negative = shorter leg (up)
-            let legHeightOffsets: [[CGFloat]] = [
-                [3, -3, 3, -3],   // Phase 0: alternating
-                [0, 0, 0, 0],     // Phase 1: neutral
-                [-3, 3, -3, 3],   // Phase 2: alternating (opposite)
-                [0, 0, 0, 0],     // Phase 3: neutral
+        guard let url = Bundle.main.url(
+            forResource: name,
+            withExtension: "png"
+        ),
+        let image = NSImage(contentsOf: url) else {
+            return nil
+        }
+
+        frameCache[name] = image
+        return image
+    }
+
+    private var timelineInterval: TimeInterval {
+        switch motion {
+        case .working:
+            return 2.0 / 3.0
+        case .waiting:
+            return 0.5
+        case .idle, .ready:
+            return 1.0
+        }
+    }
+
+    private var glowColor: Color {
+        switch motion {
+        case .idle:
+            return Color(red: 0.30, green: 0.59, blue: 0.44)
+        case .working:
+            return Color(red: 0.36, green: 0.49, blue: 0.67)
+        case .waiting, .ready:
+            return Color(red: 0.75, green: 0.50, blue: 0.29)
+        }
+    }
+
+    private var glanceFrameIndex: Int {
+        switch motion {
+        case .idle:
+            return 3
+        case .working:
+            return 2
+        case .waiting, .ready:
+            return 4
+        }
+    }
+
+    private var regularAnimation: VibePetAnimation {
+        let regularIndices = animation.frameNames.indices.filter {
+            $0 != glanceFrameIndex
+        }
+        return VibePetAnimation(
+            frameNames: regularIndices.map { animation.frameNames[$0] },
+            frameDurations: regularIndices.map { animation.frameDurations[$0] }
+        )
+    }
+
+    private func displayedFrameName(at date: Date) -> String {
+        if rareGlanceVisible {
+            return animation.frameNames[glanceFrameIndex]
+        }
+
+        guard motion == .idle else {
+            return regularAnimation.frameNames[
+                regularAnimation.frameIndex(at: date)
             ]
-
-            let currentHeightOffsets = animateLegs ? legHeightOffsets[legPhase % 4] : [CGFloat](repeating: 0, count: 4)
-
-            for (index, xPos) in baseLegPositions.enumerated() {
-                let heightOffset = currentHeightOffsets[index]
-                let legHeight = baseLegHeight + heightOffset
-                let leg = Path { p in
-                    p.addRect(CGRect(x: xPos, y: 39, width: 6, height: legHeight))
-                }.applying(CGAffineTransform(scaleX: scale, y: scale).translatedBy(x: xOffset / scale, y: 0))
-                context.fill(leg, with: .color(color))
-            }
-
-            // Main body
-            let body = Path { p in
-                p.addRect(CGRect(x: 6, y: 0, width: 54, height: 39))
-            }.applying(CGAffineTransform(scaleX: scale, y: scale).translatedBy(x: xOffset / scale, y: 0))
-            context.fill(body, with: .color(color))
-
-            // Left eye
-            let leftEye = Path { p in
-                p.addRect(CGRect(x: 12, y: 13, width: 6, height: 6.5))
-            }.applying(CGAffineTransform(scaleX: scale, y: scale).translatedBy(x: xOffset / scale, y: 0))
-            context.fill(leftEye, with: .color(.black))
-
-            // Right eye
-            let rightEye = Path { p in
-                p.addRect(CGRect(x: 48, y: 13, width: 6, height: 6.5))
-            }.applying(CGAffineTransform(scaleX: scale, y: scale).translatedBy(x: xOffset / scale, y: 0))
-            context.fill(rightEye, with: .color(.black))
         }
-        .frame(width: size * (66.0 / 52.0), height: size)
-        .onReceive(legTimer) { _ in
-            if animateLegs {
-                legPhase = (legPhase + 1) % 4
+
+        guard let playbackStartedAt = idlePlaybackStartedAt else {
+            return regularAnimation.frameNames[
+                min(idleHeldFrameIndex, regularAnimation.frameNames.count - 1)
+            ]
+        }
+
+        let elapsed = max(0, date.timeIntervalSince(playbackStartedAt))
+        let frameIndex = min(
+            Int(elapsed / timelineInterval),
+            regularAnimation.frameNames.count - 1
+        )
+        return regularAnimation.frameNames[frameIndex]
+    }
+
+    private func runIdlePlaybackSchedule() async {
+        guard motion == .idle else {
+            idlePlaybackStartedAt = nil
+            return
+        }
+
+        idlePlaybackStartedAt = nil
+        idleHeldFrameIndex = Int.random(in: regularAnimation.frameNames.indices)
+
+        while !Task.isCancelled {
+            do {
+                let pause = Double.random(in: Self.idlePauseRange)
+                try await Task.sleep(
+                    nanoseconds: UInt64(pause * 1_000_000_000)
+                )
+                try Task.checkCancellation()
+
+                idlePlaybackStartedAt = Date()
+                try await Task.sleep(
+                    nanoseconds: UInt64(
+                        regularAnimation.duration * 1_000_000_000
+                    )
+                )
+                try Task.checkCancellation()
+
+                idleHeldFrameIndex = Int.random(
+                    in: regularAnimation.frameNames.indices
+                )
+                idlePlaybackStartedAt = nil
+            } catch {
+                return
             }
         }
+    }
+
+    private func runRareGlanceSchedule() async {
+        rareGlanceVisible = false
+
+        while !Task.isCancelled {
+            do {
+                let pause = Double.random(in: Self.rareGlancePauseRange)
+                try await Task.sleep(
+                    nanoseconds: UInt64(pause * 1_000_000_000)
+                )
+                try Task.checkCancellation()
+
+                rareGlanceVisible = true
+                try await Task.sleep(
+                    nanoseconds: UInt64(timelineInterval * 1_000_000_000)
+                )
+                try Task.checkCancellation()
+                rareGlanceVisible = false
+            } catch {
+                rareGlanceVisible = false
+                return
+            }
+        }
+    }
+
+    private var animation: VibePetAnimation {
+        switch motion {
+        case .idle:
+            return VibePetAnimation(
+                frameNames: (0...7).map {
+                    String(format: "%02d-idle-green-f%d", $0, $0 + 1)
+                },
+                frameDurations: Array(repeating: 1.0, count: 8)
+            )
+        case .working:
+            return VibePetAnimation(
+                frameNames: (8...15).map {
+                    String(format: "%02d-working-blue-f%d", $0, $0 - 7)
+                },
+                frameDurations: Array(repeating: 2.0 / 3.0, count: 8)
+            )
+        case .waiting:
+            return VibePetAnimation(
+                frameNames: (16...23).map {
+                    String(format: "%02d-waiting-orange-f%d", $0, $0 - 15)
+                },
+                frameDurations: Array(repeating: 0.5, count: 8)
+            )
+        case .ready:
+            return VibePetAnimation(
+                frameNames: (16...23).map {
+                    String(format: "%02d-waiting-orange-f%d", $0, $0 - 15)
+                },
+                frameDurations: Array(repeating: 1.0, count: 8)
+            )
+        }
+    }
+}
+
+/// A tiny state companion that sits beside the pet. Its silhouettes and
+/// slower cadence deliberately differ from the 3x3 comet on the far right.
+struct PetStateSignalIcon: View {
+    let motion: VibePetMotion
+    let size: CGFloat
+
+    init(motion: VibePetMotion, size: CGFloat = 15) {
+        self.motion = motion
+        self.size = size
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: interval)) { context in
+            let phase = Int(
+                context.date.timeIntervalSinceReferenceDate / interval
+            )
+            let breathingOpacity = waitingOpacity(at: context.date)
+
+            Canvas { canvas, _ in
+                if motion == .waiting {
+                    let diameter: CGFloat = 5
+                    canvas.fill(
+                        Path(
+                            ellipseIn: CGRect(
+                                x: (size - diameter) / 2,
+                                y: (size - diameter) / 2,
+                                width: diameter,
+                                height: diameter
+                            )
+                        ),
+                        with: .color(color.opacity(breathingOpacity))
+                    )
+                } else {
+                    for pixel in pixels(for: phase) {
+                        canvas.fill(
+                            Path(
+                                CGRect(
+                                    x: pixel.x,
+                                    y: pixel.y,
+                                    width: 4,
+                                    height: 4
+                                )
+                            ),
+                            with: .color(color.opacity(pixel.opacity))
+                        )
+                    }
+                }
+            }
+            .shadow(
+                color: color.opacity(
+                    motion == .waiting
+                        ? 0.16 + breathingOpacity * 0.34
+                        : 0.42
+                ),
+                radius: motion == .waiting ? 1.5 : 1.2
+            )
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private var interval: TimeInterval {
+        switch motion {
+        case .working: return 0.5
+        case .waiting: return 1.0 / 30.0
+        case .idle: return 1
+        case .ready: return 2
+        }
+    }
+
+    private func waitingOpacity(at date: Date) -> Double {
+        guard motion == .waiting else { return 1 }
+        let cycleDuration = 2.4
+        let progress = date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: cycleDuration)
+            / cycleDuration
+        let wave = (sin(progress * 2 * .pi - .pi / 2) + 1) / 2
+        return 0.18 + wave * 0.82
+    }
+
+    private var color: Color {
+        switch motion {
+        case .idle:
+            return Color(red: 0.30, green: 0.59, blue: 0.44)
+        case .working:
+            return Color(red: 0.36, green: 0.49, blue: 0.67)
+        case .waiting, .ready:
+            return Color(red: 0.75, green: 0.50, blue: 0.29)
+        }
+    }
+
+    private func pixels(for phase: Int) -> [(x: CGFloat, y: CGFloat, opacity: Double)] {
+        switch motion {
+        case .idle:
+            // A calm vertical breath: no chasing motion that could imply work.
+            let active = abs(phase % 4 - 2)
+            return (0..<3).map { index in
+                (
+                    x: 5,
+                    y: CGFloat(index * 5),
+                    opacity: index == active ? 0.95 : 0.34
+                )
+            }
+        case .working:
+            // A short rising staircase, visibly different from the comet loop.
+            return (0..<3).map { index in
+                (
+                    x: CGFloat(index * 5),
+                    y: CGFloat(10 - index * 5),
+                    opacity: index == phase % 3 ? 1 : 0.30
+                )
+            }
+        case .waiting:
+            return []
+        case .ready:
+            // Completion is deliberately still; the far-right check owns it.
+            return [
+                (x: 5, y: 0, opacity: 0.72),
+                (x: 0, y: 5, opacity: 0.72),
+                (x: 10, y: 5, opacity: 0.72),
+                (x: 5, y: 10, opacity: 0.72),
+            ]
+        }
+    }
+}
+
+/// Quiet, static pixel marker used when no agent needs attention.
+/// It deliberately never pulses: motion on the right edge always means work.
+struct IdlePixelIndicatorIcon: View {
+    let size: CGFloat
+    let color: Color
+
+    init(size: CGFloat = 14, color: Color = .white.opacity(0.32)) {
+        self.size = size
+        self.color = color
+    }
+
+    private let pixels: [(CGFloat, CGFloat)] = [
+        (15, 3), (15, 7),
+        (7, 15), (11, 15), (15, 15), (19, 15), (23, 15),
+        (15, 19), (15, 23),
+    ]
+
+    var body: some View {
+        Canvas { context, _ in
+            let scale = size / 30
+            let pixelSize = 4 * scale
+
+            for (x, y) in pixels {
+                context.fill(
+                    Path(
+                        CGRect(
+                            x: x * scale - pixelSize / 2,
+                            y: y * scale - pixelSize / 2,
+                            width: pixelSize,
+                            height: pixelSize
+                        )
+                    ),
+                    with: .color(color)
+                )
+            }
+        }
+        .frame(width: size, height: size)
     }
 }
 
@@ -169,4 +527,3 @@ struct ReadyForInputIndicatorIcon: View {
         .frame(width: size, height: size)
     }
 }
-

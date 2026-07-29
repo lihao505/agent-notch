@@ -1,10 +1,12 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ClaudeInstancesView.swift
 //  ClaudeIsland
 //
 //  Minimal instances list matching Dynamic Island aesthetic
 //
 
+import AppKit
 import Combine
 import SwiftUI
 
@@ -28,7 +30,7 @@ struct ClaudeInstancesView: View {
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(.white.opacity(0.4))
 
-            Text("Run claude in terminal")
+            Text("Run an agent in terminal")
                 .font(.system(size: 11))
                 .foregroundColor(.white.opacity(0.25))
         }
@@ -88,13 +90,76 @@ struct ClaudeInstancesView: View {
     // MARK: - Actions
 
     private func focusSession(_ session: SessionState) {
-        guard session.isInTmux else { return }
+        // Codex Desktop uses the hook session_id as its thread id. Opening this
+        // native deep link selects the exact task instead of merely activating
+        // the last Codex window.
+        if session.source == .codex {
+            let allowed = CharacterSet.alphanumerics.union(
+                CharacterSet(charactersIn: "-_")
+            )
+            if let encodedId = session.sessionId.addingPercentEncoding(
+                withAllowedCharacters: allowed
+            ),
+               let url = URL(string: "codex://threads/\(encodedId)"),
+               NSWorkspace.shared.open(url) {
+                return
+            }
+
+            // Fallback for Codex builds that do not support thread deep links.
+            NSWorkspace.shared.runningApplications
+                .first { $0.bundleIdentifier == "com.openai.codex" }?
+                .activate(options: [.activateAllWindows])
+            return
+        }
+
+        if session.source == .codebuddy {
+            if let app = NSWorkspace.shared.runningApplications.first(
+                where: { $0.bundleIdentifier == "com.workbuddy.workbuddy-ai" }
+            ) {
+                app.activate(options: [
+                    .activateAllWindows,
+                ])
+            } else {
+                let appURL = URL(fileURLWithPath: "/Applications/WorkBuddy AI.app")
+                NSWorkspace.shared.openApplication(
+                    at: appURL,
+                    configuration: NSWorkspace.OpenConfiguration()
+                )
+            }
+            return
+        }
 
         Task {
-            if let pid = session.pid {
-                _ = await YabaiController.shared.focusWindow(forClaudePid: pid)
-            } else {
-                _ = await YabaiController.shared.focusWindow(forWorkingDirectory: session.cwd)
+            // Preserve precise tmux pane switching when yabai is available.
+            if session.isInTmux {
+                let focused: Bool
+                if let pid = session.pid {
+                    focused = await YabaiController.shared.focusWindow(
+                        forClaudePid: pid
+                    )
+                } else {
+                    focused = await YabaiController.shared.focusWindow(
+                        forWorkingDirectory: session.cwd
+                    )
+                }
+                if focused {
+                    return
+                }
+            }
+
+            // Plain Terminal/iTerm/Warp sessions do not need yabai. Walk up to
+            // their owning terminal app and activate it.
+            guard let pid = session.pid else { return }
+            let tree = ProcessTreeBuilder.shared.buildTree()
+            guard let terminalPid = ProcessTreeBuilder.shared.findTerminalPid(
+                forProcess: pid,
+                tree: tree
+            ) else { return }
+            _ = await MainActor.run {
+                NSRunningApplication(processIdentifier: pid_t(terminalPid))?
+                    .activate(options: [
+                        .activateAllWindows,
+                    ])
             }
         }
     }
@@ -130,7 +195,6 @@ struct InstanceRow: View {
     @State private var spinnerPhase = 0
     @State private var isYabaiAvailable = false
 
-    private let claudeOrange = Color(red: 0.85, green: 0.47, blue: 0.34)
     private let spinnerSymbols = ["·", "✢", "✳", "∗", "✻", "✽"]
     private let spinnerTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
 
@@ -176,6 +240,8 @@ struct InstanceRow: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(.white)
                         .lineLimit(1)
+
+                    AgentBadge(source: session.source)
 
                     // Token usage indicator
                     if session.usage.totalTokens > 0 {
@@ -256,6 +322,12 @@ struct InstanceRow: View {
                         .lineLimit(1)
                 }
             }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                // Clicking the title/activity area returns to the external
+                // agent conversation. Action buttons keep their own behavior.
+                onFocus()
+            }
 
             Spacer(minLength: 0)
 
@@ -311,13 +383,10 @@ struct InstanceRow: View {
         .padding(.trailing, 14)
         .padding(.vertical, 10)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            onChat()
-        }
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isWaitingForApproval)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(isHovered ? Color.white.opacity(0.06) : Color.clear)
+                .fill(isHovered ? session.source.accentColor.opacity(0.10) : Color.clear)
         )
         .onHover { isHovered = $0 }
         .task {
@@ -331,7 +400,7 @@ struct InstanceRow: View {
         case .processing, .compacting:
             Text(spinnerSymbols[spinnerPhase % spinnerSymbols.count])
                 .font(.system(size: 12, weight: .bold))
-                .foregroundColor(claudeOrange)
+                .foregroundColor(session.source.accentColor)
                 .onReceive(spinnerTimer) { _ in
                     spinnerPhase = (spinnerPhase + 1) % spinnerSymbols.count
                 }

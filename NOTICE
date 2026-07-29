@@ -1,0 +1,12 @@
+Agent Notch contains derivative work based on Vibe Notch (previously Claude
+Island), Copyright 2025 Farouq Aldori, licensed under the Apache License,
+Version 2.0. The original Apache-2.0 license is retained in LICENSE.md.
+
+This repository includes local modifications and additional components for
+multi-agent session monitoring, local hook bridging, pixel animation, and
+notch-based interaction. Agent Notch is independently maintained by lihao505.
+These modifications are not endorsed by the original authors.
+
+All source files changed from the upstream work are distributed as modified
+Agent Notch files. The repository history, this NOTICE, and
+docs/RELEASE_RISK_AUDIT.md identify the derivative-work boundary.

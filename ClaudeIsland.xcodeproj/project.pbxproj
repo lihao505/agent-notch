@@ -1,4 +1,5 @@
 // !$*UTF8*$!
+// Modified by lihao505 for Agent Notch, 2026.
 {
 	archiveVersion = 1;
 	classes = {
@@ -7,13 +8,22 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		FD0F42E72EE7ABA400980302 /* Mixpanel in Frameworks */ = {isa = PBXBuildFile; productRef = FD0F42E62EE7ABA400980302 /* Mixpanel */; };
 		FDA49F7D2EE11E3C00F9612E /* Markdown in Frameworks */ = {isa = PBXBuildFile; productRef = FD33FD722EDF32D7002A6548 /* Markdown */; };
 		FDA49F7E2EE11E3C00F9612E /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = FDA49F7F2EE11E3C00F9612E /* Sparkle */; };
+		AA1000012F00000100A00101 /* LICENSE.md in Resources */ = {isa = PBXBuildFile; fileRef = AA1000112F00000100A00101 /* LICENSE.md */; };
+		AA1000022F00000100A00101 /* NOTICE in Resources */ = {isa = PBXBuildFile; fileRef = AA1000122F00000100A00101 /* NOTICE */; };
+		AA1000032F00000100A00101 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = AA1000132F00000100A00101 /* THIRD_PARTY_NOTICES.md */; };
+		AA1000042F00000100A00101 /* PRIVACY.md in Resources */ = {isa = PBXBuildFile; fileRef = AA1000142F00000100A00101 /* PRIVACY.md */; };
+		AA1000052F00000100A00101 /* AgentBridge in Resources */ = {isa = PBXBuildFile; fileRef = AA1000152F00000100A00101 /* AgentBridge */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		FD33FD5D2EDF32D7002A6548 /* Claude Island.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Claude Island.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA1000112F00000100A00101 /* LICENSE.md */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE.md; sourceTree = "<group>"; };
+		AA1000122F00000100A00101 /* NOTICE */ = {isa = PBXFileReference; lastKnownFileType = text; path = NOTICE; sourceTree = "<group>"; };
+		AA1000132F00000100A00101 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
+		AA1000142F00000100A00101 /* PRIVACY.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = PRIVACY.md; sourceTree = "<group>"; };
+		AA1000152F00000100A00101 /* AgentBridge */ = {isa = PBXFileReference; lastKnownFileType = folder; path = AgentBridge; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -42,7 +52,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				FD0F42E72EE7ABA400980302 /* Mixpanel in Frameworks */,
 				FDA49F7D2EE11E3C00F9612E /* Markdown in Frameworks */,
 				FDA49F7E2EE11E3C00F9612E /* Sparkle in Frameworks */,
 			);
@@ -55,6 +64,11 @@
 			isa = PBXGroup;
 			children = (
 				FD33FD5F2EDF32D7002A6548 /* ClaudeIsland */,
+				AA1000112F00000100A00101 /* LICENSE.md */,
+				AA1000122F00000100A00101 /* NOTICE */,
+				AA1000132F00000100A00101 /* THIRD_PARTY_NOTICES.md */,
+				AA1000142F00000100A00101 /* PRIVACY.md */,
+				AA1000152F00000100A00101 /* AgentBridge */,
 				FD33FD5E2EDF32D7002A6548 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -89,7 +103,6 @@
 			packageProductDependencies = (
 				FD33FD722EDF32D7002A6548 /* Markdown */,
 				FDA49F7F2EE11E3C00F9612E /* Sparkle */,
-				FD0F42E62EE7ABA400980302 /* Mixpanel */,
 			);
 			productName = ClaudeIsland;
 			productReference = FD33FD5D2EDF32D7002A6548 /* Claude Island.app */;
@@ -122,7 +135,6 @@
 			packageReferences = (
 				FD33FD712EDF32D7002A6548 /* XCRemoteSwiftPackageReference "swift-markdown" */,
 				FDA49F802EE11E3C00F9612E /* XCRemoteSwiftPackageReference "Sparkle" */,
-				FD0F42E52EE7ABA400980302 /* XCRemoteSwiftPackageReference "mixpanel-swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = FD33FD5E2EDF32D7002A6548 /* Products */;
@@ -139,6 +151,11 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA1000012F00000100A00101 /* LICENSE.md in Resources */,
+				AA1000022F00000100A00101 /* NOTICE in Resources */,
+				AA1000032F00000100A00101 /* THIRD_PARTY_NOTICES.md in Resources */,
+				AA1000042F00000100A00101 /* PRIVACY.md in Resources */,
+				AA1000052F00000100A00101 /* AgentBridge in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -190,7 +207,6 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 2DKS5U9LV4;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -254,7 +270,6 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 2DKS5U9LV4;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -283,8 +298,7 @@
 				CODE_SIGN_ENTITLEMENTS = ClaudeIsland/Resources/ClaudeIsland.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 6;
-				DEVELOPMENT_TEAM = 2DKS5U9LV4;
+				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -297,9 +311,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.ClaudeIsland;
-				PRODUCT_NAME = "Vibe Notch";
+				MARKETING_VERSION = 0.9.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lihao505.AgentNotch;
+				PRODUCT_NAME = "Agent Notch";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -318,8 +332,7 @@
 				CODE_SIGN_ENTITLEMENTS = ClaudeIsland/Resources/ClaudeIsland.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 6;
-				DEVELOPMENT_TEAM = 2DKS5U9LV4;
+				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -332,9 +345,9 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.ClaudeIsland;
-				PRODUCT_NAME = "Vibe Notch";
+				MARKETING_VERSION = 0.9.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lihao505.AgentNotch;
+				PRODUCT_NAME = "Agent Notch";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -369,14 +382,6 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		FD0F42E52EE7ABA400980302 /* XCRemoteSwiftPackageReference "mixpanel-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/mixpanel/mixpanel-swift";
-			requirement = {
-				branch = master;
-				kind = branch;
-			};
-		};
 		FD33FD712EDF32D7002A6548 /* XCRemoteSwiftPackageReference "swift-markdown" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/swiftlang/swift-markdown";
@@ -396,11 +401,6 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		FD0F42E62EE7ABA400980302 /* Mixpanel */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = FD0F42E52EE7ABA400980302 /* XCRemoteSwiftPackageReference "mixpanel-swift" */;
-			productName = Mixpanel;
-		};
 		FD33FD722EDF32D7002A6548 /* Markdown */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = FD33FD712EDF32D7002A6548 /* XCRemoteSwiftPackageReference "swift-markdown" */;

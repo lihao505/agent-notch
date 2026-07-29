@@ -1,5 +1,6 @@
 #!/bin/bash
-# Generate EdDSA signing keys for Sparkle updates
+# Modified by lihao505 for Agent Notch, 2026.
+# Generate Agent Notch EdDSA signing keys for Sparkle updates
 # Run this ONCE and save the private key securely!
 
 set -e
@@ -7,8 +8,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 KEYS_DIR="$PROJECT_DIR/.sparkle-keys"
+KEY_ACCOUNT="${AGENT_NOTCH_SPARKLE_ACCOUNT:-io.github.lihao505.AgentNotch}"
 
-echo "=== Sparkle EdDSA Key Generation ==="
+echo "=== Agent Notch Sparkle EdDSA Key Generation ==="
 echo ""
 
 # Check if keys already exist
@@ -63,13 +65,25 @@ fi
 echo "Using generate_keys from: $GENERATE_KEYS"
 echo ""
 
-# Generate the key pair (stores in Keychain, prints public key)
-echo "Generating EdDSA key pair..."
-PUBLIC_KEY=$("$GENERATE_KEYS" -p 2>/dev/null | grep -oE '[A-Za-z0-9+/=]{40,}')
+# Reuse this product's key when present; otherwise generate it in a dedicated
+# Keychain account so it never silently shares another Sparkle app's identity.
+echo "Loading Agent Notch EdDSA key pair..."
+PUBLIC_KEY=$("$GENERATE_KEYS" --account "$KEY_ACCOUNT" -p 2>/dev/null || true)
+if [ -z "$PUBLIC_KEY" ]; then
+    PUBLIC_KEY=$(
+        "$GENERATE_KEYS" --account "$KEY_ACCOUNT" 2>/dev/null |
+        grep -oE '[A-Za-z0-9+/=]{40,}' |
+        tail -n 1
+    )
+fi
+if [ -z "$PUBLIC_KEY" ]; then
+    echo "ERROR: Sparkle did not return a public key."
+    exit 1
+fi
 
 # Export the private key from Keychain to file (same key pair as above)
 echo "Exporting private key to file..."
-"$GENERATE_KEYS" -x "$KEYS_DIR/eddsa_private_key"
+"$GENERATE_KEYS" --account "$KEY_ACCOUNT" -x "$KEYS_DIR/eddsa_private_key"
 
 # Restrict permissions on private key
 chmod 600 "$KEYS_DIR/eddsa_private_key"
