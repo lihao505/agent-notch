@@ -12,6 +12,14 @@ Agent Notch 是一个本地优先的 macOS 工具，目前支持 Claude Code、C
 CodeBuddy 的任务状态。它会根据任务数量调整刘海尺寸，并提供会话标题、用量、
 对话跳转、Codex 回复和逐会话审批策略。
 
+## 项目状态
+
+当前版本是开源预览版，优先提供源码构建，不提供经过 Developer ID 签名和 Apple
+公证的官方安装包。直接分享自行构建的 App 时，macOS 可能提示无法验证开发者。
+
+Claude Code、Codex 和 CodeBuddy 的协议会随各自版本变化。审批与自动信任功能仍
+需在对应工具的真实版本上逐项验收；不要在未确认兼容性时将其视为安全边界。
+
 ## 当前能力
 
 - 自适应小刘海：空闲、工作、等待审批和完成状态使用不同像素动画
@@ -71,9 +79,9 @@ Agent Notch 默认在本机读取 Agent 会话文件并通过本机 Unix socket 
 网络访问仅来自用户使用的 Agent 工具，以及配置完成后的更新检查。详见
 [PRIVACY.md](PRIVACY.md)。
 
-## 发布与贡献
+## 开源与贡献
 
-- 发布闸门和签名流程：[docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
+- 开源发布清单与可选签名流程：[docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
 - Agent 接入层：[AgentBridge/README.md](AgentBridge/README.md)
 - 安全问题：[SECURITY.md](SECURITY.md)
 - 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)

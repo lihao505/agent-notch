@@ -16,24 +16,24 @@
 - 已移除上游 Apple Developer Team ID；签名构建必须显式传入发布者自己的 Team ID。
 - Agent Bridge 已并入主仓库、加入 CI，并随应用资源同版本打包。
 
-## 发布阻断项
+## 公开源码风险项
 
 | 优先级 | 风险 | 证据 | 上线前动作 |
 | --- | --- | --- | --- |
 | P0 | 自动审批可能造成用户误操作 | 工具权限可被自动允许 | 默认单次审批；将自动/完全信任限定为普通工具权限，不绕过问答、计划确认、macOS 权限或外部账户授权。 |
-| P1 | 第三方依赖许可证随包分发 | Sparkle、swift-markdown、swift-cmark 已固定版本并建立清单 | 在 DMG/公开仓库保留完整许可证文本，并在升级依赖时同步清单。 |
+| P1 | 第三方依赖许可证随包分发 | Sparkle、swift-markdown、swift-cmark 已固定版本并建立清单 | 在未来分发 DMG 时附带完整许可证文本，并在升级依赖时同步清单。 |
 | P1 | 竞品视觉/商标混淆 | 产品能力规格已改为独立需求文档 | 公开仓库与营销不得声称“一比一复刻”，或使用任何竞品的名称、图标、截图、文案或素材。 |
 | P2 | 代码与运行时命名仍是 ClaudeIsland | socket、hooks、日志 subsystem 与 Xcode scheme 大量保留旧名 | 在确定项目名后做一次受控重命名；不要把 Claude/Codex 商标用于产品名称。 |
 
-## 外部凭据阻断项
+## 可选签名发行依赖
 
-以下项目不能由源码替代，需要发布者账号完成：
+以下项目不阻止公开源码；只有未来提供签名、公证的官方二进制时才需要：
 
-- Developer ID Application 证书、App ID 与 notarization profile；
+- Apple Developer Program、Developer ID Application 证书与 notarization profile；
 - 独立 Sparkle 私钥的离线备份，以及对应公钥写入 `Info.plist`；
-- `lihao505/agent-notch` 远程仓库存在且 GitHub CLI 有发布权限；
-- Claude Code、Codex 和 CodeBuddy 的真实版本兼容性矩阵；
-- 商标检索和商业发行前的专业法律复核。
+
+Claude Code、Codex 和 CodeBuddy 的真实版本兼容性矩阵仍是功能 Beta 的工程验收项。
+商标检索和专业法律复核在未来商业化或扩大宣传范围前重新评估。
 
 ## 独立发布边界
 
