@@ -22,22 +22,23 @@ for file in "${required_files[@]}"; do
 done
 
 forbidden_pattern='https://vibenotch\.app|https://github\.com/farouqaldori|PRODUCT_BUNDLE_IDENTIFIER = com\.celestial\.ClaudeIsland|com\.farouqaldori\.ClaudeIsland'
-if rg -n "$forbidden_pattern" \
-    README.md ClaudeIsland scripts \
-    --glob '!**/*.md' \
-    --glob '!**/*.pyc'
+if grep -REn \
+    --exclude='*.md' \
+    --exclude='*.pyc' \
+    "$forbidden_pattern" \
+    README.md ClaudeIsland scripts
 then
     fail "runtime or release files still reference upstream infrastructure"
 fi
 
-rg -q 'PRODUCT_BUNDLE_IDENTIFIER = io\.github\.lihao505\.AgentNotch;' \
+grep -Eq 'PRODUCT_BUNDLE_IDENTIFIER = io\.github\.lihao505\.AgentNotch;' \
     ClaudeIsland.xcodeproj/project.pbxproj ||
     fail "Agent Notch bundle identifier is not configured"
-rg -q '<string>Agent Notch</string>' ClaudeIsland/Info.plist ||
+grep -Eq '<string>Agent Notch</string>' ClaudeIsland/Info.plist ||
     fail "Agent Notch display name is not configured"
-rg -q 'lihao505/agent-notch/releases/latest/download/appcast\.xml' ClaudeIsland/Info.plist ||
+grep -Eq 'lihao505/agent-notch/releases/latest/download/appcast\.xml' ClaudeIsland/Info.plist ||
     fail "owned update feed is not configured"
-if rg -n 'DEVELOPMENT_TEAM = 2DKS5U9LV4;' ClaudeIsland.xcodeproj/project.pbxproj; then
+if grep -En 'DEVELOPMENT_TEAM = 2DKS5U9LV4;' ClaudeIsland.xcodeproj/project.pbxproj; then
     fail "upstream Apple Developer team is still configured"
 fi
 
