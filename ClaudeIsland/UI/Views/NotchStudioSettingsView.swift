@@ -96,6 +96,7 @@ struct NotchStudioSettingsView: View {
         }
         .frame(minWidth: 780, minHeight: 560)
         .onAppear {
+            AppDelegate.shared?.settingsWindowDidAppear()
             refreshSystemState()
             updateWindowTitle()
         }

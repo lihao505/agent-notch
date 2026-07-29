@@ -7,6 +7,7 @@ import SwiftUI
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowManager: WindowManager?
     private var screenObserver: ScreenObserver?
+    private weak var trackedSettingsWindow: NSWindow?
 
     static var shared: AppDelegate?
     let updater: SPUUpdater
@@ -58,6 +59,104 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         screenObserver = nil
+        removeSettingsWindowObservers()
+        trackedSettingsWindow = nil
+    }
+
+    /// Switch to a regular app while Studio is open so its window is represented
+    /// in the Dock. Returns `true` when SwiftUI still needs to create the window.
+    func prepareForSettingsPresentation() -> Bool {
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        guard let window = settingsWindow else {
+            return true
+        }
+
+        trackSettingsWindow(window)
+        window.makeKeyAndOrderFront(nil)
+        return false
+    }
+
+    /// Called after SwiftUI receives `openSettings()`. The retry covers the short
+    /// interval between Scene creation and the NSWindow entering `NSApp.windows`.
+    func settingsPresentationRequested(attempt: Int = 0) {
+        if let window = settingsWindow {
+            trackSettingsWindow(window)
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        guard attempt < 20 else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            self?.settingsPresentationRequested(attempt: attempt + 1)
+        }
+    }
+
+    /// The settings root view calls this once its window content is on screen.
+    func settingsWindowDidAppear() {
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        settingsPresentationRequested()
+    }
+
+    private var settingsWindow: NSWindow? {
+        NSApp.windows.first {
+            $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window"
+        }
+    }
+
+    private func trackSettingsWindow(_ window: NSWindow) {
+        guard trackedSettingsWindow !== window else { return }
+
+        removeSettingsWindowObservers()
+        trackedSettingsWindow = window
+
+        for notificationName in [
+            NSWindow.willCloseNotification,
+            NSWindow.didResignKeyNotification
+        ] {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(settingsWindowVisibilityChanged(_:)),
+                name: notificationName,
+                object: window
+            )
+        }
+    }
+
+    @objc
+    private func settingsWindowVisibilityChanged(_ notification: Notification) {
+        settingsWindowMayHaveHidden(notification.object as? NSWindow)
+    }
+
+    private func settingsWindowMayHaveHidden(_ window: NSWindow?) {
+        Task { @MainActor [weak self, weak window] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard let self else { return }
+            guard window == nil || self.trackedSettingsWindow === window else {
+                return
+            }
+            guard window?.isVisible != true else { return }
+
+            self.removeSettingsWindowObservers()
+            self.trackedSettingsWindow = nil
+            NSApplication.shared.setActivationPolicy(.accessory)
+        }
+    }
+
+    private func removeSettingsWindowObservers() {
+        for notificationName in [
+            NSWindow.willCloseNotification,
+            NSWindow.didResignKeyNotification
+        ] {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: notificationName,
+                object: trackedSettingsWindow
+            )
+        }
     }
 
     private func ensureSingleInstance() -> Bool {

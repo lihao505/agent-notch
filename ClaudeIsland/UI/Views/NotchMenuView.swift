@@ -122,9 +122,19 @@ struct NotchMenuView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    viewModel.notchClose()
-                    openSettings()
-                    NSApp.activate(ignoringOtherApps: true)
+                    let shouldCreateWindow =
+                        AppDelegate.shared?.prepareForSettingsPresentation()
+                        ?? true
+                    if shouldCreateWindow {
+                        openSettings()
+                    }
+                    AppDelegate.shared?.settingsPresentationRequested()
+
+                    // Give SwiftUI enough time to create the Settings scene
+                    // before this source view is removed from the notch.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        viewModel.notchClose()
+                    }
                 } label: {
                     HStack(spacing: 10) {
                         ZStack {
