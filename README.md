@@ -33,7 +33,7 @@ Claude Code、Codex 和 CodeBuddy 的协议会随各自版本变化。审批与�
 ## 系统要求
 
 - 带刘海的 MacBook（无刘海屏幕可以运行，但不是主要适配目标）
-- macOS 15.6 或更高版本
+- macOS 15.5 或更高版本
 - Xcode 16 或更高版本（仅源码构建需要）
 - 至少安装一个受支持的 Agent CLI
 
