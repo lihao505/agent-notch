@@ -14,17 +14,7 @@ struct UsageLimitBar: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: snapshot.source.symbolName)
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(snapshot.source.accentColor)
-                .frame(width: 15, height: 15)
-                .background(
-                    Circle()
-                        .fill(snapshot.source.accentColor.opacity(0.14))
-                )
-                .accessibilityLabel(
-                    "\(snapshot.source.displayName) usage"
-                )
+            AgentUsageIcon(source: snapshot.source)
 
             if let primary = snapshot.primary {
                 windowRow(primary)
@@ -99,5 +89,63 @@ struct UsageLimitBar: View {
         default:
             return snapshot.source.accentColor
         }
+    }
+}
+
+/// A compact quota-source mark that does not depend on a tiny SF Symbol being
+/// available on the current macOS release. Codex uses a custom-drawn code
+/// glyph; the remaining sources use stable, high-contrast system marks.
+private struct AgentUsageIcon: View {
+    let source: AgentSource
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(source.accentColor.opacity(0.18))
+
+            if source == .codex {
+                CodexUsageMark()
+                    .stroke(
+                        source.accentColor,
+                        style: StrokeStyle(
+                            lineWidth: 1.25,
+                            lineCap: .square,
+                            lineJoin: .miter
+                        )
+                    )
+                    .padding(3.5)
+            } else {
+                Image(systemName: source.symbolName)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(source.accentColor)
+            }
+        }
+        .frame(width: 17, height: 17)
+        .overlay {
+            Circle()
+                .strokeBorder(
+                    source.accentColor.opacity(0.28),
+                    lineWidth: 0.5
+                )
+        }
+        .accessibilityLabel("\(source.displayName) usage")
+    }
+}
+
+private struct CodexUsageMark: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+
+        path.move(to: CGPoint(x: rect.width * 0.30, y: rect.height * 0.18))
+        path.addLine(to: CGPoint(x: rect.width * 0.08, y: rect.height * 0.50))
+        path.addLine(to: CGPoint(x: rect.width * 0.30, y: rect.height * 0.82))
+
+        path.move(to: CGPoint(x: rect.width * 0.70, y: rect.height * 0.18))
+        path.addLine(to: CGPoint(x: rect.width * 0.92, y: rect.height * 0.50))
+        path.addLine(to: CGPoint(x: rect.width * 0.70, y: rect.height * 0.82))
+
+        path.move(to: CGPoint(x: rect.width * 0.58, y: rect.height * 0.08))
+        path.addLine(to: CGPoint(x: rect.width * 0.42, y: rect.height * 0.92))
+        return path
     }
 }

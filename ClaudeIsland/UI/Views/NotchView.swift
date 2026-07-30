@@ -313,7 +313,7 @@ struct NotchView: View {
         HStack(spacing: 0) {
             // Left side - compact pet and its state signal.
             if showClosedActivity {
-                HStack(spacing: 1) {
+                HStack(spacing: -2) {
                     VibePetIcon(
                         size:
                             CompactNotchMetrics.compactAnimationSize

@@ -272,7 +272,7 @@ struct NotchStudioSettingsView: View {
 
                         HStack(spacing: 0) {
                             if !previewIsHidden {
-                                HStack(spacing: 1) {
+                                HStack(spacing: -2) {
                                     VibePetIcon(
                                         size:
                                             CompactNotchMetrics
