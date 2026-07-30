@@ -14,7 +14,17 @@ struct UsageLimitBar: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            AgentBadge(source: snapshot.source)
+            Image(systemName: snapshot.source.symbolName)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(snapshot.source.accentColor)
+                .frame(width: 15, height: 15)
+                .background(
+                    Circle()
+                        .fill(snapshot.source.accentColor.opacity(0.14))
+                )
+                .accessibilityLabel(
+                    "\(snapshot.source.displayName) usage"
+                )
 
             if let primary = snapshot.primary {
                 windowRow(primary)

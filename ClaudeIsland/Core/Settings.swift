@@ -132,11 +132,29 @@ enum CompactNotchMetrics {
     static let simpleWingWidth: CGFloat = 32
     static let detailedWingWidth: CGFloat = 47
     static let baseConfiguredWidth = 96.0
+    static let maximumConfiguredWidth = 176.0
+    static let maximumAnimationScale: CGFloat = 1.35
 
     static func wingWidth(for style: CompactNotchStyle) -> CGFloat {
         style == .detailed
             ? detailedWingWidth
             : simpleWingWidth
+    }
+
+    static func wingWidth(
+        for style: CompactNotchStyle,
+        configuredWidth: Double
+    ) -> CGFloat {
+        wingWidth(for: style) + userExtraWidth(for: configuredWidth) / 2
+    }
+
+    static func animationScale(for configuredWidth: Double) -> CGFloat {
+        let range = maximumConfiguredWidth - baseConfiguredWidth
+        let progress = min(
+            1,
+            max(0, (configuredWidth - baseConfiguredWidth) / range)
+        )
+        return 1 + CGFloat(progress) * (maximumAnimationScale - 1)
     }
 
     static func userExtraWidth(for configuredWidth: Double) -> CGFloat {
@@ -147,8 +165,10 @@ enum CompactNotchMetrics {
         style: CompactNotchStyle,
         configuredWidth: Double
     ) -> CGFloat {
-        2 * wingWidth(for: style) +
-            userExtraWidth(for: configuredWidth)
+        2 * wingWidth(
+            for: style,
+            configuredWidth: configuredWidth
+        )
     }
 }
 
@@ -253,7 +273,7 @@ final class NotchPreferences: ObservableObject {
     /// Keeping this independent from the hardware notch width makes every
     /// slider step produce the same visible result on different Mac models.
     static let compactWidthRange =
-        CompactNotchMetrics.baseConfiguredWidth...176.0
+        CompactNotchMetrics.baseConfiguredWidth...CompactNotchMetrics.maximumConfiguredWidth
     static let defaultCompactWidth =
         CompactNotchMetrics.baseConfiguredWidth
 

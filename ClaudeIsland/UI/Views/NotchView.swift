@@ -63,20 +63,22 @@ struct NotchView: View {
 
     private var leftWingWidth: CGFloat {
         CompactNotchMetrics.wingWidth(
-            for: preferences.compactStyle
+            for: preferences.compactStyle,
+            configuredWidth: preferences.compactWidth
         )
     }
 
     private var rightWingWidth: CGFloat {
         CompactNotchMetrics.wingWidth(
-            for: preferences.compactStyle
+            for: preferences.compactStyle,
+            configuredWidth: preferences.compactWidth
         )
     }
 
-    private var physicalNotchSideClearance: CGFloat {
-        CompactNotchMetrics.userExtraWidth(
+    private var compactAnimationScale: CGFloat {
+        CompactNotchMetrics.animationScale(
             for: preferences.compactWidth
-        ) / 2
+        )
     }
 
     // MARK: - Sizing
@@ -92,8 +94,7 @@ struct NotchView: View {
     private var expansionWidth: CGFloat {
         let compactBaseWidth =
             leftWingWidth +
-            rightWingWidth +
-            2 * physicalNotchSideClearance
+            rightWingWidth
 
         // Expand for processing activity
         if activityCoordinator.expandingActivity.show {
@@ -314,18 +315,26 @@ struct NotchView: View {
             if showClosedActivity {
                 HStack(spacing: 1) {
                     VibePetIcon(
-                        size: CompactNotchMetrics.compactAnimationSize,
+                        size:
+                            CompactNotchMetrics.compactAnimationSize
+                            * compactAnimationScale,
                         motion: petMotion
                     )
                         .frame(
-                            width: CompactNotchMetrics.compactPetCanvasSize,
-                            height: CompactNotchMetrics.compactPetCanvasSize
+                            width:
+                                CompactNotchMetrics.compactPetCanvasSize
+                                * compactAnimationScale,
+                            height:
+                                CompactNotchMetrics.compactPetCanvasSize
+                                * compactAnimationScale
                         )
                         .matchedGeometryEffect(id: "pet", in: activityNamespace, isSource: showClosedActivity)
 
                     PetStateSignalIcon(
                         motion: petMotion,
-                        size: CompactNotchMetrics.compactSignalSize
+                        size:
+                            CompactNotchMetrics.compactSignalSize
+                            * compactAnimationScale
                     )
                 }
                 .frame(width: leftWingWidth)
@@ -343,7 +352,6 @@ struct NotchView: View {
                     .fill(.black)
                     .frame(
                         width: closedNotchSize.width +
-                            2 * physicalNotchSideClearance +
                             (isBouncing ? 16 : 0)
                     )
             }
@@ -371,11 +379,17 @@ struct NotchView: View {
 
                     if hasPendingPermission {
                         WaitingPixelIndicatorIcon(
-                            size: CompactNotchMetrics.compactAnimationSize
+                            size:
+                                CompactNotchMetrics.compactAnimationSize
+                                * compactAnimationScale
                         )
                             .frame(
-                                width: CompactNotchMetrics.animationCanvasSize,
-                                height: CompactNotchMetrics.animationCanvasSize
+                                width:
+                                    CompactNotchMetrics.animationCanvasSize
+                                    * compactAnimationScale,
+                                height:
+                                    CompactNotchMetrics.animationCanvasSize
+                                    * compactAnimationScale
                             )
                             .matchedGeometryEffect(
                                 id: "spinner",
@@ -384,11 +398,17 @@ struct NotchView: View {
                             )
                     } else if isProcessing {
                         PixelLoaderIcon(
-                            size: CompactNotchMetrics.compactAnimationSize
+                            size:
+                                CompactNotchMetrics.compactAnimationSize
+                                * compactAnimationScale
                         )
                             .frame(
-                                width: CompactNotchMetrics.animationCanvasSize,
-                                height: CompactNotchMetrics.animationCanvasSize
+                                width:
+                                    CompactNotchMetrics.animationCanvasSize
+                                    * compactAnimationScale,
+                                height:
+                                    CompactNotchMetrics.animationCanvasSize
+                                    * compactAnimationScale
                             )
                             .matchedGeometryEffect(
                                 id: "spinner",
@@ -397,12 +417,16 @@ struct NotchView: View {
                             )
                     } else if hasWaitingForInput {
                         ReadyForInputIndicatorIcon(
-                            size: 10,
+                            size: 10 * compactAnimationScale,
                             color: TerminalColors.green
                         )
                         .frame(
-                            width: CompactNotchMetrics.animationCanvasSize,
-                            height: CompactNotchMetrics.animationCanvasSize
+                            width:
+                                CompactNotchMetrics.animationCanvasSize
+                                * compactAnimationScale,
+                            height:
+                                CompactNotchMetrics.animationCanvasSize
+                                * compactAnimationScale
                         )
                         .matchedGeometryEffect(
                             id: "spinner",
@@ -412,8 +436,12 @@ struct NotchView: View {
                     } else {
                         IdlePixelIndicatorIcon()
                             .frame(
-                                width: CompactNotchMetrics.animationCanvasSize,
-                                height: CompactNotchMetrics.animationCanvasSize
+                                width:
+                                    CompactNotchMetrics.animationCanvasSize
+                                    * compactAnimationScale,
+                                height:
+                                    CompactNotchMetrics.animationCanvasSize
+                                    * compactAnimationScale
                             )
                     }
                 }

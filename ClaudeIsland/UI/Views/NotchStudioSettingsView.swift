@@ -276,22 +276,26 @@ struct NotchStudioSettingsView: View {
                                     VibePetIcon(
                                         size:
                                             CompactNotchMetrics
-                                                .compactAnimationSize,
+                                                .compactAnimationSize
+                                            * previewAnimationScale,
                                         motion: previewState.motion
                                     )
                                     .frame(
                                         width:
                                             CompactNotchMetrics
-                                                .compactPetCanvasSize,
+                                                .compactPetCanvasSize
+                                            * previewAnimationScale,
                                         height:
                                             CompactNotchMetrics
                                                 .compactPetCanvasSize
+                                            * previewAnimationScale
                                     )
                                     PetStateSignalIcon(
                                         motion: previewState.motion,
                                         size:
                                             CompactNotchMetrics
                                                 .compactSignalSize
+                                            * previewAnimationScale
                                     )
                                 }
                                 .frame(width: previewLeftWingWidth)
@@ -299,10 +303,7 @@ struct NotchStudioSettingsView: View {
 
                             Rectangle()
                                 .fill(.black)
-                                .frame(
-                                    width: previewCameraWidth +
-                                        previewUserExtraWidth
-                                )
+                                .frame(width: previewCameraWidth)
 
                             if !previewIsHidden {
                                 HStack(spacing: 5) {
@@ -406,18 +407,20 @@ struct NotchStudioSettingsView: View {
 
     private var previewLeftWingWidth: CGFloat {
         CompactNotchMetrics.wingWidth(
-            for: preferences.compactStyle
+            for: preferences.compactStyle,
+            configuredWidth: preferences.compactWidth
         )
     }
 
     private var previewRightWingWidth: CGFloat {
         CompactNotchMetrics.wingWidth(
-            for: preferences.compactStyle
+            for: preferences.compactStyle,
+            configuredWidth: preferences.compactWidth
         )
     }
 
-    private var previewUserExtraWidth: CGFloat {
-        CompactNotchMetrics.userExtraWidth(
+    private var previewAnimationScale: CGFloat {
+        CompactNotchMetrics.animationScale(
             for: preferences.compactWidth
         )
     }
@@ -441,34 +444,64 @@ struct NotchStudioSettingsView: View {
     private var previewIndicator: some View {
         switch previewState {
         case .idle:
-            IdlePixelIndicatorIcon(size: 14)
+            IdlePixelIndicatorIcon(
+                size:
+                    CompactNotchMetrics.compactAnimationSize
+                    * previewAnimationScale
+            )
                 .frame(
-                    width: CompactNotchMetrics.animationCanvasSize,
-                    height: CompactNotchMetrics.animationCanvasSize
+                    width:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale,
+                    height:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale
                 )
                 .id(previewState)
                 .transition(.opacity.combined(with: .scale(scale: 0.72)))
         case .working:
-            PixelLoaderIcon(size: 19)
+            PixelLoaderIcon(
+                size:
+                    CompactNotchMetrics.compactAnimationSize
+                    * previewAnimationScale
+            )
                 .frame(
-                    width: CompactNotchMetrics.animationCanvasSize,
-                    height: CompactNotchMetrics.animationCanvasSize
+                    width:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale,
+                    height:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale
                 )
                 .id(previewState)
                 .transition(.opacity.combined(with: .scale(scale: 0.72)))
         case .waiting:
-            WaitingPixelIndicatorIcon(size: 19)
+            WaitingPixelIndicatorIcon(
+                size:
+                    CompactNotchMetrics.compactAnimationSize
+                    * previewAnimationScale
+            )
                 .frame(
-                    width: CompactNotchMetrics.animationCanvasSize,
-                    height: CompactNotchMetrics.animationCanvasSize
+                    width:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale,
+                    height:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale
                 )
                 .id(previewState)
                 .transition(.opacity.combined(with: .scale(scale: 0.72)))
         case .complete:
-            ReadyForInputIndicatorIcon(size: 14)
+            ReadyForInputIndicatorIcon(
+                size: 10 * previewAnimationScale
+            )
                 .frame(
-                    width: CompactNotchMetrics.animationCanvasSize,
-                    height: CompactNotchMetrics.animationCanvasSize
+                    width:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale,
+                    height:
+                        CompactNotchMetrics.animationCanvasSize
+                        * previewAnimationScale
                 )
                 .id(previewState)
                 .transition(.opacity.combined(with: .scale(scale: 0.72)))

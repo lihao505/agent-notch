@@ -191,22 +191,18 @@ class NotchViewModel: ObservableObject {
     /// The chat session we're viewing (persists across close/open)
     private var currentChatSession: SessionState?
 
-    private var compactHitExtra: CGFloat {
-        CompactNotchMetrics.userExtraWidth(
-            for: preferences.compactWidth
-        ) / 2
-    }
-
     private var compactLeftHitExtension: CGFloat {
         CompactNotchMetrics.wingWidth(
-            for: preferences.compactStyle
-        ) + compactHitExtra
+            for: preferences.compactStyle,
+            configuredWidth: preferences.compactWidth
+        )
     }
 
     private var compactRightHitExtension: CGFloat {
         CompactNotchMetrics.wingWidth(
-            for: preferences.compactStyle
-        ) + compactHitExtra
+            for: preferences.compactStyle,
+            configuredWidth: preferences.compactWidth
+        )
     }
 
     private func isPointInCompactNotch(_ location: CGPoint) -> Bool {
