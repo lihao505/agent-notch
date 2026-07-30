@@ -1,5 +1,6 @@
 // Modified by lihao505 for Agent Notch, 2026.
 import AppKit
+import QuartzCore
 import Sparkle
 import SwiftUI
 
@@ -175,7 +176,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the source panel disappears during the same event cycle.
     func showDetailedSettings() {
         let window = settingsWindow ?? makeSettingsWindow()
-        presentSettingsWindow(window)
+        presentSettingsWindow(
+            window,
+            animated: !window.isVisible
+        )
 
         // Reassert frontmost status after the notch finishes its close
         // animation and after macOS completes the activation-policy change.
@@ -220,6 +224,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.minSize = NSSize(width: 780, height: 560)
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
+        window.animationBehavior = .none
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         window.center()
 
@@ -228,7 +233,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return window
     }
 
-    private func presentSettingsWindow(_ window: NSWindow) {
+    private func presentSettingsWindow(
+        _ window: NSWindow,
+        animated: Bool = false
+    ) {
+        let shouldAnimate =
+            animated &&
+            !window.isVisible &&
+            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let finalFrame = window.frame
+
+        if shouldAnimate {
+            var initialFrame = finalFrame.insetBy(dx: 14, dy: 10)
+            initialFrame.origin.y += 8
+            window.setFrame(initialFrame, display: false)
+            window.alphaValue = 0
+        } else if !window.isVisible {
+            window.alphaValue = 1
+        }
+
         NSApplication.shared.setActivationPolicy(.regular)
         window.level = .normal
         window.collectionBehavior.insert(.moveToActiveSpace)
@@ -241,6 +264,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         window.makeMain()
+
+        guard shouldAnimate else { return }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.30
+            context.timingFunction = CAMediaTimingFunction(
+                name: .easeOut
+            )
+            context.allowsImplicitAnimation = true
+
+            window.animator().alphaValue = 1
+            window.animator().setFrame(finalFrame, display: true)
+        } completionHandler: { [weak window] in
+            guard let window else { return }
+            window.alphaValue = 1
+            window.setFrame(finalFrame, display: true)
+        }
     }
 
     private func trackSettingsWindow(_ window: NSWindow) {
