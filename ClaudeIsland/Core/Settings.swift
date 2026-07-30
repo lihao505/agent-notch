@@ -101,6 +101,12 @@ enum CompactNotchStyle: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum CompactCompanionPresentation: Equatable {
+    case hidden
+    case micro
+    case full
+}
+
 /// Controls how normal tool PermissionRequest events are handled. Interactive
 /// questions and plan reviews deliberately remain manual: they require input,
 /// not merely an allow/deny decision.
@@ -137,6 +143,8 @@ enum CompactNotchMetrics {
     static let baseConfiguredWidth = 96.0
     static let maximumConfiguredWidth = 176.0
     static let maximumAnimationScale: CGFloat = 1.35
+    static let microCompanionThreshold = 106.0
+    static let fullCompanionThreshold = 136.0
 
     static func wingWidth(for style: CompactNotchStyle) -> CGFloat {
         style == .detailed
@@ -158,6 +166,20 @@ enum CompactNotchMetrics {
             max(0, (configuredWidth - baseConfiguredWidth) / range)
         )
         return 1 + CGFloat(progress) * (maximumAnimationScale - 1)
+    }
+
+    /// Add companion detail only when the wing has enough room to preserve
+    /// every pixel and its glow outside the hardware notch.
+    static func companionPresentation(
+        for configuredWidth: Double
+    ) -> CompactCompanionPresentation {
+        if configuredWidth < microCompanionThreshold {
+            return .hidden
+        }
+        if configuredWidth < fullCompanionThreshold {
+            return .micro
+        }
+        return .full
     }
 
     static func userExtraWidth(for configuredWidth: Double) -> CGFloat {

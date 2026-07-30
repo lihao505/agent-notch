@@ -71,7 +71,10 @@ struct NotchView: View {
     }
 
     private var compactTaskCount: Int {
-        sessionMonitor.instances.count
+        sessionMonitor.instances.filter {
+            $0.completedAt == nil &&
+                ($0.phase.isActive || $0.phase.isWaitingForApproval)
+        }.count
     }
 
     private var leftWingWidth: CGFloat {
@@ -94,11 +97,18 @@ struct NotchView: View {
         )
     }
 
+    private var compactCompanionPresentation:
+        CompactCompanionPresentation {
+        CompactNotchMetrics.companionPresentation(
+            for: preferences.compactWidth
+        )
+    }
+
     private var layoutAnimationState: NotchLayoutAnimationState {
         NotchLayoutAnimationState(
             status: viewModel.status,
             size: notchSize,
-            activityVisible: activityCoordinator.expandingActivity.show,
+            activityVisible: isAnyProcessing,
             permissionVisible: hasPendingPermission,
             completionVisible: hasWaitingForInput,
             compactStyle: preferences.compactStyle,
@@ -122,13 +132,8 @@ struct NotchView: View {
             rightWingWidth
 
         // Expand for processing activity
-        if activityCoordinator.expandingActivity.show {
-            switch activityCoordinator.expandingActivity.type {
-            case .claude:
-                return compactBaseWidth
-            case .none:
-                break
-            }
+        if isAnyProcessing {
+            return compactBaseWidth
         }
 
         // Expand for pending permissions (left indicator) or waiting for input (checkmark on right)
@@ -274,7 +279,7 @@ struct NotchView: View {
     // MARK: - Notch Layout
 
     private var isProcessing: Bool {
-        activityCoordinator.expandingActivity.show && activityCoordinator.expandingActivity.type == .claude
+        isAnyProcessing
     }
 
     /// Whether to show the expanded closed state (processing, pending permission, or waiting for input)
@@ -490,10 +495,19 @@ struct NotchView: View {
                 compactAnimationScale /
                 CompactNotchMetrics.openedAnimationSize
             let scale = isOpened ? 1 : compactScale
+            let companionPresentation = isOpened
+                ? CompactCompanionPresentation.full
+                : compactCompanionPresentation
+            let companionSize = petCompanionSize(
+                for: companionPresentation
+            )
+            let companionSpacing = petCompanionSpacing(
+                for: companionPresentation
+            )
             let fullWidth =
                 CompactNotchMetrics.openedAnimationCanvasSize +
-                6 +
-                CompactNotchMetrics.openedSignalSize
+                companionSpacing +
+                companionSize
             let compactX = max(
                 0,
                 (leftWingWidth - fullWidth * compactScale) / 2
@@ -505,7 +519,7 @@ struct NotchView: View {
                     compactScale) / 2
             )
 
-            HStack(spacing: 6) {
+            HStack(spacing: companionSpacing) {
                 VibePetIcon(
                     size: CompactNotchMetrics.openedAnimationSize,
                     motion: petMotion
@@ -515,10 +529,20 @@ struct NotchView: View {
                     height: CompactNotchMetrics.openedAnimationCanvasSize
                 )
 
-                PetStateSignalIcon(
-                    motion: petMotion,
-                    size: CompactNotchMetrics.openedSignalSize
-                )
+                switch companionPresentation {
+                case .hidden:
+                    EmptyView()
+                case .micro:
+                    CompactPetCompanionIcon(
+                        motion: petMotion,
+                        size: companionSize
+                    )
+                case .full:
+                    PetStateSignalIcon(
+                        motion: petMotion,
+                        size: companionSize
+                    )
+                }
             }
             .scaleEffect(scale, anchor: .topLeading)
             .offset(
@@ -527,6 +551,26 @@ struct NotchView: View {
             )
             .allowsHitTesting(false)
             .zIndex(3)
+        }
+    }
+
+    private func petCompanionSize(
+        for presentation: CompactCompanionPresentation
+    ) -> CGFloat {
+        switch presentation {
+        case .hidden: return 0
+        case .micro: return 14
+        case .full: return CompactNotchMetrics.openedSignalSize
+        }
+    }
+
+    private func petCompanionSpacing(
+        for presentation: CompactCompanionPresentation
+    ) -> CGFloat {
+        switch presentation {
+        case .hidden: return 0
+        case .micro: return 3
+        case .full: return 6
         }
     }
 
@@ -720,7 +764,10 @@ struct NotchView: View {
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                if viewModel.status == .closed && !isAnyProcessing && !hasPendingPermission && !hasWaitingForInput && !activityCoordinator.expandingActivity.show {
+                if viewModel.status == .closed &&
+                   !isAnyProcessing &&
+                   !hasPendingPermission &&
+                   !hasWaitingForInput {
                     isVisible = false
                 }
             }
@@ -761,6 +808,10 @@ struct NotchView: View {
         let now = Date()
         for session in waitingForInputSessions where newWaitingIds.contains(session.stableId) {
             waitingForInputTimestamps[session.stableId] = now
+            scheduleCompletionReminderExpiry(
+                sessionId: session.stableId,
+                enteredAt: now
+            )
         }
 
         // Clean up timestamps for sessions no longer waiting
@@ -805,17 +856,28 @@ struct NotchView: View {
                 }
             }
 
-            // Completion reminders dwell briefly, then leave the session card
-            // available without keeping the collapsed notch in alert mode.
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + preferences.completionCompactDuration
-            ) { [self] in
-                // Trigger a UI update to re-evaluate hasWaitingForInput
-                handleProcessingChange()
-            }
         }
 
         previousWaitingForInputIds = currentIds
+    }
+
+    private func scheduleCompletionReminderExpiry(
+        sessionId: String,
+        enteredAt: Date
+    ) {
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + preferences.completionCompactDuration
+        ) {
+            guard waitingForInputTimestamps[sessionId] == enteredAt else {
+                return
+            }
+            // Mutating the timestamp map invalidates the SwiftUI body. Merely
+            // comparing Date() in `hasWaitingForInput` does not schedule a
+            // refresh when the reminder duration elapses.
+            waitingForInputTimestamps.removeValue(forKey: sessionId)
+            handleProcessingChange()
+            updateIdleVisibility()
+        }
     }
 
     /// Determine if notification sound should play for the given sessions

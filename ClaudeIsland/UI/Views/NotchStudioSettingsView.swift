@@ -272,7 +272,12 @@ struct NotchStudioSettingsView: View {
 
                         HStack(spacing: 0) {
                             if !previewIsHidden {
-                                HStack(spacing: -2) {
+                                HStack(
+                                    spacing:
+                                        previewCompanionPresentation == .full
+                                        ? -2
+                                        : 0
+                                ) {
                                     VibePetIcon(
                                         size:
                                             CompactNotchMetrics
@@ -290,13 +295,23 @@ struct NotchStudioSettingsView: View {
                                                 .compactPetCanvasSize
                                             * previewAnimationScale
                                     )
-                                    PetStateSignalIcon(
-                                        motion: previewState.motion,
-                                        size:
-                                            CompactNotchMetrics
-                                                .compactSignalSize
-                                            * previewAnimationScale
-                                    )
+                                    switch previewCompanionPresentation {
+                                    case .hidden:
+                                        EmptyView()
+                                    case .micro:
+                                        CompactPetCompanionIcon(
+                                            motion: previewState.motion,
+                                            size: 7 * previewAnimationScale
+                                        )
+                                    case .full:
+                                        PetStateSignalIcon(
+                                            motion: previewState.motion,
+                                            size:
+                                                CompactNotchMetrics
+                                                    .compactSignalSize
+                                                * previewAnimationScale
+                                        )
+                                    }
                                 }
                                 .frame(width: previewLeftWingWidth)
                             }
@@ -421,6 +436,13 @@ struct NotchStudioSettingsView: View {
 
     private var previewAnimationScale: CGFloat {
         CompactNotchMetrics.animationScale(
+            for: preferences.compactWidth
+        )
+    }
+
+    private var previewCompanionPresentation:
+        CompactCompanionPresentation {
+        CompactNotchMetrics.companionPresentation(
             for: preferences.compactWidth
         )
     }
@@ -844,8 +866,8 @@ struct NotchStudioSettingsView: View {
                 HStack {
                     Text(
                         t(
-                            "At minimum, each side only fits its content. Increase the slider to add balanced breathing room.",
-                            "最小值仅容纳两侧动画；增大滑块会均匀增加额外留白。"
+                            "The narrowest notch keeps only the pet. Medium widths add a micro signal; wide notches restore the full companion.",
+                            "最窄时只保留桌宠；中等宽度加入微型信号，足够宽时再显示完整伴生动画。"
                         )
                     )
                     .font(.system(size: 10))

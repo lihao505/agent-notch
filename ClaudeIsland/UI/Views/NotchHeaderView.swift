@@ -424,6 +424,100 @@ struct PetStateSignalIcon: View {
     }
 }
 
+/// A purpose-built signal for narrow compact notches. It uses a fixed 7×7
+/// logical grid and fewer, larger pixels than the full companion.
+struct CompactPetCompanionIcon: View {
+    let motion: VibePetMotion
+    let size: CGFloat
+
+    init(motion: VibePetMotion, size: CGFloat = 14) {
+        self.motion = motion
+        self.size = size
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: interval)) { context in
+            let elapsed = context.date.timeIntervalSinceReferenceDate
+            let phase = Int(elapsed / interval)
+            let breath = (sin(elapsed * .pi) + 1) / 2
+
+            Canvas { canvas, _ in
+                for pixel in pixels(phase: phase, breath: breath) {
+                    canvas.fill(
+                        Path(
+                            CGRect(
+                                x: (pixel.x + 1) * unit,
+                                y: (pixel.y + 1) * unit,
+                                width: unit,
+                                height: unit
+                            )
+                        ),
+                        with: .color(color.opacity(pixel.opacity))
+                    )
+                }
+            }
+            .shadow(color: color.opacity(0.32), radius: 0.8)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private var unit: CGFloat {
+        max(1, floor(size / 7))
+    }
+
+    private var interval: TimeInterval {
+        switch motion {
+        case .working: return 0.24
+        case .waiting: return 1.0 / 30.0
+        case .idle: return 1.4
+        case .ready: return 2
+        }
+    }
+
+    private var color: Color {
+        switch motion {
+        case .idle:
+            return Color(red: 0.26, green: 0.78, blue: 0.48)
+        case .working:
+            return Color(red: 0.36, green: 0.64, blue: 0.88)
+        case .waiting, .ready:
+            return Color(red: 0.90, green: 0.58, blue: 0.32)
+        }
+    }
+
+    private func pixels(
+        phase: Int,
+        breath: Double
+    ) -> [(x: CGFloat, y: CGFloat, opacity: Double)] {
+        switch motion {
+        case .idle:
+            return [
+                (2, 2, 0.34),
+                (2, 4, phase.isMultiple(of: 2) ? 0.72 : 0.44),
+            ]
+        case .working:
+            let active = phase % 3
+            return (0..<3).map { index in
+                (
+                    x: CGFloat(index * 2),
+                    y: CGFloat(4 - index * 2),
+                    opacity: index == active ? 1 : 0.26
+                )
+            }
+        case .waiting:
+            return [(2, 2, 0.22 + breath * 0.78)]
+        case .ready:
+            return [
+                (2, 0, 0.78),
+                (0, 2, 0.78),
+                (4, 2, 0.78),
+                (2, 4, 0.78),
+            ]
+        }
+    }
+}
+
 /// Quiet, static pixel marker used when no agent needs attention.
 /// It deliberately never pulses: motion on the right edge always means work.
 struct IdlePixelIndicatorIcon: View {
