@@ -214,6 +214,11 @@ actor SessionStore {
             (event.event == "Notification" &&
                 event.notificationType == "idle_prompt")
         if isCompletionSignal {
+            // Completion must be visible even when a missed start/tool hook
+            // left the session in idle. Relying only on canTransition used to
+            // set completedAt while leaving phase == idle, so the compact
+            // completion animation could never appear.
+            session.phase = .waitingForInput
             session.completedAt = Date()
         } else if newPhase.isActive ||
                     newPhase.isWaitingForApproval ||

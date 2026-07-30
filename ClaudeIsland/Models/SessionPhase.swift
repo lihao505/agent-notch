@@ -105,6 +105,8 @@ enum SessionPhase: Sendable {
         // Idle transitions
         case (.idle, .processing):
             return true
+        case (.idle, .waitingForInput):
+            return true  // A fast/externally observed turn can finish from idle
         case (.idle, .waitingForApproval):
             return true  // Direct permission request on idle session
         case (.idle, .compacting):

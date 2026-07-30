@@ -11,6 +11,12 @@ import Foundation
 
 /// Pure geometry calculations for the notch
 struct NotchGeometry: Sendable {
+    /// The rendered SwiftUI panel includes the corner/padding wings outside
+    /// `openedSize.width`. Keep global hover/click geometry aligned with the
+    /// AppKit hosting view so controls near either edge remain interactive.
+    nonisolated static let openedPanelHorizontalHitExpansion: CGFloat = 52
+    nonisolated static let openedPanelVerticalHitExpansion: CGFloat = 32
+
     let deviceNotchRect: CGRect
     let screenRect: CGRect
     let windowHeight: CGFloat
@@ -27,9 +33,10 @@ struct NotchGeometry: Sendable {
 
     /// The opened panel rect in screen coordinates for a given size
     func openedScreenRect(for size: CGSize) -> CGRect {
-        // Match the actual rendered panel size (tuned to match visual output)
-        let width = size.width - 6
-        let height = size.height - 30
+        let width =
+            size.width + Self.openedPanelHorizontalHitExpansion
+        let height =
+            size.height + Self.openedPanelVerticalHitExpansion
         return CGRect(
             x: screenRect.midX - width / 2,
             y: screenRect.maxY - height,

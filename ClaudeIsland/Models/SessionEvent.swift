@@ -145,7 +145,7 @@ extension HookEvent {
         }
 
         if event == "Notification" && notificationType == "idle_prompt" {
-            return .idle
+            return .waitingForInput
         }
 
         switch status {
