@@ -120,12 +120,14 @@ enum CompactNotchMetrics {
     /// own larger animation metrics so shrinking this does not reduce detail
     /// in the full panel.
     static let compactAnimationSize: CGFloat = 13
+    static let compactStatusAnimationSize: CGFloat = 11
     static let openedAnimationSize: CGFloat = 27
     static let openedSignalSize: CGFloat = 19
 
     /// A compact sprite renders inside this larger canvas so its glow and every
     /// animation frame stay away from the notch's rounded clipping boundary.
     static let animationCanvasSize: CGFloat = 18
+    static let compactStatusCanvasSize: CGFloat = 15
     static let compactPetCanvasSize: CGFloat = 16
     static let compactSignalSize: CGFloat = 9
     static let openedAnimationCanvasSize: CGFloat = 33

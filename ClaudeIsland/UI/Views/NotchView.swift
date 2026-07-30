@@ -380,15 +380,18 @@ struct NotchView: View {
                     if hasPendingPermission {
                         WaitingPixelIndicatorIcon(
                             size:
-                                CompactNotchMetrics.compactAnimationSize
+                                CompactNotchMetrics
+                                    .compactStatusAnimationSize
                                 * compactAnimationScale
                         )
                             .frame(
                                 width:
-                                    CompactNotchMetrics.animationCanvasSize
+                                    CompactNotchMetrics
+                                        .compactStatusCanvasSize
                                     * compactAnimationScale,
                                 height:
-                                    CompactNotchMetrics.animationCanvasSize
+                                    CompactNotchMetrics
+                                        .compactStatusCanvasSize
                                     * compactAnimationScale
                             )
                             .matchedGeometryEffect(
@@ -399,15 +402,18 @@ struct NotchView: View {
                     } else if isProcessing {
                         PixelLoaderIcon(
                             size:
-                                CompactNotchMetrics.compactAnimationSize
+                                CompactNotchMetrics
+                                    .compactStatusAnimationSize
                                 * compactAnimationScale
                         )
                             .frame(
                                 width:
-                                    CompactNotchMetrics.animationCanvasSize
+                                    CompactNotchMetrics
+                                        .compactStatusCanvasSize
                                     * compactAnimationScale,
                                 height:
-                                    CompactNotchMetrics.animationCanvasSize
+                                    CompactNotchMetrics
+                                        .compactStatusCanvasSize
                                     * compactAnimationScale
                             )
                             .matchedGeometryEffect(
@@ -417,15 +423,17 @@ struct NotchView: View {
                             )
                     } else if hasWaitingForInput {
                         ReadyForInputIndicatorIcon(
-                            size: 10 * compactAnimationScale,
+                            size: 9 * compactAnimationScale,
                             color: TerminalColors.green
                         )
                         .frame(
                             width:
-                                CompactNotchMetrics.animationCanvasSize
+                                CompactNotchMetrics
+                                    .compactStatusCanvasSize
                                 * compactAnimationScale,
                             height:
-                                CompactNotchMetrics.animationCanvasSize
+                                CompactNotchMetrics
+                                    .compactStatusCanvasSize
                                 * compactAnimationScale
                         )
                         .matchedGeometryEffect(
@@ -434,13 +442,20 @@ struct NotchView: View {
                             isSource: showClosedActivity
                         )
                     } else {
-                        IdlePixelIndicatorIcon()
+                        IdlePixelIndicatorIcon(
+                            size:
+                                CompactNotchMetrics
+                                    .compactStatusAnimationSize
+                                * compactAnimationScale
+                        )
                             .frame(
                                 width:
-                                    CompactNotchMetrics.animationCanvasSize
+                                    CompactNotchMetrics
+                                        .compactStatusCanvasSize
                                     * compactAnimationScale,
                                 height:
-                                    CompactNotchMetrics.animationCanvasSize
+                                    CompactNotchMetrics
+                                        .compactStatusCanvasSize
                                     * compactAnimationScale
                             )
                     }

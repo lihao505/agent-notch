@@ -446,15 +446,15 @@ struct NotchStudioSettingsView: View {
         case .idle:
             IdlePixelIndicatorIcon(
                 size:
-                    CompactNotchMetrics.compactAnimationSize
+                    CompactNotchMetrics.compactStatusAnimationSize
                     * previewAnimationScale
             )
                 .frame(
                     width:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale,
                     height:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale
                 )
                 .id(previewState)
@@ -462,15 +462,15 @@ struct NotchStudioSettingsView: View {
         case .working:
             PixelLoaderIcon(
                 size:
-                    CompactNotchMetrics.compactAnimationSize
+                    CompactNotchMetrics.compactStatusAnimationSize
                     * previewAnimationScale
             )
                 .frame(
                     width:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale,
                     height:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale
                 )
                 .id(previewState)
@@ -478,29 +478,29 @@ struct NotchStudioSettingsView: View {
         case .waiting:
             WaitingPixelIndicatorIcon(
                 size:
-                    CompactNotchMetrics.compactAnimationSize
+                    CompactNotchMetrics.compactStatusAnimationSize
                     * previewAnimationScale
             )
                 .frame(
                     width:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale,
                     height:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale
                 )
                 .id(previewState)
                 .transition(.opacity.combined(with: .scale(scale: 0.72)))
         case .complete:
             ReadyForInputIndicatorIcon(
-                size: 10 * previewAnimationScale
+                size: 9 * previewAnimationScale
             )
                 .frame(
                     width:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale,
                     height:
-                        CompactNotchMetrics.animationCanvasSize
+                        CompactNotchMetrics.compactStatusCanvasSize
                         * previewAnimationScale
                 )
                 .id(previewState)
