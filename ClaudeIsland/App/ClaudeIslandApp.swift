@@ -25,6 +25,12 @@ struct ClaudeIslandApp: App {
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
+
+            CommandGroup(after: .help) {
+                Button("Agent Notch Guide") {
+                    appDelegate.showOnboarding()
+                }
+            }
         }
     }
 }

@@ -5,8 +5,12 @@ import SwiftUI
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let onboardingCompletedKey =
+        "agentNotchOnboardingCompleted.v1"
+
     private var windowManager: WindowManager?
     private var screenObserver: ScreenObserver?
+    private var onboardingWindowController: NSWindowController?
     private var settingsWindowController: NSWindowController?
     private weak var trackedSettingsWindow: NSWindow?
 
@@ -52,6 +56,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleScreenChange()
         }
 
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.showOnboardingIfNeeded()
+        }
     }
 
     private func handleScreenChange() {
@@ -60,8 +67,107 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         screenObserver = nil
+        removeOnboardingWindowObserver()
         removeSettingsWindowObservers()
         trackedSettingsWindow = nil
+    }
+
+    private func showOnboardingIfNeeded() {
+        guard !UserDefaults.standard.bool(
+            forKey: Self.onboardingCompletedKey
+        ) else {
+            return
+        }
+        showOnboarding()
+    }
+
+    func showOnboarding() {
+        if let window = onboardingWindowController?.window {
+            presentOnboardingWindow(window)
+            return
+        }
+
+        let contentController = NSHostingController(
+            rootView: OnboardingView { [weak self] in
+                self?.finishOnboarding()
+            }
+        )
+        let window = NSWindow(contentViewController: contentController)
+        window.identifier = NSUserInterfaceItemIdentifier(
+            "agent_notch_onboarding_window"
+        )
+        window.title = NotchPreferences.shared.language.text(
+            "Welcome to Agent Notch",
+            "欢迎使用 Agent Notch"
+        )
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(NSSize(width: 720, height: 480))
+        window.isReleasedWhenClosed = false
+        window.isMovableByWindowBackground = true
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.center()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onboardingWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: window
+        )
+
+        let controller = NSWindowController(window: window)
+        onboardingWindowController = controller
+        presentOnboardingWindow(window)
+
+        Task { @MainActor [weak self, weak window] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard let self, let window, window.isVisible else { return }
+            self.presentOnboardingWindow(window)
+        }
+    }
+
+    private func presentOnboardingWindow(_ window: NSWindow) {
+        NSApplication.shared.setActivationPolicy(.regular)
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        onboardingWindowController?.showWindow(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        window.makeMain()
+    }
+
+    private func finishOnboarding() {
+        UserDefaults.standard.set(
+            true,
+            forKey: Self.onboardingCompletedKey
+        )
+        onboardingWindowController?.window?.close()
+    }
+
+    @objc
+    private func onboardingWindowWillClose(_ notification: Notification) {
+        UserDefaults.standard.set(
+            true,
+            forKey: Self.onboardingCompletedKey
+        )
+        removeOnboardingWindowObserver()
+        onboardingWindowController = nil
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard let self else { return }
+            if self.settingsWindow?.isVisible != true {
+                NSApplication.shared.setActivationPolicy(.accessory)
+            }
+        }
+    }
+
+    private func removeOnboardingWindowObserver() {
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.willCloseNotification,
+            object: onboardingWindowController?.window
+        )
     }
 
     /// Opens Studio from the non-activating notch panel without depending on
