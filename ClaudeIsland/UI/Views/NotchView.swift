@@ -294,27 +294,32 @@ struct NotchView: View {
 
     @ViewBuilder
     private var notchLayout: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Header row - always present, contains the pet and status indicator.
-            headerRow
-                .frame(
-                    height: viewModel.status == .opened
-                        ? CompactNotchMetrics.openedHeaderHeight
-                        : max(24, closedNotchSize.height)
-                )
-
-            // Main content only when opened
-            if viewModel.status == .opened {
-                contentView
-                    .frame(width: notchSize.width - 24) // Fixed width to prevent reflow
-                    .transition(
-                        .asymmetric(
-                            insertion: .scale(scale: 0.8, anchor: .top)
-                                .combined(with: .opacity),
-                            removal: .opacity
-                        )
+        ZStack(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: 0) {
+                headerRow
+                    .frame(
+                        height: viewModel.status == .opened
+                            ? CompactNotchMetrics.openedHeaderHeight
+                            : max(24, closedNotchSize.height)
                     )
+
+                if viewModel.status == .opened {
+                    contentView
+                        .frame(width: notchSize.width - 24)
+                        .transition(
+                            .asymmetric(
+                                insertion: .scale(
+                                    scale: 0.8,
+                                    anchor: .top
+                                )
+                                .combined(with: .opacity),
+                                removal: .opacity
+                            )
+                        )
+                }
             }
+
+            persistentPet
         }
     }
 
@@ -333,30 +338,7 @@ struct NotchView: View {
         HStack(spacing: 0) {
             // Left side - compact pet and its state signal.
             if showClosedActivity {
-                HStack(spacing: -2) {
-                    VibePetIcon(
-                        size:
-                            CompactNotchMetrics.compactAnimationSize
-                            * compactAnimationScale,
-                        motion: petMotion
-                    )
-                        .frame(
-                            width:
-                                CompactNotchMetrics.compactPetCanvasSize
-                                * compactAnimationScale,
-                            height:
-                                CompactNotchMetrics.compactPetCanvasSize
-                                * compactAnimationScale
-                        )
-                        .matchedGeometryEffect(id: "pet", in: activityNamespace, isSource: showClosedActivity)
-
-                    PetStateSignalIcon(
-                        motion: petMotion,
-                        size:
-                            CompactNotchMetrics.compactSignalSize
-                            * compactAnimationScale
-                    )
-                }
+                Color.clear
                 .frame(width: leftWingWidth)
             }
 
@@ -495,6 +477,59 @@ struct NotchView: View {
 
     // MARK: - Opened Header
 
+    /// The pet is a single persistent view rather than two matched snapshots.
+    /// The shell width, offset, and scale animate together, so the sprite keeps
+    /// its current frame while travelling from the compact wing to the row
+    /// beneath quota information.
+    @ViewBuilder
+    private var persistentPet: some View {
+        if viewModel.status == .opened || showClosedActivity {
+            let isOpened = viewModel.status == .opened
+            let compactScale =
+                CompactNotchMetrics.compactAnimationSize *
+                compactAnimationScale /
+                CompactNotchMetrics.openedAnimationSize
+            let scale = isOpened ? 1 : compactScale
+            let fullWidth =
+                CompactNotchMetrics.openedAnimationCanvasSize +
+                6 +
+                CompactNotchMetrics.openedSignalSize
+            let compactX = max(
+                0,
+                (leftWingWidth - fullWidth * compactScale) / 2
+            )
+            let compactY = max(
+                0,
+                (closedNotchSize.height -
+                    CompactNotchMetrics.openedAnimationCanvasSize *
+                    compactScale) / 2
+            )
+
+            HStack(spacing: 6) {
+                VibePetIcon(
+                    size: CompactNotchMetrics.openedAnimationSize,
+                    motion: petMotion
+                )
+                .frame(
+                    width: CompactNotchMetrics.openedAnimationCanvasSize,
+                    height: CompactNotchMetrics.openedAnimationCanvasSize
+                )
+
+                PetStateSignalIcon(
+                    motion: petMotion,
+                    size: CompactNotchMetrics.openedSignalSize
+                )
+            }
+            .scaleEffect(scale, anchor: .topLeading)
+            .offset(
+                x: isOpened ? 8 : compactX,
+                y: isOpened ? 27 : compactY
+            )
+            .allowsHitTesting(false)
+            .zIndex(3)
+        }
+    }
+
     private var openedHeaderRow: some View {
         VStack(spacing: 2) {
             // Keep quota information inside the narrow rail beside the
@@ -505,6 +540,10 @@ struct NotchView: View {
                    let usage = usageMonitor.snapshot {
                     UsageLimitBar(snapshot: usage)
                         .frame(maxWidth: 148)
+                        // Compensate for the shell's shape-safe outer inset so
+                        // quota information aligns with the pet at the true
+                        // left edge of the opened content.
+                        .offset(x: -24)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
@@ -539,33 +578,23 @@ struct NotchView: View {
                     preferences.language == .simplifiedChinese
                         ? "快捷设置"
                         : "Quick Controls"
-                )
+                    )
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             // The animated state lives below quota information. Both sides
             // remain outside the physical notch and can use the larger opened
             // size without being clipped.
             HStack(spacing: 10) {
-                HStack(spacing: 6) {
-                    VibePetIcon(
-                        size: CompactNotchMetrics.openedAnimationSize,
-                        motion: petMotion
-                    )
+                Color.clear
                     .frame(
-                        width: CompactNotchMetrics.openedAnimationCanvasSize,
-                        height: CompactNotchMetrics.openedAnimationCanvasSize
+                        width:
+                            CompactNotchMetrics.openedAnimationCanvasSize +
+                            6 +
+                            CompactNotchMetrics.openedSignalSize,
+                        height:
+                            CompactNotchMetrics.openedAnimationCanvasSize
                     )
-                    .matchedGeometryEffect(
-                        id: "pet",
-                        in: activityNamespace,
-                        isSource: false
-                    )
-
-                    PetStateSignalIcon(
-                        motion: petMotion,
-                        size: CompactNotchMetrics.openedSignalSize
-                    )
-                }
 
                 Spacer()
 
@@ -599,6 +628,7 @@ struct NotchView: View {
             }
         }
         .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Content View (Opened State)

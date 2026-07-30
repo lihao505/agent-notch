@@ -222,7 +222,8 @@ class ClaudeSessionMonitor: ObservableObject {
     private func updateFromSessions(_ sessions: [SessionState]) {
         let now = Date()
         let active = sessions.filter {
-            $0.completedAt == nil && $0.phase != .ended
+            $0.completedAt == nil &&
+                ($0.phase.isActive || $0.phase.isWaitingForApproval)
         }
         let recentCompleted = sessions
             .filter { session in

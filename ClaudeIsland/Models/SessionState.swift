@@ -206,6 +206,20 @@ nonisolated enum SessionRetentionPolicy {
     static let completedLifetime: TimeInterval = 5 * 60 * 60
     static let maximumVisibleCompleted = 1
     static let activeCrowdingThreshold = 2
+    static let missingCodexGracePeriod: TimeInterval = 30
+
+    /// CodexBar starts short-lived Claude CLI probes to read account status.
+    /// They are health checks rather than user conversations and must never
+    /// become task cards.
+    static func isIgnoredProbe(
+        source: AgentSource,
+        cwd: String,
+        projectName: String
+    ) -> Bool {
+        source == .claude &&
+            projectName == "ClaudeProbe" &&
+            cwd.contains("/Application Support/CodexBar/ClaudeProbe")
+    }
 }
 
 // MARK: - Tool Tracker

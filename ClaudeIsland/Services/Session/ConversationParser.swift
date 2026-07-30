@@ -55,6 +55,17 @@ struct ConversationInfo: Equatable {
     var usage: UsageInfo = UsageInfo()  // Token usage stats
 }
 
+/// The latest authoritative turn marker in a Codex Desktop rollout.
+///
+/// A hidden reply relay can outlive the turn for hours, so its PID is not
+/// evidence that Codex is still working. `task_started` / `task_complete` are.
+nonisolated enum CodexTaskLifecycle: Equatable, Sendable {
+    case active(Date?)
+    case completed(Date?)
+    case missing
+    case unknown
+}
+
 actor ConversationParser {
     static let shared = ConversationParser()
 
@@ -73,6 +84,14 @@ actor ConversationParser {
     private var cache: [String: CachedInfo] = [:]
 
     private var incrementalState: [String: IncrementalParseState] = [:]
+    private var codexRolloutPaths: [String: URL] = [:]
+    private var codexLifecycleCache: [
+        String: (
+            fileSize: UInt64,
+            modificationDate: Date?,
+            lifecycle: CodexTaskLifecycle
+        )
+    ] = [:]
 
     private struct CachedInfo {
         let modificationDate: Date
@@ -176,6 +195,111 @@ actor ConversationParser {
             if !title.isEmpty {
                 return title
             }
+        }
+        return nil
+    }
+
+    /// Read only the tail of Codex Desktop's native rollout and return its
+    /// latest turn boundary. This is intentionally independent from the
+    /// synthetic chat transcript used by the notch UI.
+    func codexTaskLifecycle(sessionId: String) -> CodexTaskLifecycle {
+        guard let rolloutURL = codexRolloutURL(sessionId: sessionId) else {
+            return .missing
+        }
+        let values = try? rolloutURL.resourceValues(
+            forKeys: [.fileSizeKey, .contentModificationDateKey]
+        )
+        let fileSize = UInt64(values?.fileSize ?? 0)
+        let modificationDate = values?.contentModificationDate
+        if let cached = codexLifecycleCache[sessionId],
+           cached.fileSize == fileSize,
+           cached.modificationDate == modificationDate {
+            return cached.lifecycle
+        }
+
+        guard let handle = try? FileHandle(forReadingFrom: rolloutURL) else {
+            codexRolloutPaths.removeValue(forKey: sessionId)
+            codexLifecycleCache.removeValue(forKey: sessionId)
+            return .missing
+        }
+        defer { try? handle.close() }
+
+        let tailBudget: UInt64 = 1_048_576
+        guard let fileSize = try? handle.seekToEnd() else {
+            return .unknown
+        }
+        let startOffset = fileSize > tailBudget
+            ? fileSize - tailBudget
+            : 0
+        do {
+            try handle.seek(toOffset: startOffset)
+        } catch {
+            return .unknown
+        }
+
+        guard let data = try? handle.readToEnd(),
+              var text = String(data: data, encoding: .utf8) else {
+            return .unknown
+        }
+        if startOffset > 0, let firstNewline = text.firstIndex(of: "\n") {
+            text.removeSubrange(...firstNewline)
+        }
+
+        var lifecycle = CodexTaskLifecycle.unknown
+        for line in text.split(separator: "\n").reversed() {
+            guard line.contains("\"task_"),
+                  let data = line.data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(
+                    with: data
+                  ) as? [String: Any],
+                  row["type"] as? String == "event_msg",
+                  let payload = row["payload"] as? [String: Any],
+                  let type = payload["type"] as? String else {
+                continue
+            }
+
+            let timestamp = (row["timestamp"] as? String)
+                .flatMap(Self.parseISO8601)
+            switch type {
+            case "task_started":
+                lifecycle = .active(timestamp)
+            case "task_complete":
+                lifecycle = .completed(timestamp)
+            default:
+                continue
+            }
+            break
+        }
+
+        codexLifecycleCache[sessionId] = (
+            fileSize: fileSize,
+            modificationDate: modificationDate,
+            lifecycle: lifecycle
+        )
+        return lifecycle
+    }
+
+    private func codexRolloutURL(sessionId: String) -> URL? {
+        if let cached = codexRolloutPaths[sessionId],
+           FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
+
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions", isDirectory: true)
+        let suffix = "-\(sessionId).jsonl"
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return nil
+        }
+
+        for case let url as URL in enumerator
+        where url.lastPathComponent.hasSuffix(suffix) {
+            codexRolloutPaths[sessionId] = url
+            return url
         }
         return nil
     }

@@ -143,6 +143,22 @@ actor SessionStore {
 
     private func processHookEvent(_ event: HookEvent) async {
         let sessionId = event.sessionId
+        let eventSource = event.source == nil
+            ? AgentSource.claude
+            : AgentSource(hookValue: event.source)
+        let eventProjectName = URL(
+            fileURLWithPath: event.cwd
+        ).lastPathComponent
+        if SessionRetentionPolicy.isIgnoredProbe(
+            source: eventSource,
+            cwd: event.cwd,
+            projectName: eventProjectName
+        ) {
+            sessions.removeValue(forKey: sessionId)
+            cancelPendingSync(sessionId: sessionId)
+            return
+        }
+
         var session = sessions[sessionId] ?? createSession(from: event)
 
         session.pid = event.pid
@@ -219,7 +235,6 @@ actor SessionStore {
         }
 
         sessions[sessionId] = session
-        publishState()
 
         if event.shouldSyncFile {
             scheduleFileSync(sessionId: sessionId, cwd: event.cwd)
@@ -296,16 +311,20 @@ actor SessionStore {
                 }
             }
 
-        case "PostToolUse":
+        case "PostToolUse", "PostToolUseFailure":
             if let toolUseId = event.toolUseId {
-                session.toolTracker.completeTool(id: toolUseId, success: true)
+                let succeeded = event.event == "PostToolUse"
+                session.toolTracker.completeTool(
+                    id: toolUseId,
+                    success: succeeded
+                )
                 // Update chatItem status - tool completed (possibly approved via terminal)
                 // Only update if still waiting for approval or running
                 for i in 0..<session.chatItems.count {
                     if session.chatItems[i].id == toolUseId,
                        case .toolCall(var tool) = session.chatItems[i].type,
                        tool.status == .waitingForApproval || tool.status == .running {
-                        tool.status = .success
+                        tool.status = succeeded ? .success : .error
                         session.chatItems[i] = ChatHistoryItem(
                             id: toolUseId,
                             type: .toolCall(tool),
@@ -1122,6 +1141,11 @@ actor SessionStore {
         payload: FileUpdatePayload,
         session: inout SessionState
     ) {
+        // Codex synthetic transcripts are presentation data. They may retain
+        // a tool placeholder when a native hook is missed, so letting them
+        // drive lifecycle would overwrite the authoritative task boundary
+        // read from Codex Desktop's rollout and cause active/completed flapping.
+        guard session.source != .codex else { return }
         guard !session.phase.isWaitingForApproval else { return }
 
         let hasRunningTool = session.chatItems.contains { item in
@@ -1186,12 +1210,57 @@ actor SessionStore {
     }
 
     /// Recheck status of all active sessions
-    private func recheckAllSessions() {
+    private func recheckAllSessions() async {
         var stateChanged = false
         let now = Date()
 
         for (sessionId, originalSession) in Array(sessions) {
             var session = originalSession
+            if SessionRetentionPolicy.isIgnoredProbe(
+                source: session.source,
+                cwd: session.cwd,
+                projectName: session.projectName
+            ) {
+                sessions.removeValue(forKey: sessionId)
+                cancelPendingSync(sessionId: sessionId)
+                stateChanged = true
+                continue
+            }
+
+            if session.source == .codex {
+                let lifecycle = await ConversationParser.shared
+                    .codexTaskLifecycle(sessionId: sessionId)
+                switch lifecycle {
+                case .active:
+                    if !session.phase.isWaitingForApproval &&
+                       (session.completedAt != nil ||
+                        !session.phase.isActive) {
+                        session.phase = .processing
+                        session.completedAt = nil
+                        sessions[sessionId] = session
+                        stateChanged = true
+                    }
+                case .completed(let completedAt):
+                    if session.completedAt == nil ||
+                       session.phase != .waitingForInput {
+                        session.phase = .waitingForInput
+                        session.completedAt = completedAt ?? now
+                        sessions[sessionId] = session
+                        stateChanged = true
+                    }
+                case .missing:
+                    if now.timeIntervalSince(session.lastActivity) >=
+                        SessionRetentionPolicy.missingCodexGracePeriod {
+                        sessions.removeValue(forKey: sessionId)
+                        cancelPendingSync(sessionId: sessionId)
+                        stateChanged = true
+                        continue
+                    }
+                case .unknown:
+                    break
+                }
+            }
+
             if session.phase == .ended {
                 if let completedAt = session.completedAt,
                    now.timeIntervalSince(completedAt) >=
@@ -1351,6 +1420,15 @@ actor SessionStore {
 
         let now = Date()
         for item in persisted where !sessions.keys.contains(item.sessionId) {
+            let source = AgentSource(rawValue: item.source) ?? .unknown
+            if SessionRetentionPolicy.isIgnoredProbe(
+                source: source,
+                cwd: item.cwd,
+                projectName: item.projectName
+            ) {
+                continue
+            }
+
             let livePid = item.pid.flatMap {
                 isProcessRunning(pid: $0) ? $0 : nil
             }
@@ -1365,12 +1443,30 @@ actor SessionStore {
                 continue
             }
 
-            let source = AgentSource(rawValue: item.source) ?? .unknown
             let codexTitle = source == .codex
                 ? ConversationParser.codexThreadTitle(sessionId: item.sessionId)
                 : nil
+            let codexLifecycle = source == .codex
+                ? await ConversationParser.shared.codexTaskLifecycle(
+                    sessionId: item.sessionId
+                )
+                : .unknown
+            if codexLifecycle == .missing,
+               now.timeIntervalSince(item.lastActivity) >=
+                SessionRetentionPolicy.missingCodexGracePeriod {
+                continue
+            }
+
+            let lifecycleCompletion: Date?
+            if case .completed(let completedAt) = codexLifecycle {
+                lifecycleCompletion = completedAt ?? now
+            } else {
+                lifecycleCompletion = item.completedAt
+            }
             let restoredPhase: SessionPhase
-            if item.completedAt != nil {
+            if case .active = codexLifecycle {
+                restoredPhase = .processing
+            } else if lifecycleCompletion != nil {
                 restoredPhase = item.phase == "ended"
                     ? .ended
                     : .waitingForInput
@@ -1405,7 +1501,7 @@ actor SessionStore {
                 ),
                 lastActivity: item.lastActivity,
                 createdAt: item.createdAt,
-                completedAt: item.completedAt
+                completedAt: lifecycleCompletion
             )
 
             sessions[item.sessionId] = session
