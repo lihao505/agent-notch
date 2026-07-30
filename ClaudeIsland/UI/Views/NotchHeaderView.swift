@@ -76,23 +76,20 @@ struct VibePetIcon: View {
                         .aspectRatio(contentMode: .fit)
                         .foregroundStyle(glowColor)
                         .blur(radius: 2.6)
-                        .opacity(0.50)
+                        .opacity(0.32)
 
                     Image(nsImage: frameImage)
                         .resizable()
                         .interpolation(.none)
                         .antialiased(false)
                         .aspectRatio(contentMode: .fit)
-                        .saturation(1.20)
-                        .contrast(1.08)
-                        .brightness(-0.02)
                         .shadow(
-                            color: glowColor.opacity(0.72),
-                            radius: 1.3
+                            color: glowColor.opacity(0.46),
+                            radius: 1.1
                         )
                         .shadow(
-                            color: glowColor.opacity(0.38),
-                            radius: 3.6
+                            color: glowColor.opacity(0.18),
+                            radius: 3.0
                         )
                 }
             } else {
@@ -140,11 +137,11 @@ struct VibePetIcon: View {
     private var glowColor: Color {
         switch motion {
         case .idle:
-            return Color(red: 0.12, green: 0.78, blue: 0.43)
+            return Color(red: 0.26, green: 0.78, blue: 0.48)
         case .working:
-            return Color(red: 0.16, green: 0.48, blue: 0.92)
+            return Color(red: 0.36, green: 0.64, blue: 0.88)
         case .waiting, .ready:
-            return Color(red: 0.95, green: 0.45, blue: 0.12)
+            return Color(red: 0.90, green: 0.58, blue: 0.32)
         }
     }
 
@@ -258,28 +255,44 @@ struct VibePetIcon: View {
         case .idle:
             return VibePetAnimation(
                 frameNames: (0...7).map {
-                    String(format: "%02d-idle-green-f%d", $0, $0 + 1)
+                    String(
+                        format: "dense-%02d-idle-green-f%d",
+                        $0,
+                        $0 + 1
+                    )
                 },
                 frameDurations: Array(repeating: 1.0, count: 8)
             )
         case .working:
             return VibePetAnimation(
                 frameNames: (8...15).map {
-                    String(format: "%02d-working-blue-f%d", $0, $0 - 7)
+                    String(
+                        format: "dense-%02d-working-blue-f%d",
+                        $0,
+                        $0 - 7
+                    )
                 },
                 frameDurations: Array(repeating: 2.0 / 3.0, count: 8)
             )
         case .waiting:
             return VibePetAnimation(
                 frameNames: (16...23).map {
-                    String(format: "%02d-waiting-orange-f%d", $0, $0 - 15)
+                    String(
+                        format: "dense-%02d-waiting-orange-f%d",
+                        $0,
+                        $0 - 15
+                    )
                 },
                 frameDurations: Array(repeating: 0.5, count: 8)
             )
         case .ready:
             return VibePetAnimation(
                 frameNames: (16...23).map {
-                    String(format: "%02d-waiting-orange-f%d", $0, $0 - 15)
+                    String(
+                        format: "dense-%02d-waiting-orange-f%d",
+                        $0,
+                        $0 - 15
+                    )
                 },
                 frameDurations: Array(repeating: 1.0, count: 8)
             )
@@ -370,11 +383,11 @@ struct PetStateSignalIcon: View {
     private var color: Color {
         switch motion {
         case .idle:
-            return Color(red: 0.12, green: 0.78, blue: 0.43)
+            return Color(red: 0.26, green: 0.78, blue: 0.48)
         case .working:
-            return Color(red: 0.16, green: 0.48, blue: 0.92)
+            return Color(red: 0.36, green: 0.64, blue: 0.88)
         case .waiting, .ready:
-            return Color(red: 0.95, green: 0.45, blue: 0.12)
+            return Color(red: 0.90, green: 0.58, blue: 0.32)
         }
     }
 
@@ -417,7 +430,7 @@ struct IdlePixelIndicatorIcon: View {
     let size: CGFloat
     let color: Color
 
-    init(size: CGFloat = 14, color: Color = .white.opacity(0.32)) {
+    init(size: CGFloat = 14, color: Color = TerminalColors.green.opacity(0.72)) {
         self.size = size
         self.color = color
     }

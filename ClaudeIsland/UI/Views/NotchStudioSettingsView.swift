@@ -272,21 +272,26 @@ struct NotchStudioSettingsView: View {
 
                         HStack(spacing: 0) {
                             if !previewIsHidden {
-                                HStack(spacing: 4) {
+                                HStack(spacing: 1) {
                                     VibePetIcon(
-                                        size: 19,
+                                        size:
+                                            CompactNotchMetrics
+                                                .compactAnimationSize,
                                         motion: previewState.motion
                                     )
                                     .frame(
                                         width:
                                             CompactNotchMetrics
-                                                .animationCanvasSize,
+                                                .compactPetCanvasSize,
                                         height:
                                             CompactNotchMetrics
-                                                .animationCanvasSize
+                                                .compactPetCanvasSize
                                     )
                                     PetStateSignalIcon(
-                                        motion: previewState.motion
+                                        motion: previewState.motion,
+                                        size:
+                                            CompactNotchMetrics
+                                                .compactSignalSize
                                     )
                                 }
                                 .frame(width: previewLeftWingWidth)
@@ -400,11 +405,13 @@ struct NotchStudioSettingsView: View {
     private var previewCameraWidth: CGFloat { 198 }
 
     private var previewLeftWingWidth: CGFloat {
-        CompactNotchMetrics.leftWingWidth
+        CompactNotchMetrics.wingWidth(
+            for: preferences.compactStyle
+        )
     }
 
     private var previewRightWingWidth: CGFloat {
-        CompactNotchMetrics.rightWingWidth(
+        CompactNotchMetrics.wingWidth(
             for: preferences.compactStyle
         )
     }

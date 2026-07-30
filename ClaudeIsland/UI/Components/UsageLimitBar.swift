@@ -13,30 +13,21 @@ struct UsageLimitBar: View {
     @AppStorage("usageDisplayRemaining") private var displayRemaining = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 5) {
             AgentBadge(source: snapshot.source)
 
             if let primary = snapshot.primary {
                 windowRow(primary)
             }
-            if snapshot.primary != nil, snapshot.secondary != nil {
-                Text("|")
-                    .font(.system(size: 9, weight: .light))
-                    .foregroundColor(.white.opacity(0.18))
-            }
-            if let secondary = snapshot.secondary {
-                windowRow(secondary)
-            }
-
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
         .background(
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: 8)
                 .fill(Color.white.opacity(0.045))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10)
+                    RoundedRectangle(cornerRadius: 8)
                         .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
                 )
         )
@@ -54,27 +45,20 @@ struct UsageLimitBar: View {
             ? window.remainingPercent
             : window.usedPercent
 
-        return HStack(spacing: 7) {
-            Text(windowLabel(window.windowMinutes))
-                .font(.system(size: 9, weight: .semibold, design: .rounded))
-                .foregroundColor(.white.opacity(0.48))
-
+        return HStack(spacing: 4) {
             Text("\(Int(percent.rounded()))%")
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
                 .foregroundColor(progressColor(percent))
 
-            Text(resetText(window.resetsAt))
-                .font(.system(size: 9, design: .rounded))
-                .foregroundColor(.white.opacity(0.34))
+            Label {
+                Text(resetText(window.resetsAt))
+            } icon: {
+                Image(systemName: "clock.arrow.circlepath")
+            }
+            .font(.system(size: 7.5, design: .rounded))
+            .foregroundColor(.white.opacity(0.40))
         }
-        .frame(height: 10)
-    }
-
-    private func windowLabel(_ minutes: Int) -> String {
-        if minutes >= 10_080 { return "7d" }
-        if minutes >= 1_440 { return "\(minutes / 1_440)d" }
-        if minutes >= 60 { return "\(minutes / 60)h" }
-        return "\(minutes)m"
+        .frame(height: 9)
     }
 
     private func resetText(_ date: Date) -> String {

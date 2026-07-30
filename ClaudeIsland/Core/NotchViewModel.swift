@@ -47,6 +47,7 @@ class NotchViewModel: ObservableObject {
     @Published var contentType: NotchContentType = .instances
     @Published var isHovering: Bool = false
     @Published private(set) var visibleSessionCount: Int = 0
+    @Published private var compactApprovalSessionId: String?
 
     // MARK: - Dependencies
 
@@ -77,6 +78,12 @@ class NotchViewModel: ObservableObject {
         )
 
         switch contentType {
+        case .chat(let session)
+            where compactApprovalSessionId == session.sessionId:
+            return CGSize(
+                width: min(configuredWidth, 500),
+                height: min(configuredHeight, 360)
+            )
         case .chat:
             return CGSize(width: configuredWidth, height: configuredHeight)
         case .menu:
@@ -87,11 +94,10 @@ class NotchViewModel: ObservableObject {
                 height: min(configuredHeight, 390)
             )
         case .instances:
-            let usageHeight: CGFloat = preferences.showUsageLimits ? 44 : 0
             let listHeight: CGFloat = visibleSessionCount == 0
                 ? 82
                 : CGFloat(visibleSessionCount) * 58 + 8
-            let contentDrivenHeight = max(180, 64 + usageHeight + listHeight)
+            let contentDrivenHeight = max(180, 70 + listHeight)
 
             return CGSize(
                 width: configuredWidth,
@@ -192,11 +198,13 @@ class NotchViewModel: ObservableObject {
     }
 
     private var compactLeftHitExtension: CGFloat {
-        CompactNotchMetrics.leftWingWidth + compactHitExtra
+        CompactNotchMetrics.wingWidth(
+            for: preferences.compactStyle
+        ) + compactHitExtra
     }
 
     private var compactRightHitExtension: CGFloat {
-        CompactNotchMetrics.rightWingWidth(
+        CompactNotchMetrics.wingWidth(
             for: preferences.compactStyle
         ) + compactHitExtra
     }
@@ -350,6 +358,7 @@ class NotchViewModel: ObservableObject {
         }
         status = .closed
         contentType = .instances
+        compactApprovalSessionId = nil
     }
 
     func notchPop() {
@@ -363,6 +372,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func toggleMenu() {
+        compactApprovalSessionId = nil
         contentType = contentType == .menu ? .instances : .menu
     }
 
@@ -371,6 +381,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func showChat(for session: SessionState) {
+        compactApprovalSessionId = nil
         // Avoid unnecessary updates if already showing this chat
         if case .chat(let current) = contentType, current.sessionId == session.sessionId {
             return
@@ -378,9 +389,20 @@ class NotchViewModel: ObservableObject {
         contentType = .chat(session)
     }
 
+    /// Open a permission request in a smaller, scrollable conversation panel.
+    /// The normal chat size remains available when the user opens it manually.
+    func showApproval(for session: SessionState) {
+        openReason = .notification
+        currentChatSession = nil
+        compactApprovalSessionId = session.sessionId
+        contentType = .chat(session)
+        status = .opened
+    }
+
     /// Go back to instances list and clear saved chat state
     func exitChat() {
         currentChatSession = nil
+        compactApprovalSessionId = nil
         contentType = .instances
     }
 

@@ -82,6 +82,7 @@ struct ChatView: View {
                             ))
                     } else {
                         approvalBar(tool: tool)
+                            .id(session.pendingToolId)
                             .transition(.asymmetric(
                                 insertion: .opacity.combined(with: .move(edge: .bottom)),
                                 removal: .opacity
@@ -154,10 +155,15 @@ struct ChatView: View {
                 let wasWaiting = isWaitingForApproval
                 session = updated
                 let isNowProcessing = updated.phase == .processing
+                let isNowWaiting = updated.phase.isWaitingForApproval
 
                 if wasWaiting && isNowProcessing {
                     // Scroll to bottom after permission accepted (with slight delay)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        shouldScrollToBottom = true
+                    }
+                } else if !wasWaiting && isNowWaiting {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                         shouldScrollToBottom = true
                     }
                 }
@@ -569,7 +575,8 @@ struct ChatView: View {
         ChatApprovalBar(
             tool: tool,
             toolInput: session.pendingToolInput,
-            onApprove: { approvePermission() },
+            onApproveOnce: { approvePermission() },
+            onAutoApprove: { autoApprovePermission() },
             onDeny: { denyPermission() }
         )
     }
@@ -626,11 +633,25 @@ struct ChatView: View {
     }
 
     private func approvePermission() {
-        sessionMonitor.approvePermission(sessionId: sessionId)
+        guard let toolUseId = session.pendingToolId else { return }
+        sessionMonitor.approvePermission(
+            sessionId: sessionId,
+            expectedToolUseId: toolUseId
+        )
+    }
+
+    private func autoApprovePermission() {
+        preferences.setApprovalMode(.auto, for: sessionId)
+        approvePermission()
     }
 
     private func denyPermission() {
-        sessionMonitor.denyPermission(sessionId: sessionId, reason: nil)
+        guard let toolUseId = session.pendingToolId else { return }
+        sessionMonitor.denyPermission(
+            sessionId: sessionId,
+            expectedToolUseId: toolUseId,
+            reason: nil
+        )
     }
 
     private func sendMessage() {
@@ -1382,65 +1403,90 @@ struct ChatInteractivePromptBar: View {
 struct ChatApprovalBar: View {
     let tool: String
     let toolInput: String?
-    let onApprove: () -> Void
+    let onApproveOnce: () -> Void
+    let onAutoApprove: () -> Void
     let onDeny: () -> Void
+    @ObservedObject private var preferences = NotchPreferences.shared
 
     @State private var showContent = false
     @State private var showAllowButton = false
     @State private var showDenyButton = false
 
     var body: some View {
-        HStack(spacing: 12) {
-            // Tool info
-            VStack(alignment: .leading, spacing: 2) {
-                Text(MCPToolFormatter.formatToolName(tool))
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(TerminalColors.amber)
-                if let input = toolInput {
-                    Text(input)
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.5))
-                        .lineLimit(1)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(TerminalColors.amber)
+                    .frame(width: 20, height: 20)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(t("Approval required", "需要审批"))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+
+                    HStack(spacing: 5) {
+                        Text(MCPToolFormatter.formatToolName(tool))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(TerminalColors.amber)
+                        Text(t("wants to perform this action", "请求执行以下操作"))
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.46))
+                    }
+
+                    if let input = toolInput, !input.isEmpty {
+                        Text(input)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.64))
+                            .lineLimit(4)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(Color.white.opacity(0.055))
+                            )
+                    }
                 }
+                .opacity(showContent ? 1 : 0)
+                .offset(x: showContent ? 0 : -10)
             }
-            .opacity(showContent ? 1 : 0)
-            .offset(x: showContent ? 0 : -10)
 
-            Spacer()
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                approvalButton(
+                    t("Deny", "拒绝"),
+                    icon: "xmark",
+                    foreground: .white.opacity(0.72),
+                    background: .white.opacity(0.09),
+                    action: onDeny
+                )
+                .opacity(showDenyButton ? 1 : 0)
+                .scaleEffect(showDenyButton ? 1 : 0.8)
 
-            // Deny button
-            Button {
-                onDeny()
-            } label: {
-                Text("Deny")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white.opacity(0.7))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Capsule())
+                approvalButton(
+                    t("Allow once", "允许一次"),
+                    icon: "checkmark",
+                    foreground: .black,
+                    background: .white.opacity(0.94),
+                    action: onApproveOnce
+                )
+                .opacity(showAllowButton ? 1 : 0)
+                .scaleEffect(showAllowButton ? 1 : 0.8)
+
+                approvalButton(
+                    t("Auto approve", "自动审批"),
+                    icon: "bolt.fill",
+                    foreground: .black,
+                    background: TerminalColors.green,
+                    action: onAutoApprove
+                )
+                .opacity(showAllowButton ? 1 : 0)
+                .scaleEffect(showAllowButton ? 1 : 0.8)
             }
-            .buttonStyle(.plain)
-            .opacity(showDenyButton ? 1 : 0)
-            .scaleEffect(showDenyButton ? 1 : 0.8)
-
-            // Allow button
-            Button {
-                onApprove()
-            } label: {
-                Text("Allow")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color.white.opacity(0.95))
-                    .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .opacity(showAllowButton ? 1 : 0)
-            .scaleEffect(showAllowButton ? 1 : 0.8)
         }
-        .frame(minHeight: 44)  // Consistent height with other bars
+        .frame(minHeight: 82)
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Color.black.opacity(0.2))
@@ -1455,6 +1501,29 @@ struct ChatApprovalBar: View {
                 showAllowButton = true
             }
         }
+    }
+
+    private func approvalButton(
+        _ title: String,
+        icon: String,
+        foreground: Color,
+        background: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(foreground)
+                .padding(.horizontal, 12)
+                .frame(height: 30)
+                .background(background)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func t(_ english: String, _ chinese: String) -> String {
+        preferences.language.text(english, chinese)
     }
 }
 

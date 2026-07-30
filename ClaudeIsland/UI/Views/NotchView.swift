@@ -62,11 +62,13 @@ struct NotchView: View {
     }
 
     private var leftWingWidth: CGFloat {
-        CompactNotchMetrics.leftWingWidth
+        CompactNotchMetrics.wingWidth(
+            for: preferences.compactStyle
+        )
     }
 
     private var rightWingWidth: CGFloat {
-        CompactNotchMetrics.rightWingWidth(
+        CompactNotchMetrics.wingWidth(
             for: preferences.compactStyle
         )
     }
@@ -88,8 +90,6 @@ struct NotchView: View {
 
     /// Extra width for expanding activities (like Dynamic Island)
     private var expansionWidth: CGFloat {
-        // Permission indicator adds width on left side only
-        let permissionIndicatorWidth: CGFloat = hasPendingPermission ? 18 : 0
         let compactBaseWidth =
             leftWingWidth +
             rightWingWidth +
@@ -99,7 +99,7 @@ struct NotchView: View {
         if activityCoordinator.expandingActivity.show {
             switch activityCoordinator.expandingActivity.type {
             case .claude:
-                return compactBaseWidth + permissionIndicatorWidth
+                return compactBaseWidth
             case .none:
                 break
             }
@@ -107,7 +107,7 @@ struct NotchView: View {
 
         // Expand for pending permissions (left indicator) or waiting for input (checkmark on right)
         if hasPendingPermission {
-            return compactBaseWidth + permissionIndicatorWidth
+            return compactBaseWidth
         }
 
         // Waiting for input just shows checkmark on right, no extra left indicator
@@ -275,21 +275,14 @@ struct NotchView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Header row - always present, contains the pet and status indicator.
             headerRow
-                .frame(height: max(24, closedNotchSize.height))
+                .frame(
+                    height: viewModel.status == .opened
+                        ? 66
+                        : max(24, closedNotchSize.height)
+                )
 
             // Main content only when opened
             if viewModel.status == .opened {
-                if preferences.showUsageLimits,
-                   let usage = usageMonitor.snapshot {
-                    UsageLimitBar(snapshot: usage)
-                        .padding(.horizontal, 2)
-                        .padding(.bottom, 8)
-                        .transition(
-                            .move(edge: .top)
-                                .combined(with: .opacity)
-                        )
-                }
-
                 contentView
                     .frame(width: notchSize.width - 24) // Fixed width to prevent reflow
                     .transition(
@@ -308,39 +301,38 @@ struct NotchView: View {
 
     @ViewBuilder
     private var headerRow: some View {
+        if viewModel.status == .opened {
+            openedHeaderRow
+        } else {
+            compactHeaderRow
+        }
+    }
+
+    private var compactHeaderRow: some View {
         HStack(spacing: 0) {
-            // Left side - pet + optional permission indicator.
+            // Left side - compact pet and its state signal.
             if showClosedActivity {
-                HStack(spacing: 4) {
-                    VibePetIcon(size: 19, motion: petMotion)
+                HStack(spacing: 1) {
+                    VibePetIcon(
+                        size: CompactNotchMetrics.compactAnimationSize,
+                        motion: petMotion
+                    )
                         .frame(
-                            width: CompactNotchMetrics.animationCanvasSize,
-                            height: CompactNotchMetrics.animationCanvasSize
+                            width: CompactNotchMetrics.compactPetCanvasSize,
+                            height: CompactNotchMetrics.compactPetCanvasSize
                         )
                         .matchedGeometryEffect(id: "pet", in: activityNamespace, isSource: showClosedActivity)
 
-                    PetStateSignalIcon(motion: petMotion)
-
-                    // Permission indicator only (amber) - waiting for input shows checkmark on right
-                    if hasPendingPermission {
-                        PermissionIndicatorIcon(size: 14, color: Color(red: 0.85, green: 0.47, blue: 0.34))
-                            .matchedGeometryEffect(id: "status-indicator", in: activityNamespace, isSource: showClosedActivity)
-                    }
+                    PetStateSignalIcon(
+                        motion: petMotion,
+                        size: CompactNotchMetrics.compactSignalSize
+                    )
                 }
-                .frame(
-                    width: viewModel.status == .opened
-                        ? nil
-                        : leftWingWidth +
-                            (hasPendingPermission ? 18 : 0)
-                )
-                .padding(.leading, viewModel.status == .opened ? 8 : 0)
+                .frame(width: leftWingWidth)
             }
 
             // Center content
-            if viewModel.status == .opened {
-                // Opened: show header content
-                openedHeaderContent
-            } else if !showClosedActivity {
+            if !showClosedActivity {
                 // Closed without activity: empty space
                 Rectangle()
                     .fill(.clear)
@@ -359,8 +351,7 @@ struct NotchView: View {
             // Right side - state animation, with an optional compact task count.
             if showClosedActivity {
                 HStack(spacing: 5) {
-                    if viewModel.status != .opened,
-                       preferences.compactStyle == .detailed {
+                    if preferences.compactStyle == .detailed {
                         HStack(spacing: 3) {
                             Image(systemName: "square.stack.3d.up.fill")
                                 .font(.system(size: 7, weight: .semibold))
@@ -378,8 +369,10 @@ struct NotchView: View {
                         )
                     }
 
-                    if isProcessing {
-                        PixelLoaderIcon(size: 19)
+                    if hasPendingPermission {
+                        WaitingPixelIndicatorIcon(
+                            size: CompactNotchMetrics.compactAnimationSize
+                        )
                             .frame(
                                 width: CompactNotchMetrics.animationCanvasSize,
                                 height: CompactNotchMetrics.animationCanvasSize
@@ -389,8 +382,10 @@ struct NotchView: View {
                                 in: activityNamespace,
                                 isSource: showClosedActivity
                             )
-                    } else if hasPendingPermission {
-                        WaitingPixelIndicatorIcon(size: 19)
+                    } else if isProcessing {
+                        PixelLoaderIcon(
+                            size: CompactNotchMetrics.compactAnimationSize
+                        )
                             .frame(
                                 width: CompactNotchMetrics.animationCanvasSize,
                                 height: CompactNotchMetrics.animationCanvasSize
@@ -402,7 +397,7 @@ struct NotchView: View {
                             )
                     } else if hasWaitingForInput {
                         ReadyForInputIndicatorIcon(
-                            size: 14,
+                            size: 10,
                             color: TerminalColors.green
                         )
                         .frame(
@@ -423,62 +418,109 @@ struct NotchView: View {
                     }
                 }
                 .frame(
-                    width: viewModel.status == .opened
-                        ? 20
-                        : rightWingWidth
+                    width: rightWingWidth
                 )
             }
         }
         .frame(height: closedNotchSize.height)
     }
 
-    // MARK: - Opened Header Content
+    // MARK: - Opened Header
 
-    @ViewBuilder
-    private var openedHeaderContent: some View {
-        HStack(spacing: 12) {
-            // Show the idle pet here when the compact header is not active.
-            // The compact header owns the pet while an activity is visible.
-            if !showClosedActivity {
-                VibePetIcon(size: 19)
-                    .matchedGeometryEffect(id: "pet", in: activityNamespace, isSource: !showClosedActivity)
-                    .padding(.leading, 8)
-            }
+    private var openedHeaderRow: some View {
+        VStack(spacing: 2) {
+            // Keep quota information inside the narrow rail beside the
+            // physical camera notch. A compact bar cannot drift underneath
+            // the opaque hardware area even on narrower displays.
+            HStack(spacing: 8) {
+                if preferences.showUsageLimits,
+                   let usage = usageMonitor.snapshot {
+                    UsageLimitBar(snapshot: usage)
+                        .frame(maxWidth: 148)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
-            Spacer()
+                Spacer(minLength: max(148, viewModel.deviceNotchRect.width))
 
-            // Menu toggle
-            Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    viewModel.toggleMenu()
-                    if viewModel.contentType == .menu {
-                        updateManager.markUpdateSeen()
+                // Menu toggle
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        viewModel.toggleMenu()
+                        if viewModel.contentType == .menu {
+                            updateManager.markUpdateSeen()
+                        }
+                    }
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: viewModel.contentType == .menu ? "xmark" : "line.3.horizontal")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white.opacity(0.4))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
+
+                        if updateManager.hasUnseenUpdate && viewModel.contentType != .menu {
+                            Circle()
+                                .fill(TerminalColors.green)
+                                .frame(width: 6, height: 6)
+                                .offset(x: -2, y: 2)
+                        }
                     }
                 }
-            } label: {
-                ZStack(alignment: .topTrailing) {
-                    Image(systemName: viewModel.contentType == .menu ? "xmark" : "line.3.horizontal")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.4))
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    preferences.language == .simplifiedChinese
+                        ? "快捷设置"
+                        : "Quick Controls"
+                )
+            }
 
-                    // Green dot for unseen update
-                    if updateManager.hasUnseenUpdate && viewModel.contentType != .menu {
-                        Circle()
-                            .fill(TerminalColors.green)
-                            .frame(width: 6, height: 6)
-                            .offset(x: -2, y: 2)
+            // The animated state lives below quota information. Both sides
+            // remain outside the physical notch and can use the larger opened
+            // size without being clipped.
+            HStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    VibePetIcon(
+                        size: CompactNotchMetrics.openedAnimationSize,
+                        motion: petMotion
+                    )
+                    .frame(
+                        width: CompactNotchMetrics.openedAnimationCanvasSize,
+                        height: CompactNotchMetrics.openedAnimationCanvasSize
+                    )
+
+                    PetStateSignalIcon(
+                        motion: petMotion,
+                        size: CompactNotchMetrics.openedSignalSize
+                    )
+                }
+
+                Spacer()
+
+                Group {
+                    if hasPendingPermission {
+                        WaitingPixelIndicatorIcon(
+                            size: CompactNotchMetrics.openedAnimationSize
+                        )
+                    } else if isProcessing {
+                        PixelLoaderIcon(
+                            size: CompactNotchMetrics.openedAnimationSize
+                        )
+                    } else if hasWaitingForInput {
+                        ReadyForInputIndicatorIcon(
+                            size: 20,
+                            color: TerminalColors.green
+                        )
+                    } else {
+                        IdlePixelIndicatorIcon(size: 20)
                     }
                 }
+                .frame(
+                    width: CompactNotchMetrics.openedAnimationCanvasSize,
+                    height: CompactNotchMetrics.openedAnimationCanvasSize
+                )
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(
-                preferences.language == .simplifiedChinese
-                    ? "快捷设置"
-                    : "Quick Controls"
-            )
         }
+        .padding(.horizontal, 8)
     }
 
     // MARK: - Content View (Opened State)
@@ -580,16 +622,22 @@ struct NotchView: View {
     private func handlePendingSessionsChange(_ sessions: [SessionState]) {
         // Completion (`waitingForInput`) should stay compact. Only an actual
         // permission decision is urgent enough to open the full panel.
-        let currentIds = Set(
-            sessions
-                .filter { $0.phase.isWaitingForApproval }
-                .map { $0.stableId }
-        )
+        let currentIds = Set(sessions.compactMap(\.pendingToolId))
         let newPendingIds = currentIds.subtracting(previousPendingIds)
 
-        if !newPendingIds.isEmpty &&
-           viewModel.status == .closed {
-            viewModel.notchOpen(reason: .notification)
+        let newlyPendingSessions = sessions.filter { session in
+                guard let toolUseId = session.pendingToolId else {
+                    return false
+                }
+                return newPendingIds.contains(toolUseId)
+            }
+        if let pendingSession = newlyPendingSessions.max(
+            by: { $0.lastActivity < $1.lastActivity }
+        ) {
+            // An approval is actionable only with its context visible. Open
+            // the exact conversation even when a second request arrives for
+            // a session that was already waiting.
+            viewModel.showApproval(for: pendingSession)
         }
 
         previousPendingIds = currentIds

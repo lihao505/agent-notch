@@ -18,10 +18,13 @@ struct PermissionContext: Sendable {
     /// Format tool input for display
     var formattedInput: String? {
         guard let input = toolInput else { return nil }
+        let displayLimit = 360
 
         // For Bash, prioritize showing the command
         if toolName == "Bash", let command = input["command"]?.value as? String {
-            return command.count > 100 ? String(command.prefix(100)) + "..." : command
+            return command.count > displayLimit
+                ? String(command.prefix(displayLimit)) + "..."
+                : command
         }
 
         // For Write/Edit, show the file path
@@ -38,14 +41,18 @@ struct PermissionContext: Sendable {
         let priorityKeys = ["command", "file_path", "path", "query", "pattern", "url"]
         for key in priorityKeys {
             if let value = input[key]?.value as? String {
-                return value.count > 100 ? String(value.prefix(100)) + "..." : value
+                return value.count > displayLimit
+                    ? String(value.prefix(displayLimit)) + "..."
+                    : value
             }
         }
 
         // Fallback: first non-description string
         for (key, value) in input where key != "description" {
             if let str = value.value as? String {
-                return str.count > 100 ? String(str.prefix(100)) + "..." : str
+                return str.count > displayLimit
+                    ? String(str.prefix(displayLimit)) + "..."
+                    : str
             }
         }
 

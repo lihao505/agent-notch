@@ -113,22 +113,30 @@ enum ApprovalMode: String, CaseIterable, Identifiable {
 }
 
 /// Shared compact-notch geometry used by the live notch, hover hit testing,
-/// and the settings preview. Simple mode is deliberately asymmetric: the
-/// left wing fits the pet plus its companion signal, while the right wing
-/// only fits the state animation.
+/// and the settings preview. Both wings stay exactly the same width; the
+/// compact left composition is tightened to fit the pet and companion signal.
 enum CompactNotchMetrics {
-    /// A 19pt sprite renders inside this larger canvas so its glow and every
+    /// Compact mode stays close to the physical notch. Opened mode uses its
+    /// own larger animation metrics so shrinking this does not reduce detail
+    /// in the full panel.
+    static let compactAnimationSize: CGFloat = 13
+    static let openedAnimationSize: CGFloat = 27
+    static let openedSignalSize: CGFloat = 19
+
+    /// A compact sprite renders inside this larger canvas so its glow and every
     /// animation frame stay away from the notch's rounded clipping boundary.
-    static let animationCanvasSize: CGFloat = 25
-    static let leftWingWidth: CGFloat = 56
-    static let simpleRightWingWidth: CGFloat = 35
-    static let detailedRightWingWidth: CGFloat = 66
+    static let animationCanvasSize: CGFloat = 18
+    static let compactPetCanvasSize: CGFloat = 16
+    static let compactSignalSize: CGFloat = 9
+    static let openedAnimationCanvasSize: CGFloat = 33
+    static let simpleWingWidth: CGFloat = 32
+    static let detailedWingWidth: CGFloat = 47
     static let baseConfiguredWidth = 96.0
 
-    static func rightWingWidth(for style: CompactNotchStyle) -> CGFloat {
+    static func wingWidth(for style: CompactNotchStyle) -> CGFloat {
         style == .detailed
-            ? detailedRightWingWidth
-            : simpleRightWingWidth
+            ? detailedWingWidth
+            : simpleWingWidth
     }
 
     static func userExtraWidth(for configuredWidth: Double) -> CGFloat {
@@ -139,8 +147,7 @@ enum CompactNotchMetrics {
         style: CompactNotchStyle,
         configuredWidth: Double
     ) -> CGFloat {
-        leftWingWidth +
-            rightWingWidth(for: style) +
+        2 * wingWidth(for: style) +
             userExtraWidth(for: configuredWidth)
     }
 }
