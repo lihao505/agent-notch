@@ -498,13 +498,14 @@ struct CompactPetCompanionIcon: View {
             ]
         case .working:
             let active = phase % 3
-            return (0..<3).map { index in
-                (
-                    x: CGFloat(index * 2),
-                    y: CGFloat(4 - index * 2),
-                    opacity: index == active ? 1 : 0.26
-                )
-            }
+            let firstOpacity = active == 0 ? 1.0 : 0.26
+            let secondOpacity = active == 1 ? 1.0 : 0.26
+            let thirdOpacity = active == 2 ? 1.0 : 0.26
+            return [
+                (0, 4, firstOpacity),
+                (2, 2, secondOpacity),
+                (4, 0, thirdOpacity),
+            ]
         case .waiting:
             return [(2, 2, 0.22 + breath * 0.78)]
         case .ready:
