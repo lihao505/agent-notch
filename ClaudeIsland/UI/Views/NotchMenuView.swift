@@ -121,10 +121,15 @@ struct NotchMenuView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    AppDelegate.shared?.showDetailedSettings()
+                    // Let the notch visibly fold back before the regular
+                    // settings window takes focus. Presenting the window first
+                    // moves the app to a new activation context and can prevent
+                    // SwiftUI from drawing the collapse, leaving the expanded
+                    // panel to disappear abruptly after the old delay.
+                    viewModel.notchClose()
 
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        viewModel.notchClose()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                        AppDelegate.shared?.showDetailedSettings()
                     }
                 } label: {
                     HStack(spacing: 10) {
