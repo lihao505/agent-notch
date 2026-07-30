@@ -207,11 +207,18 @@ actor ConversationParser {
         guard let rolloutURL = codexRolloutURL(sessionId: sessionId) else {
             return .missing
         }
-        let values = try? rolloutURL.resourceValues(
-            forKeys: [.fileSizeKey, .contentModificationDateKey]
-        )
-        let fileSize = UInt64(values?.fileSize ?? 0)
-        let modificationDate = values?.contentModificationDate
+        // URL resource values can remain cached on a long-lived URL instance.
+        // That used to freeze the first observed `.active` result even after
+        // Codex appended final_answer/task_complete to the rollout. FileManager
+        // attributes are fetched from the filesystem on every reconciliation.
+        guard let attributes = try? FileManager.default.attributesOfItem(
+            atPath: rolloutURL.path
+        ),
+        let size = attributes[.size] as? NSNumber else {
+            return .unknown
+        }
+        let fileSize = size.uint64Value
+        let modificationDate = attributes[.modificationDate] as? Date
         if let cached = codexLifecycleCache[sessionId],
            cached.fileSize == fileSize,
            cached.modificationDate == modificationDate {
@@ -248,8 +255,7 @@ actor ConversationParser {
 
         var lifecycle = CodexTaskLifecycle.unknown
         for line in text.split(separator: "\n").reversed() {
-            guard line.contains("\"task_") ||
-                    line.contains("\"final_answer\""),
+            guard line.contains("\"event_msg\""),
                   let data = line.data(using: .utf8),
                   let row = try? JSONSerialization.jsonObject(
                     with: data
@@ -277,6 +283,17 @@ actor ConversationParser {
                 lifecycle = .active(timestamp)
             case "task_complete":
                 lifecycle = .completed(timestamp)
+            case "user_message":
+                // A long turn can append more than the one-megabyte tail
+                // budget before it finishes, pushing task_started out of the
+                // scan window. The latest user message is still an
+                // authoritative active-turn boundary.
+                lifecycle = .active(timestamp)
+            case "agent_message"
+                where payload["phase"] as? String == "commentary":
+                // Likewise, ongoing commentary is positive evidence that the
+                // current turn is active. A final answer is handled above.
+                lifecycle = .active(timestamp)
             default:
                 continue
             }

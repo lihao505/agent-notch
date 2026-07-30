@@ -1219,8 +1219,10 @@ actor SessionStore {
         var stateChanged = false
         let now = Date()
 
-        for (sessionId, originalSession) in Array(sessions) {
-            var session = originalSession
+        for sessionId in Array(sessions.keys) {
+            guard var session = sessions[sessionId] else {
+                continue
+            }
             if SessionRetentionPolicy.isIgnoredProbe(
                 source: session.source,
                 cwd: session.cwd,
@@ -1233,36 +1235,48 @@ actor SessionStore {
             }
 
             if session.source == .codex {
+                let observedLastActivity = session.lastActivity
                 let lifecycle = await ConversationParser.shared
                     .codexTaskLifecycle(sessionId: sessionId)
-                switch lifecycle {
-                case .active:
-                    if !session.phase.isWaitingForApproval &&
-                       (session.completedAt != nil ||
-                        !session.phase.isActive) {
-                        session.phase = .processing
-                        session.completedAt = nil
-                        sessions[sessionId] = session
-                        stateChanged = true
+                // The actor is reentrant while the parser reads the rollout.
+                // A Stop/SessionExpired hook may have updated or removed this
+                // session during that await. Never resurrect the old snapshot
+                // or overwrite a newer authoritative hook with stale parsing.
+                guard let latestSession = sessions[sessionId] else {
+                    continue
+                }
+                session = latestSession
+
+                if session.lastActivity <= observedLastActivity {
+                    switch lifecycle {
+                    case .active:
+                        if !session.phase.isWaitingForApproval &&
+                           (session.completedAt != nil ||
+                            !session.phase.isActive) {
+                            session.phase = .processing
+                            session.completedAt = nil
+                            sessions[sessionId] = session
+                            stateChanged = true
+                        }
+                    case .completed(let completedAt):
+                        if session.completedAt == nil ||
+                           session.phase != .waitingForInput {
+                            session.phase = .waitingForInput
+                            session.completedAt = completedAt ?? now
+                            sessions[sessionId] = session
+                            stateChanged = true
+                        }
+                    case .missing:
+                        if now.timeIntervalSince(session.lastActivity) >=
+                            SessionRetentionPolicy.missingCodexGracePeriod {
+                            sessions.removeValue(forKey: sessionId)
+                            cancelPendingSync(sessionId: sessionId)
+                            stateChanged = true
+                            continue
+                        }
+                    case .unknown:
+                        break
                     }
-                case .completed(let completedAt):
-                    if session.completedAt == nil ||
-                       session.phase != .waitingForInput {
-                        session.phase = .waitingForInput
-                        session.completedAt = completedAt ?? now
-                        sessions[sessionId] = session
-                        stateChanged = true
-                    }
-                case .missing:
-                    if now.timeIntervalSince(session.lastActivity) >=
-                        SessionRetentionPolicy.missingCodexGracePeriod {
-                        sessions.removeValue(forKey: sessionId)
-                        cancelPendingSync(sessionId: sessionId)
-                        stateChanged = true
-                        continue
-                    }
-                case .unknown:
-                    break
                 }
             }
 
