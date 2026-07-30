@@ -18,5 +18,13 @@ struct ClaudeIslandApp: App {
         }
         .defaultSize(width: 860, height: 620)
         .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Agent Notch Settings…") {
+                    appDelegate.showDetailedSettings()
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+        }
     }
 }

@@ -17,7 +17,6 @@ import Sparkle
 struct NotchMenuView: View {
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var preferences = NotchPreferences.shared
-    @Environment(\.openSettings) private var openSettings
     @State private var hooksInstalled: Bool = false
     @State private var launchAtLogin: Bool = false
 
@@ -122,17 +121,9 @@ struct NotchMenuView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    let shouldCreateWindow =
-                        AppDelegate.shared?.prepareForSettingsPresentation()
-                        ?? true
-                    if shouldCreateWindow {
-                        openSettings()
-                    }
-                    AppDelegate.shared?.settingsPresentationRequested()
+                    AppDelegate.shared?.showDetailedSettings()
 
-                    // Give SwiftUI enough time to create the Settings scene
-                    // before this source view is removed from the notch.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         viewModel.notchClose()
                     }
                 } label: {

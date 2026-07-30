@@ -7,6 +7,7 @@ import SwiftUI
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowManager: WindowManager?
     private var screenObserver: ScreenObserver?
+    private var settingsWindowController: NSWindowController?
     private weak var trackedSettingsWindow: NSWindow?
 
     static var shared: AppDelegate?
@@ -63,48 +64,77 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         trackedSettingsWindow = nil
     }
 
-    /// Switch to a regular app while Studio is open so its window is represented
-    /// in the Dock. Returns `true` when SwiftUI still needs to create the window.
-    func prepareForSettingsPresentation() -> Bool {
-        NSApplication.shared.setActivationPolicy(.regular)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+    /// Opens Studio from the non-activating notch panel without depending on
+    /// SwiftUI's environment-based `openSettings`, which can be dropped when
+    /// the source panel disappears during the same event cycle.
+    func showDetailedSettings() {
+        let window = settingsWindow ?? makeSettingsWindow()
+        presentSettingsWindow(window)
 
-        guard let window = settingsWindow else {
-            return true
-        }
-
-        trackSettingsWindow(window)
-        window.makeKeyAndOrderFront(nil)
-        return false
-    }
-
-    /// Called after SwiftUI receives `openSettings()`. The retry covers the short
-    /// interval between Scene creation and the NSWindow entering `NSApp.windows`.
-    func settingsPresentationRequested(attempt: Int = 0) {
-        if let window = settingsWindow {
-            trackSettingsWindow(window)
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-
-        guard attempt < 20 else { return }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            self?.settingsPresentationRequested(attempt: attempt + 1)
+        // Reassert frontmost status after the notch finishes its close
+        // animation and after macOS completes the activation-policy change.
+        Task { @MainActor [weak self, weak window] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard let self, let window, window.isVisible else { return }
+            self.presentSettingsWindow(window)
         }
     }
 
     /// The settings root view calls this once its window content is on screen.
     func settingsWindowDidAppear() {
-        NSApplication.shared.setActivationPolicy(.regular)
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        settingsPresentationRequested()
+        guard let window = settingsWindow else { return }
+        presentSettingsWindow(window)
     }
 
     private var settingsWindow: NSWindow? {
-        NSApp.windows.first {
+        if let window = settingsWindowController?.window {
+            return window
+        }
+        return NSApp.windows.first {
             $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window"
         }
+    }
+
+    private func makeSettingsWindow() -> NSWindow {
+        let contentController = NSHostingController(
+            rootView: NotchStudioSettingsView()
+        )
+        let window = NSWindow(contentViewController: contentController)
+        window.identifier = NSUserInterfaceItemIdentifier(
+            "com_apple_SwiftUI_Settings_window"
+        )
+        window.title = "Agent Notch Settings"
+        window.styleMask = [
+            .titled,
+            .closable,
+            .miniaturizable,
+            .resizable
+        ]
+        window.setContentSize(NSSize(width: 860, height: 620))
+        window.minSize = NSSize(width: 780, height: 560)
+        window.isReleasedWhenClosed = false
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.center()
+
+        let controller = NSWindowController(window: window)
+        settingsWindowController = controller
+        return window
+    }
+
+    private func presentSettingsWindow(_ window: NSWindow) {
+        NSApplication.shared.setActivationPolicy(.regular)
+        window.level = .normal
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.deminiaturize(nil)
+
+        settingsWindowController?.showWindow(nil)
+        trackSettingsWindow(window)
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        window.makeMain()
     }
 
     private func trackSettingsWindow(_ window: NSWindow) {
