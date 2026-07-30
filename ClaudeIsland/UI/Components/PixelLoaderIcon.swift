@@ -33,9 +33,12 @@ struct PixelLoaderIcon: View {
                     .interpolation(.none)
                     .antialiased(false)
                     .aspectRatio(contentMode: .fit)
+                    .saturation(1.20)
+                    .contrast(1.08)
+                    .brightness(-0.02)
                     .shadow(
                         color: Self.glowColor,
-                        radius: 1,
+                        radius: 1.3,
                         x: 0,
                         y: 0
                     )
@@ -48,10 +51,10 @@ struct PixelLoaderIcon: View {
     }
 
     private static let glowColor = Color(
-        red: 0.36,
-        green: 0.49,
-        blue: 0.67
-    ).opacity(0.16)
+        red: 0.16,
+        green: 0.48,
+        blue: 0.92
+    ).opacity(0.28)
     private static let frameNames = (0...7).map {
         String(format: "%02d-blue-f%d", $0, $0 + 1)
     }
@@ -130,9 +133,9 @@ struct WaitingPixelIndicatorIcon: View {
     }
 
     private static let color = Color(
-        red: 0.85,
-        green: 0.47,
-        blue: 0.34
+        red: 0.95,
+        green: 0.45,
+        blue: 0.12
     )
     private static let orbitDuration: TimeInterval = 3.2
 }

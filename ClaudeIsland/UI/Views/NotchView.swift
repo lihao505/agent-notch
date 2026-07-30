@@ -588,8 +588,7 @@ struct NotchView: View {
         let newPendingIds = currentIds.subtracting(previousPendingIds)
 
         if !newPendingIds.isEmpty &&
-           viewModel.status == .closed &&
-           !TerminalVisibilityDetector.isTerminalVisibleOnCurrentSpace() {
+           viewModel.status == .closed {
             viewModel.notchOpen(reason: .notification)
         }
 

@@ -169,11 +169,20 @@ struct ClaudeInstancesView: View {
     }
 
     private func approveSession(_ session: SessionState) {
-        sessionMonitor.approvePermission(sessionId: session.sessionId)
+        guard let toolUseId = session.pendingToolId else { return }
+        sessionMonitor.approvePermission(
+            sessionId: session.sessionId,
+            expectedToolUseId: toolUseId
+        )
     }
 
     private func rejectSession(_ session: SessionState) {
-        sessionMonitor.denyPermission(sessionId: session.sessionId, reason: nil)
+        guard let toolUseId = session.pendingToolId else { return }
+        sessionMonitor.denyPermission(
+            sessionId: session.sessionId,
+            expectedToolUseId: toolUseId,
+            reason: nil
+        )
     }
 
     private func archiveSession(_ session: SessionState) {
@@ -354,6 +363,7 @@ struct InstanceRow: View {
                     onApprove: onApprove,
                     onReject: onReject
                 )
+                .id(session.pendingToolId)
                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
             } else {
                 HStack(spacing: 8) {

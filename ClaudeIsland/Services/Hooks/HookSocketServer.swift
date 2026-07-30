@@ -233,6 +233,7 @@ class HookSocketServer {
         decision: String,
         reason: String? = nil,
         updatedInput: [String: AnyCodable]? = nil,
+        allowSessionFallback: Bool = true,
         completion: @escaping @Sendable (Bool) -> Void = { _ in }
     ) {
         queue.async { [weak self] in
@@ -246,11 +247,14 @@ class HookSocketServer {
                 reason: reason,
                 updatedInput: updatedInput
             )
-            || self.sendPermissionResponseBySession(
-                sessionId: sessionId,
-                decision: decision,
-                reason: reason,
-                updatedInput: updatedInput
+            || (
+                allowSessionFallback
+                && self.sendPermissionResponseBySession(
+                    sessionId: sessionId,
+                    decision: decision,
+                    reason: reason,
+                    updatedInput: updatedInput
+                )
             )
             DispatchQueue.main.async { completion(sent) }
         }

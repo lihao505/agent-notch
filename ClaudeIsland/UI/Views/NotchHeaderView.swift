@@ -83,13 +83,16 @@ struct VibePetIcon: View {
                         .interpolation(.none)
                         .antialiased(false)
                         .aspectRatio(contentMode: .fit)
+                        .saturation(1.20)
+                        .contrast(1.08)
+                        .brightness(-0.02)
                         .shadow(
-                            color: glowColor.opacity(0.60),
-                            radius: 1.1
+                            color: glowColor.opacity(0.72),
+                            radius: 1.3
                         )
                         .shadow(
-                            color: glowColor.opacity(0.30),
-                            radius: 3.2
+                            color: glowColor.opacity(0.38),
+                            radius: 3.6
                         )
                 }
             } else {
@@ -137,11 +140,11 @@ struct VibePetIcon: View {
     private var glowColor: Color {
         switch motion {
         case .idle:
-            return Color(red: 0.30, green: 0.59, blue: 0.44)
+            return Color(red: 0.12, green: 0.78, blue: 0.43)
         case .working:
-            return Color(red: 0.36, green: 0.49, blue: 0.67)
+            return Color(red: 0.16, green: 0.48, blue: 0.92)
         case .waiting, .ready:
-            return Color(red: 0.75, green: 0.50, blue: 0.29)
+            return Color(red: 0.95, green: 0.45, blue: 0.12)
         }
     }
 
@@ -367,11 +370,11 @@ struct PetStateSignalIcon: View {
     private var color: Color {
         switch motion {
         case .idle:
-            return Color(red: 0.30, green: 0.59, blue: 0.44)
+            return Color(red: 0.12, green: 0.78, blue: 0.43)
         case .working:
-            return Color(red: 0.36, green: 0.49, blue: 0.67)
+            return Color(red: 0.16, green: 0.48, blue: 0.92)
         case .waiting, .ready:
-            return Color(red: 0.75, green: 0.50, blue: 0.29)
+            return Color(red: 0.95, green: 0.45, blue: 0.12)
         }
     }
 
