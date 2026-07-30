@@ -13,6 +13,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var screenObserver: ScreenObserver?
     private var onboardingWindowController: NSWindowController?
     private var settingsWindowController: NSWindowController?
+    private var settingsPresentationTask: Task<Void, Never>?
     private weak var trackedSettingsWindow: NSWindow?
 
     static var shared: AppDelegate?
@@ -68,6 +69,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         screenObserver = nil
+        settingsPresentationTask?.cancel()
+        settingsPresentationTask = nil
         removeOnboardingWindowObserver()
         removeSettingsWindowObservers()
         trackedSettingsWindow = nil
@@ -175,6 +178,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// SwiftUI's environment-based `openSettings`, which can be dropped when
     /// the source panel disappears during the same event cycle.
     func showDetailedSettings() {
+        settingsPresentationTask?.cancel()
+        settingsPresentationTask = nil
+        presentDetailedSettingsNow()
+    }
+
+    /// Coordinates the compact panel's close animation with Studio's
+    /// presentation. AppDelegate owns the delayed task so it survives the
+    /// source SwiftUI hierarchy disappearing and repeated requests cannot
+    /// leave stale presentations queued.
+    func showDetailedSettings(afterCollapsing viewModel: NotchViewModel) {
+        viewModel.notchClose()
+
+        settingsPresentationTask?.cancel()
+
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            settingsPresentationTask = nil
+            presentDetailedSettingsNow()
+            return
+        }
+
+        settingsPresentationTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled, let self else { return }
+
+            self.settingsPresentationTask = nil
+            self.presentDetailedSettingsNow()
+        }
+    }
+
+    private func presentDetailedSettingsNow() {
         let window = settingsWindow ?? makeSettingsWindow()
         presentSettingsWindow(
             window,
@@ -197,12 +230,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var settingsWindow: NSWindow? {
-        if let window = settingsWindowController?.window {
-            return window
-        }
-        return NSApp.windows.first {
-            $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window"
-        }
+        settingsWindowController?.window
     }
 
     private func makeSettingsWindow() -> NSWindow {
