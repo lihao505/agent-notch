@@ -220,8 +220,34 @@ class ClaudeSessionMonitor: ObservableObject {
     // MARK: - State Update
 
     private func updateFromSessions(_ sessions: [SessionState]) {
-        instances = sessions
-        pendingInstances = sessions.filter { $0.needsAttention }
+        let now = Date()
+        let active = sessions.filter {
+            $0.completedAt == nil && $0.phase != .ended
+        }
+        let recentCompleted = sessions
+            .filter { session in
+                guard let completedAt = session.completedAt else {
+                    return false
+                }
+                return now.timeIntervalSince(completedAt) <
+                    SessionRetentionPolicy.completedLifetime
+            }
+            .sorted {
+                ($0.completedAt ?? .distantPast) >
+                    ($1.completedAt ?? .distantPast)
+            }
+
+        let visibleCompleted: ArraySlice<SessionState>
+        if active.count >= SessionRetentionPolicy.activeCrowdingThreshold {
+            visibleCompleted = []
+        } else {
+            visibleCompleted = recentCompleted.prefix(
+                SessionRetentionPolicy.maximumVisibleCompleted
+            )
+        }
+
+        instances = active + visibleCompleted
+        pendingInstances = active.filter { $0.needsAttention }
     }
 
     // MARK: - History Loading (for UI)

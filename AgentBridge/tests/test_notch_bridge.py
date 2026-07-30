@@ -195,6 +195,9 @@ class SyntheticTranscriptTests(unittest.TestCase):
 
 
 class SessionCleanupTests(unittest.TestCase):
+    def test_completed_turn_default_retention_is_five_hours(self):
+        self.assertEqual(BRIDGE.COMPLETED_TTL, 5 * 60 * 60)
+
     def test_active_event_cancels_pending_completed_cleanup(self):
         with tempfile.TemporaryDirectory() as home, patch.dict(
             os.environ, {"HOME": home}, clear=False

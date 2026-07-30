@@ -59,6 +59,10 @@ struct SessionState: Equatable, Identifiable, Sendable {
 
     var lastActivity: Date
     var createdAt: Date
+    /// Set only after a turn has actually produced its completion signal.
+    /// A newly launched session that is merely waiting for its first prompt is
+    /// not considered completed.
+    var completedAt: Date?
 
     // MARK: - Identifiable
 
@@ -84,7 +88,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
         ),
         needsClearReconciliation: Bool = false,
         lastActivity: Date = Date(),
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        completedAt: Date? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
@@ -101,6 +106,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.needsClearReconciliation = needsClearReconciliation
         self.lastActivity = lastActivity
         self.createdAt = createdAt
+        self.completedAt = completedAt
     }
 
     // MARK: - Derived Properties
@@ -192,6 +198,14 @@ struct SessionState: Equatable, Identifiable, Sendable {
     var canInteract: Bool {
         phase.needsAttention
     }
+}
+
+/// Completed rows are deliberately scarce: one recent result can remain for
+/// context, but active work always owns the notch when the list gets busy.
+nonisolated enum SessionRetentionPolicy {
+    static let completedLifetime: TimeInterval = 5 * 60 * 60
+    static let maximumVisibleCompleted = 1
+    static let activeCrowdingThreshold = 2
 }
 
 // MARK: - Tool Tracker

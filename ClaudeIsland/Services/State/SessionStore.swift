@@ -26,10 +26,12 @@ actor SessionStore {
         let cwd: String
         let projectName: String
         let source: String
-        let pid: Int
+        let pid: Int?
         let tty: String?
+        let phase: String?
         let lastActivity: Date
         let createdAt: Date
+        let completedAt: Date?
     }
 
     // MARK: - State
@@ -46,8 +48,9 @@ actor SessionStore {
     /// Periodic status check task
     private var statusCheckTask: Task<Void, Never>?
 
-    /// Status check interval (3 seconds)
-    private let statusCheckIntervalSeconds: UInt64 = 3
+    /// A one-second fallback keeps the UI responsive if an agent drops a hook
+    /// event. Normal hook delivery remains immediate.
+    private let statusCheckIntervalSeconds: UInt64 = 1
 
     /// Restoration is deliberately deferred until monitoring starts, so the
     /// actor is fully initialized before any filesystem or process inspection.
@@ -156,7 +159,14 @@ actor SessionStore {
         session.lastActivity = Date()
 
         if event.status == "ended" {
-            sessions.removeValue(forKey: sessionId)
+            if event.event == "SessionExpired" {
+                sessions.removeValue(forKey: sessionId)
+            } else {
+                session.phase = .ended
+                session.completedAt = session.completedAt ?? Date()
+                session.pid = nil
+                sessions[sessionId] = session
+            }
             cancelPendingSync(sessionId: sessionId)
             return
         }
@@ -180,6 +190,20 @@ actor SessionStore {
             session.phase = newPhase
         } else {
             Self.logger.debug("Invalid transition: \(String(describing: session.phase), privacy: .public) -> \(String(describing: newPhase), privacy: .public), ignoring")
+        }
+
+        let isCompletionSignal =
+            event.event == "Stop" ||
+            event.event == "StopFailure" ||
+            (event.event == "Notification" &&
+                event.notificationType == "idle_prompt")
+        if isCompletionSignal {
+            session.completedAt = Date()
+        } else if newPhase.isActive ||
+                    newPhase.isWaitingForApproval ||
+                    event.event == "UserPromptSubmit" ||
+                    event.event == "SessionStart" {
+            session.completedAt = nil
         }
 
         if event.event == "PermissionRequest", let toolUseId = event.toolUseId {
@@ -721,6 +745,11 @@ actor SessionStore {
 
         session.toolTracker.lastSyncTime = Date()
 
+        reconcilePhaseFromTranscript(
+            payload: payload,
+            session: &session
+        )
+
         await populateSubagentToolsFromAgentFiles(
             sessionId: payload.sessionId,
             session: &session,
@@ -1086,6 +1115,47 @@ actor SessionStore {
         pendingSyncs.removeValue(forKey: sessionId)
     }
 
+    /// Transcript updates are a fallback for a missed socket hook. A new user
+    /// row or running tool means work is active; a final assistant text with no
+    /// running tool means the turn has completed.
+    private func reconcilePhaseFromTranscript(
+        payload: FileUpdatePayload,
+        session: inout SessionState
+    ) {
+        guard !session.phase.isWaitingForApproval else { return }
+
+        let hasRunningTool = session.chatItems.contains { item in
+            guard case .toolCall(let tool) = item.type else {
+                return false
+            }
+            return tool.status == .running ||
+                tool.status == .waitingForApproval
+        }
+
+        if hasRunningTool {
+            session.phase = .processing
+            session.completedAt = nil
+            return
+        }
+
+        guard let lastMessage = payload.messages.max(by: {
+            $0.timestamp < $1.timestamp
+        }) else {
+            return
+        }
+
+        if lastMessage.role == .user {
+            session.phase = .processing
+            session.completedAt = nil
+        } else if lastMessage.role == .assistant,
+                  !lastMessage.textContent.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                  ).isEmpty {
+            session.phase = .waitingForInput
+            session.completedAt = Date()
+        }
+    }
+
     // MARK: - Periodic Status Check
 
     /// Start periodic status checking for all sessions
@@ -1117,13 +1187,19 @@ actor SessionStore {
 
     /// Recheck status of all active sessions
     private func recheckAllSessions() {
-        var removedSession = false
+        var stateChanged = false
+        let now = Date()
 
-        for (sessionId, session) in Array(sessions) {
+        for (sessionId, originalSession) in Array(sessions) {
+            var session = originalSession
             if session.phase == .ended {
-                sessions.removeValue(forKey: sessionId)
-                cancelPendingSync(sessionId: sessionId)
-                removedSession = true
+                if let completedAt = session.completedAt,
+                   now.timeIntervalSince(completedAt) >=
+                    SessionRetentionPolicy.completedLifetime {
+                    sessions.removeValue(forKey: sessionId)
+                    cancelPendingSync(sessionId: sessionId)
+                    stateChanged = true
+                }
                 continue
             }
 
@@ -1131,26 +1207,23 @@ actor SessionStore {
                 let isRunning = isProcessRunning(pid: pid)
                 if !isRunning {
                     Self.logger.info("Process \(pid) no longer running, ending session \(sessionId.prefix(8))")
-                    sessions.removeValue(forKey: sessionId)
+                    session.pid = nil
+                    session.phase = .ended
+                    session.completedAt = session.completedAt ?? now
+                    sessions[sessionId] = session
                     cancelPendingSync(sessionId: sessionId)
-                    removedSession = true
+                    stateChanged = true
                     continue
                 }
             }
 
-            let needsSync: Bool
-            switch session.phase {
-            case .processing, .waitingForApproval:
-                needsSync = true
-            default:
-                needsSync = false
-            }
-            if needsSync {
-                scheduleFileSync(sessionId: sessionId, cwd: session.cwd)
-            }
+            // Reconcile every live session. This recovers from an occasional
+            // missed UserPromptSubmit/PreToolUse socket event without waiting
+            // for a later hook to repair the visible state.
+            scheduleFileSync(sessionId: sessionId, cwd: session.cwd)
         }
 
-        if removedSession {
+        if stateChanged {
             publishState()
         }
     }
@@ -1163,9 +1236,34 @@ actor SessionStore {
     // MARK: - State Publishing
 
     private func publishState() {
+        pruneCompletedSessions()
         let sortedSessions = Array(sessions.values).sorted { $0.projectName < $1.projectName }
         sessionsSubject.send(sortedSessions)
         persistActiveSessions()
+    }
+
+    private func pruneCompletedSessions(now: Date = Date()) {
+        let completed = sessions.values
+            .filter { $0.completedAt != nil }
+            .sorted {
+                ($0.completedAt ?? .distantPast) >
+                    ($1.completedAt ?? .distantPast)
+            }
+
+        let sessionsToRemove: [SessionState] = completed.enumerated().compactMap {
+            index, session -> SessionState? in
+            guard let completedAt = session.completedAt else { return nil }
+            let expired = now.timeIntervalSince(completedAt) >=
+                SessionRetentionPolicy.completedLifetime
+            let exceedsLimit =
+                index >= SessionRetentionPolicy.maximumVisibleCompleted
+            return expired || exceedsLimit ? session : nil
+        }
+
+        for session in sessionsToRemove {
+            sessions.removeValue(forKey: session.sessionId)
+            cancelPendingSync(sessionId: session.sessionId)
+        }
     }
 
     // MARK: - Active Session Persistence
@@ -1182,26 +1280,34 @@ actor SessionStore {
             .appendingPathComponent("active-sessions.json", isDirectory: false)
     }
 
-    /// Persist only sessions with a live backing process. Completed sessions
-    /// are removed from this snapshot during the same three-second status pass
-    /// that removes them from the notch.
+    /// Persist sessions with a live backing process plus the one recent
+    /// completion that may remain visible after the process exits.
     private func persistActiveSessions() {
+        let now = Date()
         let active = sessions.values.compactMap { session -> PersistedSession? in
-            guard session.phase != .ended,
-                  let pid = session.pid,
-                  isProcessRunning(pid: pid) else {
-                return nil
+            let isRecentCompletion: Bool
+            if let completedAt = session.completedAt {
+                isRecentCompletion = now.timeIntervalSince(completedAt) <
+                    SessionRetentionPolicy.completedLifetime
+            } else {
+                isRecentCompletion = false
             }
+            let livePid = session.pid.flatMap {
+                isProcessRunning(pid: $0) ? $0 : nil
+            }
+            guard isRecentCompletion || livePid != nil else { return nil }
 
             return PersistedSession(
                 sessionId: session.sessionId,
                 cwd: session.cwd,
                 projectName: session.projectName,
                 source: session.source.rawValue,
-                pid: pid,
+                pid: livePid,
                 tty: session.tty,
+                phase: session.phase.description,
                 lastActivity: session.lastActivity,
-                createdAt: session.createdAt
+                createdAt: session.createdAt,
+                completedAt: session.completedAt
             )
         }
 
@@ -1243,8 +1349,19 @@ actor SessionStore {
         var restoredCount = 0
         var restoredSessions: [(sessionId: String, cwd: String)] = []
 
+        let now = Date()
         for item in persisted where !sessions.keys.contains(item.sessionId) {
-            guard isProcessRunning(pid: item.pid) else {
+            let livePid = item.pid.flatMap {
+                isProcessRunning(pid: $0) ? $0 : nil
+            }
+            let isRecentCompletion: Bool
+            if let completedAt = item.completedAt {
+                isRecentCompletion = now.timeIntervalSince(completedAt) <
+                    SessionRetentionPolicy.completedLifetime
+            } else {
+                isRecentCompletion = false
+            }
+            guard livePid != nil || isRecentCompletion else {
                 continue
             }
 
@@ -1252,18 +1369,32 @@ actor SessionStore {
             let codexTitle = source == .codex
                 ? ConversationParser.codexThreadTitle(sessionId: item.sessionId)
                 : nil
+            let restoredPhase: SessionPhase
+            if item.completedAt != nil {
+                restoredPhase = item.phase == "ended"
+                    ? .ended
+                    : .waitingForInput
+            } else {
+                switch item.phase {
+                case "processing": restoredPhase = .processing
+                case "compacting": restoredPhase = .compacting
+                default: restoredPhase = .idle
+                }
+            }
             let session = SessionState(
                 sessionId: item.sessionId,
                 cwd: item.cwd,
                 projectName: item.projectName,
                 source: source,
-                pid: item.pid,
+                pid: livePid,
                 tty: item.tty,
-                isInTmux: ProcessTreeBuilder.shared.isInTmux(
-                    pid: item.pid,
-                    tree: processTree
-                ),
-                phase: .idle,
+                isInTmux: livePid.map {
+                    ProcessTreeBuilder.shared.isInTmux(
+                        pid: $0,
+                        tree: processTree
+                    )
+                } ?? false,
+                phase: restoredPhase,
                 conversationInfo: ConversationInfo(
                     summary: codexTitle,
                     lastMessage: nil,
@@ -1273,7 +1404,8 @@ actor SessionStore {
                     lastUserMessageDate: nil
                 ),
                 lastActivity: item.lastActivity,
-                createdAt: item.createdAt
+                createdAt: item.createdAt,
+                completedAt: item.completedAt
             )
 
             sessions[item.sessionId] = session

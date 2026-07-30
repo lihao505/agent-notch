@@ -168,7 +168,7 @@ enum SessionPhase: Sendable {
     }
 
     /// Whether this phase indicates active processing
-    var isActive: Bool {
+    nonisolated var isActive: Bool {
         switch self {
         case .processing, .compacting:
             return true
@@ -178,7 +178,7 @@ enum SessionPhase: Sendable {
     }
 
     /// Whether this is a waitingForApproval phase
-    var isWaitingForApproval: Bool {
+    nonisolated var isWaitingForApproval: Bool {
         if case .waitingForApproval = self {
             return true
         }

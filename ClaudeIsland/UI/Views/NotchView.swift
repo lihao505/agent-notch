@@ -16,6 +16,19 @@ private let cornerRadiusInsets = (
     closed: (top: CGFloat(6), bottom: CGFloat(14))
 )
 
+/// One animation value drives the notch shell. Keeping geometry changes in a
+/// single transaction avoids several implicit springs fighting over the same
+/// frame when status, content size, and activity state change together.
+private struct NotchLayoutAnimationState: Equatable {
+    let status: NotchStatus
+    let size: CGSize
+    let activityVisible: Bool
+    let permissionVisible: Bool
+    let completionVisible: Bool
+    let compactStyle: CompactNotchStyle
+    let compactWidth: Double
+}
+
 struct NotchView: View {
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var sessionMonitor = ClaudeSessionMonitor()
@@ -78,6 +91,18 @@ struct NotchView: View {
     private var compactAnimationScale: CGFloat {
         CompactNotchMetrics.animationScale(
             for: preferences.compactWidth
+        )
+    }
+
+    private var layoutAnimationState: NotchLayoutAnimationState {
+        NotchLayoutAnimationState(
+            status: viewModel.status,
+            size: notchSize,
+            activityVisible: activityCoordinator.expandingActivity.show,
+            permissionVisible: hasPendingPermission,
+            completionVisible: hasWaitingForInput,
+            compactStyle: preferences.compactStyle,
+            compactWidth: preferences.compactWidth
         )
     }
 
@@ -202,15 +227,11 @@ struct NotchView: View {
                         maxHeight: viewModel.status == .opened ? notchSize.height : nil,
                         alignment: .top
                     )
-                    .animation(viewModel.status == .opened ? openAnimation : closeAnimation, value: viewModel.status)
-                    .animation(openAnimation, value: notchSize) // Animate container size changes between content types
-                    .animation(.smooth, value: activityCoordinator.expandingActivity)
-                    .animation(.smooth, value: hasPendingPermission)
-                    .animation(.smooth, value: hasWaitingForInput)
-                    .animation(.smooth, value: preferences.compactStyle)
                     .animation(
-                        .spring(response: 0.34, dampingFraction: 0.86),
-                        value: preferences.compactWidth
+                        viewModel.status == .opened
+                            ? openAnimation
+                            : closeAnimation,
+                        value: layoutAnimationState
                     )
                     .animation(.spring(response: 0.3, dampingFraction: 0.5), value: isBouncing)
                     .contentShape(Rectangle())
@@ -278,7 +299,7 @@ struct NotchView: View {
             headerRow
                 .frame(
                     height: viewModel.status == .opened
-                        ? 66
+                        ? CompactNotchMetrics.openedHeaderHeight
                         : max(24, closedNotchSize.height)
                 )
 
@@ -289,9 +310,8 @@ struct NotchView: View {
                     .transition(
                         .asymmetric(
                             insertion: .scale(scale: 0.8, anchor: .top)
-                                .combined(with: .opacity)
-                                .animation(.smooth(duration: 0.35)),
-                            removal: .opacity.animation(.easeOut(duration: 0.15))
+                                .combined(with: .opacity),
+                            removal: .opacity
                         )
                     )
             }
@@ -455,9 +475,14 @@ struct NotchView: View {
                                     * compactAnimationScale,
                                 height:
                                     CompactNotchMetrics
-                                        .compactStatusCanvasSize
-                                    * compactAnimationScale
-                            )
+                                    .compactStatusCanvasSize
+                                * compactAnimationScale
+                        )
+                        .matchedGeometryEffect(
+                            id: "spinner",
+                            in: activityNamespace,
+                            isSource: showClosedActivity
+                        )
                     }
                 }
                 .frame(
@@ -530,6 +555,11 @@ struct NotchView: View {
                         width: CompactNotchMetrics.openedAnimationCanvasSize,
                         height: CompactNotchMetrics.openedAnimationCanvasSize
                     )
+                    .matchedGeometryEffect(
+                        id: "pet",
+                        in: activityNamespace,
+                        isSource: false
+                    )
 
                     PetStateSignalIcon(
                         motion: petMotion,
@@ -560,6 +590,11 @@ struct NotchView: View {
                 .frame(
                     width: CompactNotchMetrics.openedAnimationCanvasSize,
                     height: CompactNotchMetrics.openedAnimationCanvasSize
+                )
+                .matchedGeometryEffect(
+                    id: "spinner",
+                    in: activityNamespace,
+                    isSource: false
                 )
             }
         }

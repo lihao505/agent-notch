@@ -44,9 +44,10 @@ DEFAULT_SOCKET = "/tmp/claude-island.sock"
 PERMISSION_TIMEOUT = int(os.environ.get("NOTCH_PERMISSION_TIMEOUT", "285"))
 # Fire-and-forget connect/send budget for non-permission events.
 SEND_TIMEOUT = int(os.environ.get("NOTCH_SEND_TIMEOUT", "5"))
-# A completed turn remains visible briefly so the user can read the result.
-# Any new activity cancels the pending removal. Active sessions never expire.
-COMPLETED_TTL = int(os.environ.get("NOTCH_COMPLETED_TTL", "300"))
+# A completed turn may remain available for up to five hours. The app shows at
+# most one completed row and hides it early when active work gets crowded. Any
+# new activity cancels the pending removal.
+COMPLETED_TTL = int(os.environ.get("NOTCH_COMPLETED_TTL", "18000"))
 SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 RELAY_PREFIX = "multiagent-notch-codex-"
 APPROVAL_POLICY_FILE = os.path.join(
