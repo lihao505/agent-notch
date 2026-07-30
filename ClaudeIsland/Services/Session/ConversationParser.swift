@@ -58,7 +58,8 @@ struct ConversationInfo: Equatable {
 /// The latest authoritative turn marker in a Codex Desktop rollout.
 ///
 /// A hidden reply relay can outlive the turn for hours, so its PID is not
-/// evidence that Codex is still working. `task_started` / `task_complete` are.
+/// evidence that Codex is still working. Native turn boundaries and Codex's
+/// explicitly phased `final_answer` message are.
 nonisolated enum CodexTaskLifecycle: Equatable, Sendable {
     case active(Date?)
     case completed(Date?)
@@ -247,7 +248,8 @@ actor ConversationParser {
 
         var lifecycle = CodexTaskLifecycle.unknown
         for line in text.split(separator: "\n").reversed() {
-            guard line.contains("\"task_"),
+            guard line.contains("\"task_") ||
+                    line.contains("\"final_answer\""),
                   let data = line.data(using: .utf8),
                   let row = try? JSONSerialization.jsonObject(
                     with: data
@@ -260,6 +262,16 @@ actor ConversationParser {
 
             let timestamp = (row["timestamp"] as? String)
                 .flatMap(Self.parseISO8601)
+            if type == "agent_message",
+               payload["phase"] as? String == "final_answer" {
+                // Codex Desktop renders this message before it appends
+                // task_complete (normally about a second later). Treat the
+                // explicit final phase as the completion boundary so the
+                // notch stops showing work as soon as the user sees the final
+                // answer. Commentary agent messages never enter this branch.
+                lifecycle = .completed(timestamp)
+                break
+            }
             switch type {
             case "task_started":
                 lifecycle = .active(timestamp)
