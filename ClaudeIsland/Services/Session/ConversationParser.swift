@@ -53,6 +53,10 @@ struct ConversationInfo: Equatable {
     let firstUserMessage: String?  // Fallback title when no summary
     let lastUserMessageDate: Date?  // Timestamp of last user message (for stable sorting)
     var usage: UsageInfo = UsageInfo()  // Token usage stats
+    /// Native agent policy when the source exposes one. Codex writes this in
+    /// turn_context/thread_settings_applied rows; it is more authoritative
+    /// than Agent Notch's local fallback policy file.
+    var nativeApprovalMode: ApprovalMode? = nil
 }
 
 /// The latest authoritative turn marker in a Codex Desktop rollout.
@@ -157,6 +161,10 @@ actor ConversationParser {
                 lastRole = nil
             }
             let title = Self.codexThreadTitle(sessionId: sessionId)
+            let nativeApprovalMode = nativeApprovalMode(
+                sessionId: sessionId,
+                cwd: cwd
+            )
 
             return ConversationInfo(
                 summary: title,
@@ -165,7 +173,8 @@ actor ConversationParser {
                 lastToolName: nil,
                 firstUserMessage: Self.truncateMessage(firstUser),
                 lastUserMessageDate: messages.last(where: { $0.role == .user })?.timestamp,
-                usage: UsageInfo()
+                usage: UsageInfo(),
+                nativeApprovalMode: nativeApprovalMode
             )
         }
 
@@ -198,7 +207,8 @@ actor ConversationParser {
                 lastToolName: info.lastToolName,
                 firstUserMessage: info.firstUserMessage,
                 lastUserMessageDate: info.lastUserMessageDate,
-                usage: info.usage
+                usage: info.usage,
+                nativeApprovalMode: info.nativeApprovalMode
             )
         }
         cache[sessionFile] = CachedInfo(modificationDate: modDate, info: info)
@@ -230,6 +240,68 @@ actor ConversationParser {
             }
         }
         return nil
+    }
+
+    /// Read the latest Codex approval policy from its native rollout. This is
+    /// intentionally separate from the app-owned bridge policy: when Codex is
+    /// launched with full access (`approval_policy: never`), no Permission-
+    /// Request hook is expected and the notch must not label the conversation
+    /// as single-approval.
+    func nativeApprovalMode(sessionId: String, cwd: String) -> ApprovalMode? {
+        guard let native = nativeConversationURL(sessionId: sessionId, cwd: cwd),
+              case .codex = native.kind,
+              let handle = try? FileHandle(forReadingFrom: native.url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+
+        guard let fileSize = try? handle.seekToEnd() else { return nil }
+        let tailBudget: UInt64 = 1_048_576
+        let startOffset = fileSize > tailBudget ? fileSize - tailBudget : 0
+        guard (try? handle.seek(toOffset: startOffset)) != nil,
+              let data = try? handle.readToEnd(),
+              var text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        if startOffset > 0, let firstNewline = text.firstIndex(of: "\n") {
+            text.removeSubrange(...firstNewline)
+        }
+
+        for line in text.split(separator: "\n").reversed() {
+            guard let lineData = line.data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  row["type"] as? String == "event_msg",
+                  let payload = row["payload"] as? [String: Any],
+                  let payloadType = payload["type"] as? String else {
+                continue
+            }
+
+            let policy: String?
+            switch payloadType {
+            case "turn_context":
+                policy = payload["approval_policy"] as? String
+            case "thread_settings_applied":
+                policy = (payload["thread_settings"] as? [String: Any])?["approval_policy"] as? String
+            default:
+                continue
+            }
+
+            if let mode = Self.approvalMode(forCodexPolicy: policy) {
+                return mode
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func approvalMode(forCodexPolicy policy: String?) -> ApprovalMode? {
+        switch policy?.lowercased() {
+        case "never", "bypasspermissions", "bypass_permissions", "full-auto", "full_auto":
+            return .trusted
+        case "untrusted", "on-request", "on_request", "on-failure", "on_failure", "always":
+            return .ask
+        default:
+            return nil
+        }
     }
 
     /// Read only the tail of Codex Desktop's native rollout and return its

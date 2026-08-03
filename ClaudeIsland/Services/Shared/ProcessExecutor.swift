@@ -116,6 +116,79 @@ actor ProcessExecutor {
         try result.get()
     }
 
+    /// Run a CLI chat command and return its stdout. Output is drained on a
+    /// background reader before waiting for termination, so a verbose agent
+    /// cannot deadlock on a full stdout pipe.
+    func runCapturingOutput(
+        _ executable: String,
+        arguments: [String],
+        standardInput: String? = nil,
+        currentDirectoryPath: String? = nil
+    ) async throws -> String {
+        let result: Result<String, ProcessExecutorError> = await withCheckedContinuation { continuation in
+            let process = Process()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            let inputPipe = standardInput.map { _ in Pipe() }
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            if let currentDirectoryPath,
+               FileManager.default.fileExists(atPath: currentDirectoryPath) {
+                process.currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath)
+            }
+            process.standardInput = inputPipe
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+
+            let readGroup = DispatchGroup()
+            readGroup.enter()
+            var stdoutData = Data()
+            DispatchQueue.global(qos: .utility).async {
+                stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                readGroup.leave()
+            }
+            readGroup.enter()
+            var stderrData = Data()
+            DispatchQueue.global(qos: .utility).async {
+                stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                readGroup.leave()
+            }
+
+            do {
+                try process.run()
+                if let standardInput, let inputPipe {
+                    inputPipe.fileHandleForWriting.write(Data(standardInput.utf8))
+                    inputPipe.fileHandleForWriting.closeFile()
+                }
+                process.waitUntilExit()
+                readGroup.wait()
+
+                let output = String(data: stdoutData, encoding: .utf8) ?? ""
+                let stderr = String(data: stderrData, encoding: .utf8)
+                if process.terminationStatus == 0 {
+                    continuation.resume(returning: .success(output))
+                } else {
+                    continuation.resume(returning: .failure(.executionFailed(
+                        command: executable,
+                        exitCode: process.terminationStatus,
+                        stderr: stderr
+                    )))
+                }
+            } catch let error as NSError {
+                inputPipe?.fileHandleForWriting.closeFile()
+                if error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+                    continuation.resume(returning: .failure(.commandNotFound(executable)))
+                } else {
+                    continuation.resume(returning: .failure(.launchFailed(
+                        command: executable,
+                        underlying: error
+                    )))
+                }
+            }
+        }
+        return try result.get()
+    }
+
     /// Run a command asynchronously and return a full Result with exit code and stderr
     func runWithResult(_ executable: String, arguments: [String]) async -> Result<ProcessResult, ProcessExecutorError> {
         await withCheckedContinuation { continuation in

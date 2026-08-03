@@ -63,7 +63,7 @@ struct NotchMenuView: View {
 
                 approvalModeButton(.ask, title: t("Once", "单次"))
                 approvalModeButton(.auto, title: t("Auto", "自动"))
-                approvalModeButton(.trusted, title: t("Trust", "信任"))
+                approvalModeButton(.trusted, title: t("Fully trusted", "完全信任"))
             }
             .padding(.horizontal, 3)
 

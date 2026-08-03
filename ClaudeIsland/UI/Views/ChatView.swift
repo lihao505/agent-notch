@@ -10,6 +10,11 @@ import Combine
 import SwiftUI
 
 struct ChatView: View {
+    private enum ChatSendResult {
+        case success(output: String)
+        case failure(String)
+    }
+
     let sessionId: String
     let initialSession: SessionState
     let sessionMonitor: ClaudeSessionMonitor
@@ -53,6 +58,21 @@ struct ChatView: View {
     /// Extract the tool name if waiting for approval
     private var approvalTool: String? {
         session.phase.approvalToolName
+    }
+
+    /// Codex's native rollout is authoritative for desktop-backed sessions.
+    /// In full-access mode it records `approval_policy: never`, meaning no
+    /// PermissionRequest is expected and the chip must not say "Once".
+    private var effectiveApprovalMode: ApprovalMode {
+        if session.source == .codex,
+           let nativeMode = session.conversationInfo.nativeApprovalMode {
+            return nativeMode
+        }
+        return preferences.approvalMode(for: sessionId)
+    }
+
+    private var hasNativeApprovalMode: Bool {
+        session.source == .codex && session.conversationInfo.nativeApprovalMode != nil
     }
 
     
@@ -244,13 +264,17 @@ struct ChatView: View {
 
                 ForEach(ApprovalMode.allCases) { mode in
                     Button {
-                        preferences.setApprovalMode(mode, for: sessionId)
+                        if !hasNativeApprovalMode {
+                            preferences.setApprovalMode(mode, for: sessionId)
+                        }
                     } label: {
                         Label(
                             approvalModeTitle(mode),
                             systemImage:
-                                preferences.hasApprovalOverride(for: sessionId)
-                                && preferences.approvalMode(for: sessionId) == mode
+                                (hasNativeApprovalMode && effectiveApprovalMode == mode)
+                                || (!hasNativeApprovalMode
+                                    && preferences.hasApprovalOverride(for: sessionId)
+                                    && preferences.approvalMode(for: sessionId) == mode)
                                 ? "checkmark"
                                 : approvalModeIcon(mode)
                         )
@@ -258,12 +282,8 @@ struct ChatView: View {
                 }
             } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: approvalModeIcon(
-                        preferences.approvalMode(for: sessionId)
-                    ))
-                    Text(approvalModeTitle(
-                        preferences.approvalMode(for: sessionId)
-                    ))
+                    Image(systemName: approvalModeIcon(effectiveApprovalMode))
+                    Text(approvalModeTitle(effectiveApprovalMode))
                     Image(systemName: "chevron.down")
                         .font(.system(size: 7, weight: .bold))
                         .opacity(0.55)
@@ -285,6 +305,12 @@ struct ChatView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
+            .disabled(hasNativeApprovalMode)
+            .help(
+                hasNativeApprovalMode
+                    ? t("Controlled by Codex desktop permissions", "由 Codex 桌面端权限控制")
+                    : ""
+            )
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -316,7 +342,7 @@ struct ChatView: View {
         case .auto:
             return t("Auto", "自动")
         case .trusted:
-            return t("Trust", "信任")
+            return t("Fully trusted", "完全信任")
         }
     }
 
@@ -685,38 +711,46 @@ struct ChatView: View {
         isSendingMessage = true
         sendErrorMessage = nil
 
-        // Don't add to history here - it will be synced from JSONL when UserPromptSubmit event fires
+        // Add the exact text sent to the CLI immediately. The response is
+        // appended from CLI stdout below; no desktop transcript round-trip is
+        // required for this chat path.
+        history.append(ChatHistoryItem(
+            id: "cli-user-\(UUID().uuidString)",
+            type: .user(text),
+            timestamp: Date()
+        ))
+
         Task {
-            if let errorMessage = await sendToSession(text) {
+            switch await sendToSession(text) {
+            case .failure(let errorMessage):
                 sendErrorMessage = errorMessage
-            } else {
+            case .success(let output):
                 inputText = ""
 
-                // The desktop-backed agents write their authoritative turn
-                // to a native JSONL store, not to the Claude-shaped bridge
-                // transcript. Re-read that store after the CLI exits so the
-                // notch and the native Codex/CodeBuddy desktop conversation
-                // show the same user/assistant messages even when no hook
-                // event was delivered to this process.
-                if session.source == .codex || session.source == .codebuddy {
-                    await ChatHistoryManager.shared.syncFromFile(
-                        sessionId: sessionId,
-                        cwd: session.cwd
-                    )
-                    history = ChatHistoryManager.shared.history(for: sessionId)
+                // This is intentionally a CLI-only chat path. Render the
+                // actual CLI response directly instead of depending on a
+                // desktop app's native transcript watcher.
+                let assistantText = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !assistantText.isEmpty {
+                    history.append(ChatHistoryItem(
+                        id: "cli-assistant-\(UUID().uuidString)",
+                        type: .assistant(assistantText),
+                        timestamp: Date()
+                    ))
+                    shouldScrollToBottom = true
                 }
             }
             isSendingMessage = false
         }
     }
 
-    private func sendToSession(_ text: String) async -> String? {
+    private func sendToSession(_ text: String) async -> ChatSendResult {
         if session.source == .codex {
             guard let executable = codexExecutablePath else {
-                return "Codex CLI was not found."
+                return .failure("Codex CLI was not found.")
             }
             do {
-                try await ProcessExecutor.shared.runDiscardingOutput(
+                let output = try await ProcessExecutor.shared.runCapturingOutput(
                     executable,
                     arguments: [
                         "exec", "resume",
@@ -728,18 +762,18 @@ struct ChatView: View {
                     standardInput: text + "\n",
                     currentDirectoryPath: session.cwd
                 )
-                return nil
+                return .success(output: output)
             } catch {
-                return "Could not send to Codex: \(error.localizedDescription)"
+                return .failure("Could not send to Codex: \(error.localizedDescription)")
             }
         }
 
         if session.source == .codebuddy {
             guard let executable = codeBuddyExecutablePath else {
-                return "CodeBuddy CLI was not found."
+                return .failure("CodeBuddy CLI was not found.")
             }
             do {
-                try await ProcessExecutor.shared.runDiscardingOutput(
+                let output = try await ProcessExecutor.shared.runCapturingOutput(
                     executable,
                     arguments: [
                         "--resume", sessionId,
@@ -748,21 +782,21 @@ struct ChatView: View {
                     standardInput: text + "\n",
                     currentDirectoryPath: session.cwd
                 )
-                return nil
+                return .success(output: output)
             } catch {
-                return "Could not send to CodeBuddy: \(error.localizedDescription)"
+                return .failure("Could not send to CodeBuddy: \(error.localizedDescription)")
             }
         }
 
         guard session.isInTmux else {
-            return "This agent is not connected through tmux."
+            return .failure("This agent is not connected through tmux.")
         }
 
         if let target = await findTmuxTarget(for: session) {
             let sent = await ToolApprovalHandler.shared.sendMessage(text, to: target)
-            return sent ? nil : "Could not send the message to tmux."
+            return sent ? .success(output: "") : .failure("Could not send the message to tmux.")
         }
-        return "Could not find the agent's tmux pane."
+        return .failure("Could not find the agent's tmux pane.")
     }
 
     private var codexExecutablePath: String? {
