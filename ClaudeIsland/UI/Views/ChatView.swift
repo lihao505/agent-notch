@@ -691,6 +691,20 @@ struct ChatView: View {
                 sendErrorMessage = errorMessage
             } else {
                 inputText = ""
+
+                // The desktop-backed agents write their authoritative turn
+                // to a native JSONL store, not to the Claude-shaped bridge
+                // transcript. Re-read that store after the CLI exits so the
+                // notch and the native Codex/CodeBuddy desktop conversation
+                // show the same user/assistant messages even when no hook
+                // event was delivered to this process.
+                if session.source == .codex || session.source == .codebuddy {
+                    await ChatHistoryManager.shared.syncFromFile(
+                        sessionId: sessionId,
+                        cwd: session.cwd
+                    )
+                    history = ChatHistoryManager.shared.history(for: sessionId)
+                }
             }
             isSendingMessage = false
         }
@@ -711,7 +725,8 @@ struct ChatView: View {
                         sessionId,
                         "-"
                     ],
-                    standardInput: text + "\n"
+                    standardInput: text + "\n",
+                    currentDirectoryPath: session.cwd
                 )
                 return nil
             } catch {
@@ -730,7 +745,8 @@ struct ChatView: View {
                         "--resume", sessionId,
                         "--print"
                     ],
-                    standardInput: text + "\n"
+                    standardInput: text + "\n",
+                    currentDirectoryPath: session.cwd
                 )
                 return nil
             } catch {

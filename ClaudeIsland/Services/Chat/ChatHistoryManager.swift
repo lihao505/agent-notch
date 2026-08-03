@@ -85,7 +85,22 @@ class ChatHistoryManager: ObservableObject {
         var newHistories: [String: [ChatHistoryItem]] = [:]
         var newAgentDescriptions: [String: [String: String]] = [:]
         for session in sessions {
-            let filteredItems = filterOutSubagentTools(session.chatItems)
+            var filteredItems = filterOutSubagentTools(session.chatItems)
+
+            // Codex and CodeBuddy expose their real conversation in native
+            // rollout/message JSONL files. The hook bridge still emits
+            // Claude-shaped tool placeholders (often named Bash/Shell) so
+            // the notch can track lifecycle and approvals. Those placeholders
+            // are not conversation messages and must never appear in the
+            // user-visible transcript.
+            if session.source == .codex || session.source == .codebuddy {
+                // Native parser items are prefixed with `native-`. Keeping
+                // only those IDs also removes synthetic user/assistant rows
+                // that may already have been inserted by the bridge before
+                // the native file watcher catches up.
+                filteredItems = filteredItems.filter { $0.id.hasPrefix("native-") }
+            }
+
             newHistories[session.sessionId] = filteredItems
             newAgentDescriptions[session.sessionId] = session.subagentState.agentDescriptions
         }

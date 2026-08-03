@@ -94,6 +94,11 @@ actor ConversationParser {
         )
     ] = [:]
 
+    private enum NativeConversationKind {
+        case codex
+        case codeBuddy
+    }
+
     private struct CachedInfo {
         let modificationDate: Date
         let info: ConversationInfo
@@ -137,6 +142,33 @@ actor ConversationParser {
     /// Parse a JSONL file to extract conversation info
     /// Uses caching based on file modification time
     func parse(sessionId: String, cwd: String) -> ConversationInfo {
+        // Codex and CodeBuddy have their own native conversation stores. The
+        // bridge's Claude-shaped transcript is only a lifecycle fallback and
+        // may contain Shell/Bash hook placeholders, so never use it for the
+        // user-visible chat when a native file is available.
+        if nativeConversationURL(sessionId: sessionId, cwd: cwd) != nil {
+            let messages = parseFullConversation(sessionId: sessionId, cwd: cwd)
+            let firstUser = messages.first(where: { $0.role == .user })?.textContent
+            let last = messages.last(where: { !$0.textContent.isEmpty })
+            let lastRole: String?
+            if let last {
+                lastRole = last.role == .user ? "user" : "assistant"
+            } else {
+                lastRole = nil
+            }
+            let title = Self.codexThreadTitle(sessionId: sessionId)
+
+            return ConversationInfo(
+                summary: title,
+                lastMessage: Self.truncateMessage(last?.textContent),
+                lastMessageRole: lastRole,
+                lastToolName: nil,
+                firstUserMessage: Self.truncateMessage(firstUser),
+                lastUserMessageDate: messages.last(where: { $0.role == .user })?.timestamp,
+                usage: UsageInfo()
+            )
+        }
+
         let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
         let sessionFile = ClaudePaths.projectsDir.path + "/" + projectDir + "/" + sessionId + ".jsonl"
 
@@ -516,6 +548,17 @@ actor ConversationParser {
 
     /// Parse full conversation history for chat view (returns ALL messages - use sparingly)
     func parseFullConversation(sessionId: String, cwd: String) -> [ChatMessage] {
+        if let native = nativeConversationURL(sessionId: sessionId, cwd: cwd) {
+            var state = IncrementalParseState()
+            _ = parseNativeNewLines(
+                filePath: native.url.path,
+                kind: native.kind,
+                state: &state
+            )
+            incrementalState[sessionId] = state
+            return state.messages
+        }
+
         let sessionFile = Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
 
         guard FileManager.default.fileExists(atPath: sessionFile) else {
@@ -541,6 +584,24 @@ actor ConversationParser {
 
     /// Parse only NEW messages since last call (efficient incremental updates)
     func parseIncremental(sessionId: String, cwd: String) -> IncrementalParseResult {
+        if let native = nativeConversationURL(sessionId: sessionId, cwd: cwd) {
+            var state = incrementalState[sessionId] ?? IncrementalParseState()
+            let newMessages = parseNativeNewLines(
+                filePath: native.url.path,
+                kind: native.kind,
+                state: &state
+            )
+            incrementalState[sessionId] = state
+            return IncrementalParseResult(
+                newMessages: newMessages,
+                allMessages: state.messages,
+                completedToolIds: [],
+                toolResults: [:],
+                structuredResults: [:],
+                clearDetected: false
+            )
+        }
+
         let sessionFile = Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
 
         guard FileManager.default.fileExists(atPath: sessionFile) else {
@@ -714,6 +775,172 @@ actor ConversationParser {
     private static func sessionFilePath(sessionId: String, cwd: String) -> String {
         let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
         return ClaudePaths.projectsDir.path + "/" + projectDir + "/" + sessionId + ".jsonl"
+    }
+
+    /// Locate an agent's native transcript. Codex stores rollouts under
+    /// ~/.codex/sessions; CodeBuddy stores message JSONL under
+    /// ~/.codebuddy/projects. The bridge transcript is deliberately not part
+    /// of this lookup.
+    private func nativeConversationURL(
+        sessionId: String,
+        cwd: String
+    ) -> (url: URL, kind: NativeConversationKind)? {
+        if let url = codexRolloutURL(sessionId: sessionId) {
+            return (url, .codex)
+        }
+
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codebuddy/projects", isDirectory: true)
+        let projectKey = cwd
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
+        let projectKeyWithoutLeadingDash = projectKey.hasPrefix("-")
+            ? String(projectKey.dropFirst())
+            : projectKey
+
+        let candidates = [
+            root.appendingPathComponent(projectKey).appendingPathComponent("\(sessionId).jsonl"),
+            root.appendingPathComponent(projectKeyWithoutLeadingDash).appendingPathComponent("\(sessionId).jsonl")
+        ]
+        if let url = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+            return (url, .codeBuddy)
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return nil
+        }
+
+        for case let url as URL in enumerator
+        where url.lastPathComponent == "\(sessionId).jsonl" {
+            return (url, .codeBuddy)
+        }
+        return nil
+    }
+
+    /// Parse native Codex/CodeBuddy rows while deliberately ignoring tool
+    /// calls, shell output, reasoning blobs, and hook-generated transcripts.
+    private func parseNativeNewLines(
+        filePath: String,
+        kind: NativeConversationKind,
+        state: inout IncrementalParseState
+    ) -> [ChatMessage] {
+        guard let fileHandle = FileHandle(forReadingAtPath: filePath) else {
+            return []
+        }
+        defer { try? fileHandle.close() }
+
+        guard let fileSize = try? fileHandle.seekToEnd() else { return [] }
+        if fileSize < state.lastFileOffset {
+            state = IncrementalParseState()
+        }
+        if fileSize == state.lastFileOffset { return [] }
+
+        let startOffset = state.lastFileOffset
+        guard (try? fileHandle.seek(toOffset: startOffset)) != nil,
+              let data = try? fileHandle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        var newMessages: [ChatMessage] = []
+        var lineOffset = startOffset
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let lineLength = UInt64(line.utf8.count + 1)
+            defer { lineOffset += lineLength }
+
+            guard let data = line.data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                continue
+            }
+
+            let parsed: (ChatRole, String, Date?)?
+            switch kind {
+            case .codex:
+                parsed = Self.parseCodexNativeRow(row)
+            case .codeBuddy:
+                parsed = Self.parseCodeBuddyNativeRow(row)
+            }
+            guard let (role, messageText, timestamp) = parsed else { continue }
+
+            let cleaned = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { continue }
+
+            // The byte offset is stable across incremental reads and unique
+            // for each native JSONL row, so no actor-isolated hashing is
+            // needed here.
+            let id = "native-\(lineOffset)"
+            guard !state.messages.contains(where: { $0.id == id }) else { continue }
+
+            let message = ChatMessage(
+                id: id,
+                role: role,
+                timestamp: timestamp ?? Date(),
+                content: [.text(cleaned)]
+            )
+            state.messages.append(message)
+            newMessages.append(message)
+        }
+
+        state.lastFileOffset = fileSize
+        return newMessages
+    }
+
+    private static func parseCodexNativeRow(
+        _ row: [String: Any]
+    ) -> (ChatRole, String, Date?)? {
+        guard row["type"] as? String == "event_msg",
+              let payload = row["payload"] as? [String: Any],
+              let type = payload["type"] as? String else {
+            return nil
+        }
+
+        let role: ChatRole
+        switch type {
+        case "user_message": role = .user
+        case "agent_message": role = .assistant
+        default: return nil
+        }
+
+        guard let message = payload["message"] as? String else { return nil }
+        let timestamp = (row["timestamp"] as? String).flatMap(parseISO8601)
+        return (role, message, timestamp)
+    }
+
+    private static func parseCodeBuddyNativeRow(
+        _ row: [String: Any]
+    ) -> (ChatRole, String, Date?)? {
+        guard row["type"] as? String == "message",
+              let roleValue = row["role"] as? String,
+              let role = ChatRole(rawValue: roleValue),
+              role == .user || role == .assistant else {
+            return nil
+        }
+
+        let text: String?
+        if let content = row["content"] as? String {
+            text = content
+        } else if let blocks = row["content"] as? [[String: Any]] {
+            text = blocks.compactMap { block in
+                block["text"] as? String
+            }.joined(separator: "\n")
+        } else {
+            text = nil
+        }
+        guard let text, !text.isEmpty else { return nil }
+
+        let timestamp: Date?
+        if let milliseconds = row["timestamp"] as? NSNumber {
+            timestamp = Date(timeIntervalSince1970: milliseconds.doubleValue / 1000)
+        } else if let value = row["timestamp"] as? String {
+            timestamp = parseISO8601(value)
+        } else {
+            timestamp = nil
+        }
+        return (role, text, timestamp)
     }
 
     /// Build subagent JSONL file path.

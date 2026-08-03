@@ -67,13 +67,18 @@ actor ProcessExecutor {
     func runDiscardingOutput(
         _ executable: String,
         arguments: [String],
-        standardInput: String? = nil
+        standardInput: String? = nil,
+        currentDirectoryPath: String? = nil
     ) async throws {
         let result: Result<Void, ProcessExecutorError> = await withCheckedContinuation { continuation in
             let process = Process()
             let inputPipe = standardInput.map { _ in Pipe() }
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
+            if let currentDirectoryPath,
+               FileManager.default.fileExists(atPath: currentDirectoryPath) {
+                process.currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath)
+            }
             process.standardInput = inputPipe
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
