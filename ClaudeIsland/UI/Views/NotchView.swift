@@ -208,6 +208,18 @@ struct NotchView: View {
                             : closedContentWidth,
                         alignment: .top
                     )
+                    // The persistent pet keeps a 40pt source canvas for the
+                    // opened matched-geometry transition. That canvas is
+                    // scaled visually in compact mode, but SwiftUI still
+                    // measures its unscaled height. Pin the closed shell to
+                    // the real hardware notch so the source canvas cannot
+                    // make the black pill extend below the camera housing.
+                    .frame(
+                        height: viewModel.status == .opened
+                            ? nil
+                            : closedNotchSize.height,
+                        alignment: .top
+                    )
                     .padding(
                         .horizontal,
                         viewModel.status == .opened
