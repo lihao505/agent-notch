@@ -11,6 +11,10 @@ import AppKit
 
 // Use NSPanel subclass for non-activating behavior
 class NotchPanel: NSPanel {
+    /// Mirrors the view model's opened state so a pass-through click can
+    /// restore the correct hit-testing mode after it is re-posted.
+    var shouldAcceptMouseEvents = false
+
     override init(
         contentRect: NSRect,
         styleMask style: NSWindow.StyleMask,
@@ -83,9 +87,25 @@ class NotchPanel: NSPanel {
 
                 // Re-post the event after a tiny delay
                 DispatchQueue.main.async { [weak self] in
-                    self?.repostMouseEvent(event, at: screenLocation)
+                    guard let self else { return }
+                    self.repostMouseEvent(event, at: screenLocation)
+
+                    // A pass-through click must not leave the opened panel
+                    // permanently click-through. This used to make the next
+                    // click on the chat input (or any button) disappear
+                    // after the user clicked just outside the panel.
+                    self.ignoresMouseEvents = !self.shouldAcceptMouseEvents
                 }
                 return
+            }
+
+            // A nonactivating panel can remain key-less when the app was
+            // opened by a background notification. Once the user clicks a
+            // real control, explicitly promote the panel so TextField and
+            // keyboard events work on the first attempt.
+            if event.type == .leftMouseDown {
+                NSApp.activate(ignoringOtherApps: false)
+                makeKey()
             }
         }
 

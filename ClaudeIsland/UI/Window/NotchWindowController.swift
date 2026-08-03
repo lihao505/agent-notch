@@ -9,6 +9,15 @@ import AppKit
 import Combine
 import SwiftUI
 
+extension Notification.Name {
+    /// Posted after the panel has become key and its SwiftUI controls can
+    /// reliably accept keyboard focus. This is intentionally emitted twice
+    /// because AppKit may defer key-window promotion for a nonactivating panel.
+    static let notchPanelDidBecomeInteractive = Notification.Name(
+        "AgentNotch.notchPanelDidBecomeInteractive"
+    )
+}
+
 class NotchWindowController: NSWindowController {
     let viewModel: NotchViewModel
     private let screen: NSScreen
@@ -70,14 +79,34 @@ class NotchWindowController: NSWindowController {
                 switch status {
                 case .opened:
                     // Accept mouse events when opened so buttons work
+                    notchWindow?.shouldAcceptMouseEvents = true
                     notchWindow?.ignoresMouseEvents = false
-                    // Don't steal focus when opened by notification (task finished)
+                    // A nonactivating panel can receive key events without
+                    // activating the app behind it. Promoting it here makes
+                    // the chat TextField usable immediately after opening,
+                    // including when the panel was opened by a notification.
                     if viewModel?.openReason != .notification {
                         NSApp.activate(ignoringOtherApps: false)
-                        notchWindow?.makeKey()
                     }
+                    notchWindow?.orderFrontRegardless()
+                    notchWindow?.makeKey()
+
+                    let postInteractive = {
+                        guard notchWindow?.isVisible == true else { return }
+                        notchWindow?.makeKey()
+                        NotificationCenter.default.post(
+                            name: .notchPanelDidBecomeInteractive,
+                            object: nil
+                        )
+                    }
+                    DispatchQueue.main.async(execute: postInteractive)
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + 0.18,
+                        execute: postInteractive
+                    )
                 case .closed, .popping:
                     // Ignore mouse events when closed so clicks pass through
+                    notchWindow?.shouldAcceptMouseEvents = false
                     notchWindow?.ignoresMouseEvents = true
                 }
             }

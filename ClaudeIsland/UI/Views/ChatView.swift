@@ -177,6 +177,19 @@ struct ChatView: View {
                 }
             }
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .notchPanelDidBecomeInteractive
+            )
+        ) { _ in
+            // The panel is nonactivating and AppKit may promote it to the key
+            // window one run-loop later than SwiftUI creates this view. Retry
+            // focus after that promotion so the first click can type reliably.
+            guard canSendMessages else { return }
+            DispatchQueue.main.async {
+                isInputFocused = true
+            }
+        }
         .onAppear {
             // Auto-focus input when chat opens and tmux messaging is available
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
@@ -470,7 +483,10 @@ struct ChatView: View {
                 : codeBuddyExecutablePath
             guard executable != nil else { return false }
             switch session.phase {
-            case .idle, .waitingForInput:
+            // Codex/CodeBuddy sessions remain resumable after the desktop
+            // process reports `ended`; the CLI resume command is precisely
+            // how a completed turn receives the next user message.
+            case .idle, .waitingForInput, .ended:
                 return true
             default:
                 return false
@@ -521,6 +537,11 @@ struct ChatView: View {
                 )
                 .onSubmit {
                     sendMessage()
+                }
+                .onTapGesture {
+                    if canSendMessages {
+                        isInputFocused = true
+                    }
                 }
 
                 Button {
@@ -690,7 +711,7 @@ struct ChatView: View {
                         sessionId,
                         "-"
                     ],
-                    standardInput: text
+                    standardInput: text + "\n"
                 )
                 return nil
             } catch {
@@ -709,7 +730,7 @@ struct ChatView: View {
                         "--resume", sessionId,
                         "--print"
                     ],
-                    standardInput: text
+                    standardInput: text + "\n"
                 )
                 return nil
             } catch {
@@ -717,11 +738,11 @@ struct ChatView: View {
             }
         }
 
-        guard session.isInTmux, let tty = session.tty else {
+        guard session.isInTmux else {
             return "This agent is not connected through tmux."
         }
 
-        if let target = await findTmuxTarget(tty: tty) {
+        if let target = await findTmuxTarget(for: session) {
             let sent = await ToolApprovalHandler.shared.sendMessage(text, to: target)
             return sent ? nil : "Could not send the message to tmux."
         }
@@ -766,6 +787,31 @@ struct ChatView: View {
         return candidates.first {
             fileManager.isExecutableFile(atPath: $0)
         }
+    }
+
+    private func findTmuxTarget(for session: SessionState) async -> TmuxTarget? {
+        // Hook TTYs can change when a terminal is reattached. Prefer the
+        // exact TTY, then fall back to the tracked process and cwd so a stale
+        // hook value cannot make the chat input appear broken.
+        if let tty = session.tty,
+           let target = await findTmuxTarget(tty: tty) {
+            return target
+        }
+
+        if let pid = session.pid,
+           let target = await TmuxController.shared.findTmuxTarget(
+               forClaudePid: pid
+           ) {
+            return target
+        }
+
+        if !session.cwd.isEmpty {
+            return await TmuxController.shared.findTmuxTarget(
+                forWorkingDirectory: session.cwd
+            )
+        }
+
+        return nil
     }
 
     private func findTmuxTarget(tty: String) async -> TmuxTarget? {
