@@ -36,6 +36,95 @@ def commands(config, event=None):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_claude_vibe_decision_is_migrated_but_observers_are_retained(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            claude = home / ".claude"
+            (claude / "hooks").mkdir(parents=True)
+            (claude / "hooks/claude-island-state.py").write_text("# native\n")
+            native = "python3 ~/.claude/hooks/claude-island-state.py"
+            unrelated = "/opt/other/vibe-island-bridge-wrapper --observe"
+            status_line = str(home / ".vibe-island/bin/vibe-island-statusline")
+            (claude / "settings.json").write_text(json.dumps({
+                "statusLine": {"type": "command", "command": status_line},
+                "hooks": {
+                    "Stop": [hook(VI_CLAUDE, 86400), hook(unrelated)],
+                    "PermissionRequest": [
+                        hook(VI_CLAUDE, 86400),
+                        hook(native, 86400),
+                    ],
+                },
+            }))
+
+            env = {**os.environ, "HOME": str(home)}
+            for _ in range(2):
+                completed = subprocess.run(
+                    ["bash", str(INSTALL)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
+            config = json.loads((claude / "settings.json").read_text())
+            self.assertNotIn(VI_CLAUDE, commands(config, "PermissionRequest"))
+            self.assertIn(native, commands(config, "PermissionRequest"))
+            self.assertIn(VI_CLAUDE, commands(config, "Stop"))
+            self.assertIn(unrelated, commands(config, "Stop"))
+            self.assertEqual(config["statusLine"]["command"], status_line)
+
+    def test_codex_known_agentwatch_observer_coexists_idempotently(self):
+        with tempfile.TemporaryDirectory() as temporary_home:
+            home = Path(temporary_home)
+            codex = home / ".codex"
+            codex.mkdir()
+            agentwatch = (
+                "/Users/example/Projects/agentwatch/.venv/bin/python "
+                "-m agentwatch.cli hook --event PermissionRequest"
+            )
+            (codex / "hooks.json").write_text(json.dumps({
+                "hooks": {"PermissionRequest": [hook(agentwatch, 15)]}
+            }))
+
+            env = {**os.environ, "HOME": str(home)}
+            for _ in range(2):
+                completed = subprocess.run(
+                    ["bash", str(INSTALL)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+                )
+                self.assertIn("known observer retained", completed.stdout)
+
+            config = json.loads((codex / "hooks.json").read_text())
+            ours = (
+                f"/usr/bin/python3 {home}/.multiagent-notch/bin/"
+                "notch-bridge.py --source codex"
+            )
+            self.assertEqual(commands(config, "PermissionRequest").count(agentwatch), 1)
+            self.assertEqual(commands(config, "PermissionRequest").count(ours), 1)
+            agentwatch_hook = next(
+                item
+                for entry in config["hooks"]["PermissionRequest"]
+                for item in entry["hooks"]
+                if item.get("command") == agentwatch
+            )
+            self.assertIs(agentwatch_hook.get("async"), True)
+            ours_hook = next(
+                item
+                for entry in config["hooks"]["PermissionRequest"]
+                for item in entry["hooks"]
+                if item.get("command") == ours
+            )
+            self.assertEqual(ours_hook.get("timeout"), 105)
+
     def test_replace_is_exact_and_lifecycle_registration_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary_home:
             home = Path(temporary_home)

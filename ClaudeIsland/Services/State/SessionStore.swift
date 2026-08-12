@@ -187,6 +187,17 @@ actor SessionStore {
             return
         }
 
+        // A retained completed conversation can be resumed with the same native
+        // session id. Revive it only for unambiguous new-turn signals; delayed
+        // tool/notification hooks must not resurrect a finished task.
+        let startsNewTurn = event.event == "SessionStart" ||
+            event.event == "UserPromptSubmit" ||
+            event.event == "PermissionRequest"
+        if session.phase == .ended && startsNewTurn {
+            session.phase = .idle
+            session.completedAt = nil
+        }
+
         let newPhase = event.determinePhase()
 
         let isDuplicateInteractiveObservation: Bool
@@ -1100,9 +1111,10 @@ actor SessionStore {
     private func scheduleFileSync(sessionId: String, cwd: String) {
         // Cancel existing sync
         cancelPendingSync(sessionId: sessionId)
+        let refreshMetadataOnly = sessions[sessionId]?.source == .codex
 
         // Schedule new debounced sync
-        pendingSyncs[sessionId] = Task { [weak self, syncDebounceNs] in
+        pendingSyncs[sessionId] = Task { [weak self, syncDebounceNs, refreshMetadataOnly] in
             try? await Task.sleep(nanoseconds: syncDebounceNs)
             guard !Task.isCancelled else { return }
 
@@ -1116,7 +1128,10 @@ actor SessionStore {
                 await self?.process(.clearDetected(sessionId: sessionId))
             }
 
-            guard !result.newMessages.isEmpty || result.clearDetected else {
+            // Codex can append only a turn_context/thread_settings row when
+            // the desktop permission mode changes. There is no chat message
+            // in that update, but conversationInfo still has to be refreshed.
+            guard !result.newMessages.isEmpty || result.clearDetected || refreshMetadataOnly else {
                 return
             }
 
@@ -1259,8 +1274,13 @@ actor SessionStore {
                             stateChanged = true
                         }
                     case .completed(let completedAt):
-                        if session.completedAt == nil ||
-                           session.phase != .waitingForInput {
+                        // A live PermissionRequest is newer and more
+                        // authoritative than a completed marker left by the
+                        // previous turn. Never let periodic rollout polling
+                        // dismiss an actionable approval card.
+                        if !session.phase.isWaitingForApproval &&
+                           (session.completedAt == nil ||
+                            session.phase != .waitingForInput) {
                             session.phase = .waitingForInput
                             session.completedAt = completedAt ?? now
                             sessions[sessionId] = session
@@ -1288,6 +1308,13 @@ actor SessionStore {
                     cancelPendingSync(sessionId: sessionId)
                     stateChanged = true
                 }
+                continue
+            }
+
+            // Lifecycle polling above is enough to notice a resumed Codex
+            // rollout. Avoid reparsing every hidden completed transcript once
+            // per second during the five-hour retention window.
+            if session.completedAt != nil {
                 continue
             }
 
@@ -1331,21 +1358,16 @@ actor SessionStore {
     }
 
     private func pruneCompletedSessions(now: Date = Date()) {
-        let completed = sessions.values
-            .filter { $0.completedAt != nil }
-            .sorted {
-                ($0.completedAt ?? .distantPast) >
-                    ($1.completedAt ?? .distantPast)
-            }
-
-        let sessionsToRemove: [SessionState] = completed.enumerated().compactMap {
-            index, session -> SessionState? in
+        // Keep recent completed sessions in the backing store so an open chat
+        // cannot disappear merely because another task finished. The monitor
+        // applies `maximumVisibleCompleted` to the notch list; storage cleanup
+        // is time-based only.
+        let sessionsToRemove: [SessionState] = sessions.values.compactMap {
+            session -> SessionState? in
             guard let completedAt = session.completedAt else { return nil }
             let expired = now.timeIntervalSince(completedAt) >=
                 SessionRetentionPolicy.completedLifetime
-            let exceedsLimit =
-                index >= SessionRetentionPolicy.maximumVisibleCompleted
-            return expired || exceedsLimit ? session : nil
+            return expired ? session : nil
         }
 
         for session in sessionsToRemove {
@@ -1368,8 +1390,9 @@ actor SessionStore {
             .appendingPathComponent("active-sessions.json", isDirectory: false)
     }
 
-    /// Persist sessions with a live backing process plus the one recent
-    /// completion that may remain visible after the process exits.
+    /// Persist sessions with a live backing process plus recent completions.
+    /// The monitor still exposes at most one completed row in the notch; the
+    /// backing records keep an already-open chat stable across app restarts.
     private func persistActiveSessions() {
         let now = Date()
         let active = sessions.values.compactMap { session -> PersistedSession? in

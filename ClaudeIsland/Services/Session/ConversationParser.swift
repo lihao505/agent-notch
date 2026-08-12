@@ -270,17 +270,19 @@ actor ConversationParser {
         for line in text.split(separator: "\n").reversed() {
             guard let lineData = line.data(using: .utf8),
                   let row = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  row["type"] as? String == "event_msg",
-                  let payload = row["payload"] as? [String: Any],
-                  let payloadType = payload["type"] as? String else {
+                  let rowType = row["type"] as? String,
+                  let payload = row["payload"] as? [String: Any] else {
                 continue
             }
 
             let policy: String?
-            switch payloadType {
+            switch rowType {
             case "turn_context":
                 policy = payload["approval_policy"] as? String
-            case "thread_settings_applied":
+            case "event_msg":
+                guard payload["type"] as? String == "thread_settings_applied" else {
+                    continue
+                }
                 policy = (payload["thread_settings"] as? [String: Any])?["approval_policy"] as? String
             default:
                 continue

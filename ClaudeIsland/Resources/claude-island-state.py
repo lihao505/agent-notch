@@ -10,7 +10,8 @@ import socket
 import sys
 
 SOCKET_PATH = "/tmp/claude-island.sock"
-TIMEOUT_SECONDS = 300  # 5 minutes for permission decisions
+PERMISSION_TIMEOUT_SECONDS = 90
+SEND_TIMEOUT_SECONDS = 5
 
 
 def get_tty():
@@ -53,12 +54,15 @@ def send_event(state):
     """Send event to app, return response if any"""
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT_SECONDS)
+        is_permission = state.get("status") == "waiting_for_approval"
+        sock.settimeout(
+            PERMISSION_TIMEOUT_SECONDS if is_permission else SEND_TIMEOUT_SECONDS
+        )
         sock.connect(SOCKET_PATH)
         sock.sendall(json.dumps(state).encode())
 
         # For permission requests, wait for response
-        if state.get("status") == "waiting_for_approval":
+        if is_permission:
             response = sock.recv(4096)
             sock.close()
             if response:
@@ -141,6 +145,7 @@ def main():
         state["status"] = "waiting_for_approval"
         state["tool"] = data.get("tool_name")
         state["tool_input"] = tool_input
+        state["response_timeout_seconds"] = PERMISSION_TIMEOUT_SECONDS
         # tool_use_id lookup handled by Swift-side cache from PreToolUse
 
         # Send to app and wait for decision

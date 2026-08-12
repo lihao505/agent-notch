@@ -3,12 +3,11 @@
 # Wires supported agents into the Agent Notch socket via the normalized bridge.
 # Supported: Claude (native display hook + lifecycle helper), Codex, CodeBuddy.
 #
-# PermissionRequest ownership (per Codex review):
+# PermissionRequest ownership (per current official Codex Hooks docs):
 #   Codex runs EVERY matching PermissionRequest hook concurrently and "any deny
-#   wins". Two approval owners => both block; the slowest (e.g. vibe-island's
-#   7200s) can stall the turn. So approval must be EXCLUSIVE. By default we do
-#   NOT register our decision hook when another PermissionRequest hook exists;
-#   we report the conflict instead. Migrate explicitly with:
+#   wins". Decision hooks should be exclusive; known observation-only hooks may
+#   coexist asynchronously so they cannot stall the approval. Unknown hooks are
+#   treated as conflicts. Migrate explicitly with:
 #     ./install.sh --migrate-permission "<exact old command>"   (repeatable)
 set -e
 
@@ -17,7 +16,6 @@ HOME_DIR="${HOME}"
 STABLE_DIR="${HOME_DIR}/.multiagent-notch/bin"
 BRIDGE_SRC="${REPO_DIR}/bin/notch-bridge.py"
 BRIDGE_DST="${STABLE_DIR}/notch-bridge.py"
-RELAY_SRC="${REPO_DIR}/bin/codex-relay.py"
 RELAY_DST="${STABLE_DIR}/codex-relay.py"
 PY="/usr/bin/python3"   # stable interpreter, always present on macOS
 
@@ -62,15 +60,19 @@ echo "=== Agent Notch Bridge installer ==="
 # 1) Copy the bridge to a stable location (independent of repo path) ----------
 mkdir -p "${STABLE_DIR}"
 cp "${BRIDGE_SRC}" "${BRIDGE_DST}"
-cp "${RELAY_SRC}" "${RELAY_DST}"
 chmod 755 "${BRIDGE_DST}"
-chmod 755 "${RELAY_DST}"
 echo "• bridge installed -> ${BRIDGE_DST}"
+# Current app replies through `codex exec resume` directly. Keep no hidden
+# relay process or duplicate agent session alive from older installs.
+rm -f "${RELAY_DST}" 2>/dev/null || true
 if command -v tmux >/dev/null 2>&1; then
-  echo "• Codex chat relay ready (tmux found)."
-else
-  echo "• Codex chat relay unavailable: install tmux to enable notch replies."
+  while IFS= read -r relay_session; do
+    case "$relay_session" in
+      multiagent-notch-codex-*) tmux kill-session -t "$relay_session" 2>/dev/null || true ;;
+    esac
+  done < <(tmux list-sessions -F '#S' 2>/dev/null || true)
 fi
+echo "• Codex replies use direct CLI resume (legacy hidden relays removed)."
 
 # 2) Claude Code -------------------------------------------------------------
 # Agent Notch keeps owning display/approval. Our lifecycle-only hook emits no
@@ -111,7 +113,14 @@ def edit_event(event, add_ours):
                 command = command_of(hook)
                 if command in (our_cmd, interactive_cmd):
                     continue
-                if replace_vi and command in vi_commands:
+                # Approval decisions must have one owner. Migrate only the
+                # exact known Vibe Island decision command from
+                # PermissionRequest even during a normal install; retain its
+                # observation hooks and status line unless full replacement
+                # was explicitly requested.
+                if command in vi_commands and (
+                    replace_vi or event == "PermissionRequest"
+                ):
                     continue
                 kept.append(hook)
             if not kept:
@@ -142,7 +151,7 @@ hooks.setdefault("PreToolUse", []).append({
     "hooks": [{
         "type": "command",
         "command": interactive_cmd,
-        "timeout": 300,
+        "timeout": 105,
     }],
 })
 
@@ -161,7 +170,8 @@ with open(p, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PYEOF
-  echo "• Claude: Agent Notch native display kept; cleanup + notch question/plan replies wired."
+  echo "• Claude: Agent Notch owns PermissionRequest; known Vibe Island decision hook migrated."
+  echo "          Other Vibe Island observation hooks stay installed."
   if [ "${REPLACE_VI}" = "1" ]; then
     echo "• Claude: known Vibe Island hooks/statusLine removed (backup made)."
   fi
@@ -183,7 +193,7 @@ if command -v codex >/dev/null 2>&1 || [ -f "${CODEX_HOOKS}" ]; then
 
   PY_OUT="$(OUR_CMD="${OUR_CMD}" OWNED_JSON="${OWNED_JSON}" MIGRATE_JSON="${MIGRATE_JSON}" VI_COMMANDS_JSON="${VI_COMMANDS_JSON}" TAKE="${TAKE_PERMISSION}" VI_REPLACE="${REPLACE_VI}" \
   "${PY}" - "$CODEX_HOOKS" <<'PYEOF'
-import json, os, sys
+import json, os, re, sys
 
 p = sys.argv[1]
 our_cmd  = os.environ["OUR_CMD"]
@@ -213,6 +223,38 @@ def strip_cmds(entries, remove):
 
 def our_entry(timeout):
     return {"hooks": [{"type": "command", "command": our_cmd, "timeout": timeout}]}
+
+def is_known_observer(command):
+    """Known telemetry hook that never returns an approval decision.
+
+    Keep this deliberately strict. Generic substring matching here could
+    silently turn an unknown decision hook into a co-owner.
+    """
+    return re.fullmatch(
+        r"/.+/agentwatch/\.venv/bin/python(?:3)? -m "
+        r"agentwatch\.cli hook --event PermissionRequest",
+        command,
+    ) is not None
+
+def make_known_observers_async(entries):
+    """Make vetted notification-only hooks non-blocking for Codex.
+
+    Official Codex behavior guarantees async hooks cannot approve or deny.
+    """
+    output = []
+    for entry in entries:
+        updated_entry = dict(entry)
+        nested = entry.get("hooks")
+        if isinstance(nested, list):
+            updated_hooks = []
+            for hook in nested:
+                updated_hook = dict(hook)
+                if is_known_observer(cmd_of(hook)):
+                    updated_hook["async"] = True
+                updated_hooks.append(updated_hook)
+            updated_entry["hooks"] = updated_hooks
+        output.append(updated_entry)
+    return output
 
 # --- optional full cut-over: strip ALL vibe-island hooks (named removal) ----- #
 if os.environ.get("VI_REPLACE") == "1":
@@ -252,20 +294,25 @@ for ev, t in OBS.items():
 pr = hooks.get("PermissionRequest", [])
 pr = pr if isinstance(pr, list) else []
 pr = strip_cmds(pr, owned | migrate)      # remove our old + user-migrated cmds
+pr = make_known_observers_async(pr)
 
 # any remaining PR hook is a foreign potential decision owner
 remaining = [cmd_of(h) for e in pr for h in e.get("hooks", []) if cmd_of(h)]
 take = os.environ.get("TAKE") == "1"
+observer_only = bool(remaining) and all(is_known_observer(c) for c in remaining)
 perm_status = "registered"
 conflicts = []
-if remaining and not take:
+if remaining and not take and not observer_only:
     perm_status = "skipped_conflict"
     conflicts = sorted(set(remaining))
 else:
-    if remaining:                    # --take-permission: coexist with benign hooks
+    if observer_only:
+        perm_status = "registered_observer_coexist"
+        conflicts = sorted(set(remaining))
+    elif remaining:                  # explicit override; caller accepts the risk
         perm_status = "registered_coexist"
         conflicts = sorted(set(remaining))
-    pr.append(our_entry(300))
+    pr.append(our_entry(105))
 hooks["PermissionRequest"] = pr
 if not hooks["PermissionRequest"]:
     del hooks["PermissionRequest"]
@@ -285,6 +332,11 @@ PYEOF
   PERM_STATUS="$(printf '%s\n' "$PY_OUT" | sed -n 's/^PERM_STATUS=//p')"
   if [ "$PERM_STATUS" = "registered" ]; then
     echo "• Codex: PermissionRequest → sole owner within ~/.codex/hooks.json ✅"
+  elif [ "$PERM_STATUS" = "registered_observer_coexist" ]; then
+    echo "• Codex: PermissionRequest → Agent Notch owns approvals ✅ (known observer retained):"
+    while IFS= read -r line; do
+      case "$line" in CONFLICT=*) echo "    - ${line#CONFLICT=}" ;; esac
+    done <<< "$PY_OUT"
   elif [ "$PERM_STATUS" = "registered_coexist" ]; then
     echo "• Codex: PermissionRequest → Agent Notch owns approvals ✅ (coexisting hooks must be observation-only):"
     while IFS= read -r line; do
@@ -395,7 +447,8 @@ CodeBuddy: observation events wired; restart CodeBuddy/WorkBuddy once so new
            sessions load ~/.codebuddy/settings.json. Native approvals stay native.
 
 Cleanup : Stop sessions stay visible for NOTCH_COMPLETED_TTL seconds (default
-          300). Any new activity cancels removal; active projects never expire.
+          18000 / five hours). Any new activity cancels removal; active
+          projects never expire.
 
 If PermissionRequest was SKIPPED due to a conflict, migrate explicitly, e.g.:
   ./install.sh --migrate-permission "<the exact conflicting command printed above>"

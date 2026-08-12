@@ -23,14 +23,12 @@ Design notes
   fall back to `--event <Name>` (some agents pass it as an arg).
 * PermissionRequest blocks until the notch returns a decision (or timeout), then
   emits the decision in the agent's expected wire format. Claude Code and Codex
-  share the same format (verified against the codex binary schema); other agents
-  can override via DECISION_FORMATTERS below.
+  share the same format (verified against the current official Codex Hooks
+  schema); other agents can override via DECISION_FORMATTERS below.
 """
 import json
 import os
 import re
-import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -39,9 +37,9 @@ import uuid
 
 DEFAULT_SOCKET = "/tmp/claude-island.sock"
 # Seconds the bridge waits for a notch decision on PermissionRequest.
-# MUST stay strictly below the agent's outer hook timeout (see install.sh: 300)
+# MUST stay strictly below the agent's outer hook timeout (see install.sh: 105)
 # so we win the race and exit 0 gracefully instead of being killed mid-flight.
-PERMISSION_TIMEOUT = int(os.environ.get("NOTCH_PERMISSION_TIMEOUT", "285"))
+PERMISSION_TIMEOUT = int(os.environ.get("NOTCH_PERMISSION_TIMEOUT", "90"))
 # Fire-and-forget connect/send budget for non-permission events.
 SEND_TIMEOUT = int(os.environ.get("NOTCH_SEND_TIMEOUT", "5"))
 # A completed turn may remain available for up to five hours. The app shows at
@@ -49,7 +47,6 @@ SEND_TIMEOUT = int(os.environ.get("NOTCH_SEND_TIMEOUT", "5"))
 # new activity cancels the pending removal.
 COMPLETED_TTL = int(os.environ.get("NOTCH_COMPLETED_TTL", "18000"))
 SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
-RELAY_PREFIX = "multiagent-notch-codex-"
 APPROVAL_POLICY_FILE = os.path.join(
     os.path.expanduser("~"), ".multiagent-notch", "approval-policy.json"
 )
@@ -138,93 +135,6 @@ def get_tty():
         except (OSError, AttributeError):
             pass
     return None
-
-
-def _tmux_path():
-    for candidate in (
-        shutil.which("tmux"),
-        "/opt/homebrew/bin/tmux",
-        "/usr/local/bin/tmux",
-    ):
-        if candidate and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
-def _relay_session_name(session_id):
-    if not SAFE_SESSION_ID.fullmatch(session_id):
-        raise ValueError("unsafe session id")
-    return RELAY_PREFIX + session_id
-
-
-def ensure_codex_relay(session_id, cwd):
-    """Return the hidden relay pane's (pid, tty), or None if unavailable."""
-    try:
-        tmux = _tmux_path()
-        relay = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "codex-relay.py")
-        if not tmux or not os.path.isfile(relay):
-            return None
-
-        name = _relay_session_name(session_id)
-        exists = subprocess.run(
-            [tmux, "has-session", "-t", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=1,
-            check=False,
-        ).returncode == 0
-        if not exists:
-            working_directory = cwd if os.path.isdir(cwd) else os.path.expanduser("~")
-            command = " ".join(shlex.quote(part) for part in (
-                sys.executable,
-                relay,
-                "--session-id", session_id,
-                "--cwd", working_directory,
-            ))
-            subprocess.run(
-                [
-                    tmux, "new-session", "-d",
-                    "-s", name,
-                    "-c", working_directory,
-                    command,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-                check=False,
-            )
-
-        panes = subprocess.run(
-            [
-                tmux, "list-panes", "-t", name,
-                "-F", "#{pane_pid}\t#{pane_tty}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            check=False,
-        )
-        first = panes.stdout.strip().splitlines()[0]
-        pid_text, tty = first.split("\t", 1)
-        return int(pid_text), tty
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return None
-
-
-def stop_codex_relay(session_id):
-    try:
-        tmux = _tmux_path()
-        if tmux:
-            subprocess.run(
-                [tmux, "kill-session", "-t", _relay_session_name(session_id)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=1,
-                check=False,
-            )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -550,8 +460,6 @@ def run_cleanup_job(opts):
             "status": "ended",
             "source": opts["source"],
         }, expect_reply=False)
-        if opts["source"] == "codex":
-            stop_codex_relay(session_id)
         os.unlink(marker)
     except (OSError, ValueError, json.JSONDecodeError):
         return
@@ -706,11 +614,6 @@ def main():
         # extra field ignored by the app but handy for future app-side theming
         "source": source,
     }
-    if source.lower() == "codex":
-        relay = ensure_codex_relay(session_id, cwd)
-        if relay:
-            state["pid"], state["tty"] = relay
-
     if event in ("PreToolUse", "PostToolUse", "PostToolUseFailure",
                  "PermissionRequest", "PermissionDenied"):
         state["tool"] = data.get("tool_name")
@@ -734,6 +637,7 @@ def main():
 
     # ---- PermissionRequest: block for a decision, then answer the agent ---- #
     if event == "PermissionRequest":
+        state["response_timeout_seconds"] = PERMISSION_TIMEOUT
         approval_mode = current_approval_mode(session_id)
         if approval_mode in ("auto", "trusted"):
             # Preserve a visible activity update, but never open a second,

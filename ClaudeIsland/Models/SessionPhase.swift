@@ -125,6 +125,8 @@ enum SessionPhase: Sendable {
         // WaitingForInput transitions
         case (.waitingForInput, .processing):
             return true
+        case (.waitingForInput, .waitingForApproval):
+            return true  // Approval can arrive even if the start hook was missed
         case (.waitingForInput, .idle):
             return true  // Can become idle
         case (.waitingForInput, .compacting):

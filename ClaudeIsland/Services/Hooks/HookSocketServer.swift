@@ -27,6 +27,7 @@ struct HookEvent: Codable, Sendable {
     let toolUseId: String?
     let notificationType: String?
     let message: String?
+    let responseTimeoutSeconds: Double?
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
@@ -34,11 +35,12 @@ struct HookEvent: Codable, Sendable {
         case toolInput = "tool_input"
         case toolUseId = "tool_use_id"
         case notificationType = "notification_type"
+        case responseTimeoutSeconds = "response_timeout_seconds"
         case message
     }
 
     /// Create a copy with updated toolUseId
-    init(sessionId: String, cwd: String, event: String, status: String, source: String?, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?) {
+    init(sessionId: String, cwd: String, event: String, status: String, source: String?, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?, responseTimeoutSeconds: Double? = nil) {
         self.sessionId = sessionId
         self.cwd = cwd
         self.event = event
@@ -51,6 +53,7 @@ struct HookEvent: Codable, Sendable {
         self.toolUseId = toolUseId
         self.notificationType = notificationType
         self.message = message
+        self.responseTimeoutSeconds = responseTimeoutSeconds
     }
 
     var sessionPhase: SessionPhase {
@@ -109,6 +112,7 @@ struct PendingPermission: Sendable {
     let clientSocket: Int32
     let event: HookEvent
     let receivedAt: Date
+    let expiresAt: Date
 }
 
 /// Callback for hook events
@@ -494,19 +498,30 @@ class HookSocketServer {
                 toolInput: event.toolInput,
                 toolUseId: toolUseId,  // Use resolved toolUseId
                 notificationType: event.notificationType,
-                message: event.message
+                message: event.message,
+                responseTimeoutSeconds: event.responseTimeoutSeconds
             )
 
+            let receivedAt = Date()
+            let responseTimeout = max(1, event.responseTimeoutSeconds ?? 90)
             let pending = PendingPermission(
                 sessionId: event.sessionId,
                 toolUseId: toolUseId,
                 clientSocket: clientSocket,
                 event: updatedEvent,
-                receivedAt: Date()
+                receivedAt: receivedAt,
+                expiresAt: receivedAt.addingTimeInterval(responseTimeout + 2)
             )
             permissionsLock.lock()
             pendingPermissions[toolUseId] = pending
             permissionsLock.unlock()
+
+            queue.asyncAfter(deadline: .now() + responseTimeout + 2) { [weak self] in
+                self?.expirePendingPermission(
+                    toolUseId: toolUseId,
+                    receivedAt: receivedAt
+                )
+            }
 
             eventHandler?(updatedEvent)
             return
@@ -549,6 +564,25 @@ class HookSocketServer {
 
         close(pending.clientSocket)
         return writeSuccess
+    }
+
+    /// The bridge exits without a decision on timeout so Codex can show its
+    /// native prompt. Remove the matching socket shortly afterward; otherwise
+    /// the notch can keep displaying an approval whose client no longer exists.
+    private func expirePendingPermission(toolUseId: String, receivedAt: Date) {
+        permissionsLock.lock()
+        guard let pending = pendingPermissions[toolUseId],
+              pending.receivedAt == receivedAt,
+              pending.expiresAt <= Date() else {
+            permissionsLock.unlock()
+            return
+        }
+        pendingPermissions.removeValue(forKey: toolUseId)
+        permissionsLock.unlock()
+
+        close(pending.clientSocket)
+        logger.info("Expired unanswered permission for \(pending.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+        permissionFailureHandler?(pending.sessionId, toolUseId)
     }
 
     @discardableResult

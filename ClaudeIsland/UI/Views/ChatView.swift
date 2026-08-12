@@ -64,15 +64,17 @@ struct ChatView: View {
     /// In full-access mode it records `approval_policy: never`, meaning no
     /// PermissionRequest is expected and the chip must not say "Once".
     private var effectiveApprovalMode: ApprovalMode {
-        if session.source == .codex,
-           let nativeMode = session.conversationInfo.nativeApprovalMode {
-            return nativeMode
+        if isNativeFullyTrusted {
+            return .trusted
         }
         return preferences.approvalMode(for: sessionId)
     }
 
-    private var hasNativeApprovalMode: Bool {
-        session.source == .codex && session.conversationInfo.nativeApprovalMode != nil
+    /// Only Codex full-access is an immutable native decision. In ask mode,
+    /// Agent Notch's own bridge may still provide once/auto/trusted behavior,
+    /// so the per-conversation menu must remain interactive.
+    private var isNativeFullyTrusted: Bool {
+        session.source == .codex && session.conversationInfo.nativeApprovalMode == .trusted
     }
 
     
@@ -139,19 +141,27 @@ struct ChatView: View {
         .onReceive(ChatHistoryManager.shared.$histories) { histories in
             // Update when count changes, last item differs, or content changes (e.g., tool status)
             if let newHistory = histories[sessionId] {
-                let countChanged = newHistory.count != history.count
-                let lastItemChanged = newHistory.last?.id != history.last?.id
+                // Native-file sync may publish while a CLI reply is still in
+                // flight. Preserve optimistic CLI rows until an equivalent
+                // native row lands instead of making the user's message blink
+                // out of the notch.
+                let mergedHistory = mergeHistory(
+                    newHistory,
+                    preservingCLIItemsFrom: history
+                )
+                let countChanged = mergedHistory.count != history.count
+                let lastItemChanged = mergedHistory.last?.id != history.last?.id
                 // Always update - the @Published ensures we only get notified on real changes
                 // This allows tool status updates (waitingForApproval -> running) to reflect
-                if countChanged || lastItemChanged || newHistory != history {
+                if countChanged || lastItemChanged || mergedHistory != history {
                     // Track new messages when autoscroll is paused
-                    if isAutoscrollPaused && newHistory.count > previousHistoryCount {
-                        let addedCount = newHistory.count - previousHistoryCount
+                    if isAutoscrollPaused && mergedHistory.count > previousHistoryCount {
+                        let addedCount = mergedHistory.count - previousHistoryCount
                         newMessageCount += addedCount
-                        previousHistoryCount = newHistory.count
+                        previousHistoryCount = mergedHistory.count
                     }
 
-                    history = newHistory
+                    history = mergedHistory
 
                     // Auto-scroll to bottom only if autoscroll is NOT paused
                     if !isAutoscrollPaused && countChanged {
@@ -159,7 +169,7 @@ struct ChatView: View {
                     }
 
                     // If we have data, skip loading state (handles view recreation)
-                    if isLoading && !newHistory.isEmpty {
+                    if isLoading && !mergedHistory.isEmpty {
                         isLoading = false
                     }
                 }
@@ -168,7 +178,14 @@ struct ChatView: View {
                 viewModel.exitChat()
             }
         }
-        .onReceive(sessionMonitor.$instances) { sessions in
+        // Chat state must follow the unfiltered store. `instances` deliberately
+        // hides older completed rows when active work gets crowded; using that
+        // presentation list here can leave an already-open conversation stuck
+        // on its last processing snapshot with a disabled input field.
+        .onReceive(
+            SessionStore.shared.sessionsPublisher
+                .receive(on: DispatchQueue.main)
+        ) { sessions in
             if let updated = sessions.first(where: { $0.sessionId == sessionId }),
                updated != session {
                 // Check if permission was just accepted (transition from waitingForApproval to processing)
@@ -264,15 +281,15 @@ struct ChatView: View {
 
                 ForEach(ApprovalMode.allCases) { mode in
                     Button {
-                        if !hasNativeApprovalMode {
+                        if !isNativeFullyTrusted {
                             preferences.setApprovalMode(mode, for: sessionId)
                         }
                     } label: {
                         Label(
                             approvalModeTitle(mode),
                             systemImage:
-                                (hasNativeApprovalMode && effectiveApprovalMode == mode)
-                                || (!hasNativeApprovalMode
+                                (isNativeFullyTrusted && effectiveApprovalMode == mode)
+                                || (!isNativeFullyTrusted
                                     && preferences.hasApprovalOverride(for: sessionId)
                                     && preferences.approvalMode(for: sessionId) == mode)
                                 ? "checkmark"
@@ -305,9 +322,9 @@ struct ChatView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-            .disabled(hasNativeApprovalMode)
+            .disabled(isNativeFullyTrusted)
             .help(
-                hasNativeApprovalMode
+                isNativeFullyTrusted
                     ? t("Controlled by Codex desktop permissions", "由 Codex 桌面端权限控制")
                     : ""
             )
@@ -714,8 +731,9 @@ struct ChatView: View {
         // Add the exact text sent to the CLI immediately. The response is
         // appended from CLI stdout below; no desktop transcript round-trip is
         // required for this chat path.
+        let optimisticUserId = "cli-user-\(UUID().uuidString)"
         history.append(ChatHistoryItem(
-            id: "cli-user-\(UUID().uuidString)",
+            id: optimisticUserId,
             type: .user(text),
             timestamp: Date()
         ))
@@ -723,6 +741,7 @@ struct ChatView: View {
         Task {
             switch await sendToSession(text) {
             case .failure(let errorMessage):
+                history.removeAll { $0.id == optimisticUserId }
                 sendErrorMessage = errorMessage
             case .success(let output):
                 inputText = ""
@@ -730,7 +749,7 @@ struct ChatView: View {
                 // This is intentionally a CLI-only chat path. Render the
                 // actual CLI response directly instead of depending on a
                 // desktop app's native transcript watcher.
-                let assistantText = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                let assistantText = cleanedCLIOutput(output)
                 if !assistantText.isEmpty {
                     history.append(ChatHistoryItem(
                         id: "cli-assistant-\(UUID().uuidString)",
@@ -738,6 +757,20 @@ struct ChatView: View {
                         timestamp: Date()
                     ))
                     shouldScrollToBottom = true
+                }
+
+                // Persist against the agent's real transcript after stdout is
+                // already visible. mergeHistory keeps the optimistic rows in
+                // place until their native equivalents arrive. Do not keep
+                // the composer in a sending state while a best-effort file
+                // reconciliation scans the transcript.
+                if session.source == .codex || session.source == .codebuddy {
+                    Task {
+                        await ChatHistoryManager.shared.syncFromFile(
+                            sessionId: sessionId,
+                            cwd: session.cwd
+                        )
+                    }
                 }
             }
             isSendingMessage = false
@@ -760,7 +793,8 @@ struct ChatView: View {
                         "-"
                     ],
                     standardInput: text + "\n",
-                    currentDirectoryPath: session.cwd
+                    currentDirectoryPath: session.cwd,
+                    timeoutSeconds: 600
                 )
                 return .success(output: output)
             } catch {
@@ -780,7 +814,8 @@ struct ChatView: View {
                         "--print"
                     ],
                     standardInput: text + "\n",
-                    currentDirectoryPath: session.cwd
+                    currentDirectoryPath: session.cwd,
+                    timeoutSeconds: 600
                 )
                 return .success(output: output)
             } catch {
@@ -797,6 +832,58 @@ struct ChatView: View {
             return sent ? .success(output: "") : .failure("Could not send the message to tmux.")
         }
         return .failure("Could not find the agent's tmux pane.")
+    }
+
+    private func mergeHistory(
+        _ nativeHistory: [ChatHistoryItem],
+        preservingCLIItemsFrom currentHistory: [ChatHistoryItem]
+    ) -> [ChatHistoryItem] {
+        var merged = nativeHistory
+        let nativeMessageItems = nativeHistory.filter { messageTextAndRole(for: $0) != nil }
+
+        for item in currentHistory where item.id.hasPrefix("cli-") {
+            guard let (role, text) = messageTextAndRole(for: item) else { continue }
+            let hasNativeEquivalent = nativeMessageItems.contains { nativeItem in
+                guard let (nativeRole, nativeText) = messageTextAndRole(for: nativeItem) else {
+                    return false
+                }
+                return nativeRole == role
+                    && nativeText == text
+                    && abs(nativeItem.timestamp.timeIntervalSince(item.timestamp)) < 300
+            }
+            if !hasNativeEquivalent {
+                merged.append(item)
+            }
+        }
+
+        return merged.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func messageTextAndRole(for item: ChatHistoryItem) -> (String, String)? {
+        let role: String
+        let rawText: String
+        switch item.type {
+        case .user(let text):
+            role = "user"
+            rawText = text
+        case .assistant(let text):
+            role = "assistant"
+            rawText = text
+        default:
+            return nil
+        }
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : (role, text)
+    }
+
+    private func cleanedCLIOutput(_ output: String) -> String {
+        output
+            .replacingOccurrences(
+                of: "\u{001B}\\[[0-?]*[ -/]*[@-~]",
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var codexExecutablePath: String? {

@@ -55,36 +55,35 @@ bash install.sh
 |---|---|
 | 实时状态(处理中 / 运行工具 / 等待) | ✅ 全 agent |
 | 多会话并存、终端定位 | ✅ |
-| 权限 approve/deny | ⚠️ 协议已验证(格式与 codex 0.145.0 内置 schema 一致),**真实回合待验收**;需独占,见下 |
-| **标题 + 任务行** | ✅ 通过**合成 JSONL**:标题=agent 标签+用户 prompt,任务行=当前工具(见下) |
-| 完整聊天记录面板 | ✅ 用户 prompt + 工具调用；支持提供 `Stop.last_assistant_message` 的 agent 助手正文 |
-| 从刘海向 Codex 发消息 | ✅ 当前安装版通过隐藏 tmux relay 继续同一 Codex thread；Swift fork 也原生支持 |
+| 权限 approve/deny | ✅ 官方格式已核对，已安装 bridge → 刘海按钮 → allow JSON 端到端通过；真实 agent 原生触发仍列入发布前验收 |
+| **标题 + 任务行** | ✅ Codex 优先读取真实侧边栏标题与原生 rollout；其他 agent 可用合成 JSONL 回退 |
+| 完整聊天记录面板 | ✅ Codex/CodeBuddy 只显示原生用户与助手消息，不显示 bridge 的 Bash/Shell 生命周期占位 |
+| 从刘海向 Codex 发消息 | ✅ 直接 `codex exec resume` 续接同一 thread，stdout 即时显示并由原生 rollout 持久化 |
 | 从刘海向 CodeBuddy 发消息 | ✅ Swift fork 通过 `codebuddy --resume <sessionId> --print` 从 stdin 继续会话 |
 | 按 agent 区分标签 | ✅ 当前 App 直接显示彩色来源标题;Swift fork 另支持列表/聊天原生主题色 |
 | 只保留运行中项目 | ✅ 运行/等待审批不设过期；`Stop` 后延迟清理，新活动自动取消 |
 
-### 标题与任务行怎么来的(合成 JSONL)
+### 标题、任务行与聊天来源
 
-Agent Notch 的标题(`summary ?? firstUserMessage ?? projectName`)和活动行来自解析
-`~/.claude/projects/<cwd 的 / 和 . 换成 ->/<session_id>.jsonl`。Codex 不产这种文件,
-所以 bridge 把 Codex 的 `UserPromptSubmit.prompt`、`PreToolUse` 工具和
-`Stop.last_assistant_message` 写成一份最小的 Claude 格式 JSONL 放到该路径:
-App 在 `.processing` 相位本就会监听它 → 标题、任务和聊天正文自动更新。
+Codex 会话优先读取 `~/.codex/session_index.jsonl` 的真实侧边栏标题，以及
+`~/.codex/sessions/` 中原生 rollout 的用户/助手消息、用量、权限模式和完成边界。
+bridge 同时保留一份最小 Claude 格式 JSONL，供缺少原生 rollout 的 agent 或早期事件
+回退；Codex/CodeBuddy 的聊天界面会过滤其中的 Bash/Shell 生命周期占位。
 
 - 标题 = 彩色 agent 标记 + Codex 真实侧边栏任务标题；索引尚未生成时回退
   当前 prompt（如 `Codex · 修复登录`）；
   任务行 = 最近一次工具调用(名+参数)。
 - 每条合成消息都有稳定 `uuid`,工具块有 `id`;重复投递不会产生重复气泡。
-- JSONL 使用紧凑分隔符写入（例如 `"type":"user"`）；这是当前增量解析器
-  增量解析器的字面匹配要求。bridge 会自动迁移本项目以前写出的带空格记录。
-- 助手回复 = Codex `Stop.last_assistant_message`;子 agent 的 Stop 不混入主聊天。
+- JSONL 使用紧凑分隔符写入（例如 `"type":"user"`）；这是当前增量解析器的
+  字面匹配要求。bridge 会自动迁移本项目以前写出的带空格记录。
+- Codex 助手正文来自原生 rollout；子 agent 的 Stop 不混入主聊天。
 - 关闭:`export NOTCH_NO_SYNTHETIC=1`。
 - 写入的文件记录在 `~/.multiagent-notch/synthetic-files.txt`,`uninstall.sh` 据此清理,
   卸载时只允许删除 `~/.claude/projects/` 目录内的记录，绝不碰其他文件。
 
 ### 完成项目的定时清理
 
-`Stop` 表示当前任务已经完成。bridge 默认让它继续在刘海保留 300 秒，方便查看结果，
+`Stop` 表示当前任务已经完成。bridge 默认让它继续在刘海保留 5 小时，方便查看结果，
 随后发送 `ended` 将其移出刘海。若保留期内同一会话出现新 prompt、工具调用或审批，
 旧清理任务会因 token 失效而自动取消。
 
@@ -98,8 +97,7 @@ App 在 `.processing` 相位本就会监听它 → 标题、任务和聊天正�
 
 本机 fork 位于 `/Users/apple/project/vibe-notch`,已让 socket 正式解析 `source`,并将
 agent 标签/主题色用于会话列表、聊天标题、助手消息标记和处理中动画。配色:
-Claude 橙、Codex 绿、CodeBuddy 珊瑚红、Gemini 蓝、Cursor 紫。当前安装的上游 App 无需重编译也能通过
-上面的彩色标题看到来源;原生整行主题需要完整 Xcode 工具链重新构建 App。
+Claude 橙、Codex 绿、CodeBuddy 珊瑚红、Gemini 蓝、Cursor 紫。
 
 Swift fork 的聊天输入也按来源分流：Claude/CLI agent 仍通过 tmux 发送，Codex Desktop
 会话在 `.idle/.waitingForInput` 时运行
@@ -110,30 +108,28 @@ CodeBuddy 会话运行 `codebuddy --resume <sessionId> --print`。两者的消�
 
 ### 当前安装版的 Codex 刘海回复
 
-bridge 会为每个活跃 Codex thread 建立一个仅本项目使用的隐藏 tmux 会话
-（`multiagent-notch-codex-<threadId>`，该前缀仅为旧版本兼容标识），并把它的
-PID/TTY 交给 Agent Notch。输入内容经 tmux relay 的 stdin 传给
-`codex exec resume`，继续同一 thread。
-
-- relay 串行处理输入，Codex 工作期间不会并发 resume；
-- 完成项目从刘海定时清理时，同时停止对应 relay；
-- `uninstall.sh` 只停止上述兼容前缀的会话，不碰用户自己的 tmux；
-- 日志：`~/.multiagent-notch/logs/codex-relay-<threadId>.log`。
+Agent Notch 直接执行 `codex exec resume --all --skip-git-repo-check
+<threadId> -`，通过 stdin 发送消息并把 CLI stdout 作为即时回复。真实 Codex rollout
+随后用于持久化聊天，不再建立隐藏 tmux relay，也不会制造重复的 agent 进程或伪会话。
+升级安装时只清理本项目旧版的 `multiagent-notch-codex-*` relay，不碰用户自己的 tmux。
 
 > **事件范围**:Codex 只注册它 0.145.0 支持的事件——观察类 6 个
 > (SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SubagentStop)
 > + 可选的 PermissionRequest。`Notification` 不在 Codex 有效事件列表内,已移除。
 
-## PermissionRequest:必须"单一决策所有者"
+## PermissionRequest:决策钩子独占，观察钩子异步共存
 
 Codex 会**并发执行所有**匹配的 PermissionRequest 钩子,等全部结束才汇总,且
 **任一 `deny` 覆盖所有 `allow`**。所以若多个工具都注册审批钩子,会一起阻塞——
 最慢的那个(如 vibe-island 的 7200s)可能把整个回合卡住约 2 小时。
 
-因此审批必须**独占**;纯观察类钩子才可共存。安装器的策略:
+因此会返回 allow/deny 的审批钩子应当**独占**；纯观察类钩子可共存。安装器的策略:
 
-- 默认:若 `PermissionRequest` 上已存在**其他**钩子,**不注册**本项目的决策钩子,
-  而是打印冲突命令。
+- Claude Code：从 `PermissionRequest` 精确迁出已知 Vibe Island 决策命令；其他
+  Vibe Island 观察事件与 statusLine 默认保留。
+- 默认:精确识别 AgentWatch 的通知钩子，将它改为 `async: true` 后共存（官方行为保证
+  异步钩子不能审批/拒绝，因此也不会阻塞本次审批）。若存在其他未知钩子，则**不注册**
+  本项目决策钩子并打印冲突命令。
 - 显式迁移(只移除你指定的旧命令):
   ```bash
   ./install.sh --migrate-permission "<冲突命令原文>"   # 可重复
@@ -149,7 +145,7 @@ Codex 会**并发执行所有**匹配的 PermissionRequest 钩子,等全部结�
 ./install.sh --take-permission --replace-vibe-island
 ```
 
-决策 wire 格式(已从 codex 0.145.0 内置 schema 核对,Claude 与 Codex 同格式):
+决策 wire 格式已按当前官方 Codex Hooks 文档核对，且与本机 codex 0.145.0 schema 一致:
 
 ```json
 {"hookSpecificOutput":{"hookEventName":"PermissionRequest",
@@ -175,15 +171,17 @@ Codex 会**并发执行所有**匹配的 PermissionRequest 钩子,等全部结�
 保持会询问的模式(Codex 默认即可)。
 
 流程:agent 触发 PermissionRequest → bridge 阻塞 → 你在刘海点 allow/deny → bridge 用 agent
-认的格式回写。你若 285s 内不点,bridge `exit 0`,agent 回退到它自己的终端提示(不会卡死)。
+认的格式回写。你若 90s 内不点,bridge `exit 0`,agent 回退到它自己的终端提示；
+Agent Notch 随后关闭过期 socket 并清除僵尸审批状态。
 
 安装器的“独占”判断仅覆盖 `~/.codex/hooks.json`。Codex 插件、项目级或托管配置仍可能
 提供额外 PermissionRequest 钩子；安装输出不会再把用户配置内独占表述成全局独占。
 
 ## 超时
 
-PermissionRequest 内层等待默认 285s(`NOTCH_PERMISSION_TIMEOUT`),严格小于外层
-Codex hook 的 300s,确保是 bridge 自己先 `exit 0` 优雅退出、而非被 Codex 杀掉。
+Codex bridge 与 Claude 原生 hook 的 PermissionRequest 内层等待均为 90s，严格小于
+外层 105s，确保 hook 自己先 `exit 0` 回退原生审批，而非被 agent 杀掉。
+Codex 可用 `NOTCH_PERMISSION_TIMEOUT` 覆盖内层等待。
 非权限事件的 socket 发送用短超时(`NOTCH_SEND_TIMEOUT`,默认 5s),避免卡住回合。
 
 ## 扩展新 agent(路线图)

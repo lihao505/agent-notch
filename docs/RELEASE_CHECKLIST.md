@@ -28,7 +28,9 @@
 ## 首个功能 Beta 前
 
 - [ ] 在真实 Claude Code、Codex、CodeBuddy 回合分别验收状态与跳转
-- [ ] 在真实 Claude Code/Codex `PermissionRequest` 回合确认 allow/deny wire format
+- [x] 按当前官方 Codex Hooks 文档确认 allow/deny wire format
+- [x] 使用已安装 bridge + 实际刘海按钮完成 allow/deny 端到端回写验收
+- [ ] 在真实 Claude Code/CLI `PermissionRequest` 回合完成端到端 allow/deny 点击验收
 - [ ] 人工确认同一会话的审批不会发送给另一会话
 
 ## 可选：签名二进制发行

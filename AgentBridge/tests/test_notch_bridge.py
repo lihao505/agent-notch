@@ -258,6 +258,32 @@ class SessionCleanupTests(unittest.TestCase):
 
 
 class InteractiveDecisionTests(unittest.TestCase):
+    def test_codex_permission_decision_matches_official_schema(self):
+        self.assertEqual(
+            BRIDGE.format_decision("codex", "allow", ""),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "allow"},
+                }
+            },
+        )
+        self.assertEqual(
+            BRIDGE.format_decision("codex", "deny", "unsafe"),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "deny",
+                        "message": "unsafe",
+                    },
+                }
+            },
+        )
+
+    def test_default_permission_timeout_is_bounded(self):
+        self.assertEqual(BRIDGE.PERMISSION_TIMEOUT, 90)
+
     def test_permission_request_without_native_tool_id_gets_bridge_id(self):
         generated = BRIDGE.permission_tool_use_id("codex-session")
         self.assertTrue(generated.startswith("permission-codex-session-"))

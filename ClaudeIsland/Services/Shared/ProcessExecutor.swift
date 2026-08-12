@@ -15,6 +15,7 @@ enum ProcessExecutorError: Error, LocalizedError {
     case invalidOutput(command: String)
     case commandNotFound(String)
     case launchFailed(command: String, underlying: Error)
+    case timedOut(command: String, seconds: Int)
 
     var errorDescription: String? {
         switch self {
@@ -27,7 +28,54 @@ enum ProcessExecutorError: Error, LocalizedError {
             return "Command not found: \(command)"
         case .launchFailed(let command, let underlying):
             return "Failed to launch '\(command)': \(underlying.localizedDescription)"
+        case .timedOut(let command, let seconds):
+            return "Command '\(command)' timed out after \(seconds) seconds"
         }
+    }
+}
+
+/// Process output is drained on background queues. Keep all cross-queue state
+/// behind one lock so Swift 6 does not observe mutable Data races and the
+/// continuation can be resumed exactly once across exit/timeout/launch paths.
+private final class ProcessCaptureState: @unchecked Sendable {
+    private let lock = NSLock()
+    nonisolated(unsafe) private var stdoutData = Data()
+    nonisolated(unsafe) private var stderrData = Data()
+    nonisolated(unsafe) private var timedOut = false
+    nonisolated(unsafe) private var completed = false
+
+    nonisolated init() {}
+
+    nonisolated func setStdout(_ data: Data) {
+        lock.lock()
+        stdoutData = data
+        lock.unlock()
+    }
+
+    nonisolated func setStderr(_ data: Data) {
+        lock.lock()
+        stderrData = data
+        lock.unlock()
+    }
+
+    nonisolated func markTimedOut() {
+        lock.lock()
+        timedOut = true
+        lock.unlock()
+    }
+
+    nonisolated func claimCompletion() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !completed else { return false }
+        completed = true
+        return true
+    }
+
+    nonisolated func snapshot() -> (stdout: Data, stderr: Data, timedOut: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (stdoutData, stderrData, timedOut)
     }
 }
 
@@ -123,13 +171,15 @@ actor ProcessExecutor {
         _ executable: String,
         arguments: [String],
         standardInput: String? = nil,
-        currentDirectoryPath: String? = nil
+        currentDirectoryPath: String? = nil,
+        timeoutSeconds: TimeInterval = 600
     ) async throws -> String {
         let result: Result<String, ProcessExecutorError> = await withCheckedContinuation { continuation in
             let process = Process()
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()
             let inputPipe = standardInput.map { _ in Pipe() }
+            let capture = ProcessCaptureState()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
             if let currentDirectoryPath,
@@ -142,16 +192,46 @@ actor ProcessExecutor {
 
             let readGroup = DispatchGroup()
             readGroup.enter()
-            var stdoutData = Data()
             DispatchQueue.global(qos: .utility).async {
-                stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                capture.setStdout(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
                 readGroup.leave()
             }
             readGroup.enter()
-            var stderrData = Data()
             DispatchQueue.global(qos: .utility).async {
-                stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                capture.setStderr(stderrPipe.fileHandleForReading.readDataToEndOfFile())
                 readGroup.leave()
+            }
+
+            process.terminationHandler = { completedProcess in
+                DispatchQueue.global(qos: .utility).async {
+                    // A timed-out CLI may leave a descendant holding stdout
+                    // open. Return as soon as the parent terminates instead of
+                    // waiting forever for inherited pipe descriptors.
+                    if capture.snapshot().timedOut {
+                        guard capture.claimCompletion() else { return }
+                        continuation.resume(returning: .failure(.timedOut(
+                            command: executable,
+                            seconds: max(1, Int(timeoutSeconds.rounded()))
+                        )))
+                        return
+                    }
+
+                    readGroup.wait()
+                    guard capture.claimCompletion() else { return }
+
+                    let snapshot = capture.snapshot()
+                    let output = String(data: snapshot.stdout, encoding: .utf8) ?? ""
+                    let stderr = String(data: snapshot.stderr, encoding: .utf8)
+                    if completedProcess.terminationStatus == 0 {
+                        continuation.resume(returning: .success(output))
+                    } else {
+                        continuation.resume(returning: .failure(.executionFailed(
+                            command: executable,
+                            exitCode: completedProcess.terminationStatus,
+                            stderr: stderr
+                        )))
+                    }
+                }
             }
 
             do {
@@ -160,30 +240,36 @@ actor ProcessExecutor {
                     inputPipe.fileHandleForWriting.write(Data(standardInput.utf8))
                     inputPipe.fileHandleForWriting.closeFile()
                 }
-                process.waitUntilExit()
-                readGroup.wait()
 
-                let output = String(data: stdoutData, encoding: .utf8) ?? ""
-                let stderr = String(data: stderrData, encoding: .utf8)
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: .success(output))
-                } else {
-                    continuation.resume(returning: .failure(.executionFailed(
-                        command: executable,
-                        exitCode: process.terminationStatus,
-                        stderr: stderr
-                    )))
+                if timeoutSeconds > 0 {
+                    DispatchQueue.global(qos: .utility).asyncAfter(
+                        deadline: .now() + timeoutSeconds
+                    ) {
+                        guard process.isRunning else { return }
+                        capture.markTimedOut()
+                        process.terminate()
+                        DispatchQueue.global(qos: .utility).asyncAfter(
+                            deadline: .now() + 2
+                        ) {
+                            if process.isRunning {
+                                kill(process.processIdentifier, SIGKILL)
+                            }
+                        }
+                    }
                 }
             } catch let error as NSError {
                 inputPipe?.fileHandleForWriting.closeFile()
+                stdoutPipe.fileHandleForWriting.closeFile()
+                stderrPipe.fileHandleForWriting.closeFile()
+                guard capture.claimCompletion() else { return }
                 if error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
                     continuation.resume(returning: .failure(.commandNotFound(executable)))
-                } else {
-                    continuation.resume(returning: .failure(.launchFailed(
-                        command: executable,
-                        underlying: error
-                    )))
+                    return
                 }
+                continuation.resume(returning: .failure(.launchFailed(
+                    command: executable,
+                    underlying: error
+                )))
             }
         }
         return try result.get()

@@ -10,6 +10,10 @@ import Foundation
 
 struct HookInstaller {
     private static let bridgeInstallFingerprintKey = "agentBridgeInstallFingerprint"
+    /// Increment whenever installer ownership/coexistence semantics change,
+    /// so an app update with the same marketing/build version still repairs
+    /// an already-installed bridge configuration on next launch.
+    private static let bridgeInstallRevision = "permission-owner-migration-v3"
 
     /// Install hook script and update settings.json on app launch
     static func installIfNeeded() {
@@ -46,7 +50,7 @@ struct HookInstaller {
         let python = detectPython()
         let command = "\(python) \(ClaudePaths.hookScriptShellPath)"
         let hookEntry: [[String: Any]] = [["type": "command", "command": command]]
-        let hookEntryWithTimeout: [[String: Any]] = [["type": "command", "command": command, "timeout": 86400]]
+        let hookEntryWithTimeout: [[String: Any]] = [["type": "command", "command": command, "timeout": 105]]
         let withMatcher: [[String: Any]] = [["matcher": "*", "hooks": hookEntry]]
         let withMatcherAndTimeout: [[String: Any]] = [["matcher": "*", "hooks": hookEntryWithTimeout]]
         let withoutMatcher: [[String: Any]] = [["hooks": hookEntry]]
@@ -323,7 +327,7 @@ struct HookInstaller {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "0"
         let build = info?["CFBundleVersion"] as? String ?? "0"
-        let fingerprint = "\(version)-\(build)"
+        let fingerprint = "\(version)-\(build)-\(bridgeInstallRevision)"
         let installedBridge = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".multiagent-notch/bin/notch-bridge.py")
 

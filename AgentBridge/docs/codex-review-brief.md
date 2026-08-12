@@ -25,20 +25,19 @@
 | `AgentBridge/README.md` | 架构、局限、扩展新 Agent 的方法 |
 
 ### 仓库外(运行时配置,已备份)
-- `~/.codex/hooks.json`:8 个事件挂上 `notch-bridge.py --source codex`;
-  **保留**原有 agentwatch / vibe-island-bridge 条目未动。备份:`~/.codex/hooks.json.bak.20260725T153612`。
+- `~/.codex/hooks.json`:观察事件 + 可选审批事件挂上
+  `notch-bridge.py --source codex`；已知 AgentWatch 通知观察器可异步共存，未知决策钩子
+  默认保持冲突并拒绝接管。安装时始终先备份。
 - `~/.multiagent-notch/bin/notch-bridge.py`:稳定副本(hooks 指向此处,不依赖仓库位置)。
 - **Claude 原生显示钩子保留**：避免重复 UI 事件。
 
 ## 3. 验收结果(已完成的自测)
 - [x] 模拟 Codex 一整轮(SessionStart/UserPromptSubmit/PreToolUse/Stop)全部成功进 socket,exit 0。
-- [x] 权限决策输出与 codex 二进制内置 schema 逐字节一致:
+- [x] 权限决策输出与当前官方 Codex Hooks 文档及本机二进制 schema 一致:
       `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow|deny"}}}`。
 - [x] `hooks.json` 改后仍是合法 JSON;幂等(重复 install 不叠加)。
 - [x] 旧 ad-hoc 脚本 `~/.codex/hooks/vibe-notch-bridge.py` 已清理。
-- [ ] **未完成(依赖用户/Codex 运行时)**:真实 Codex 会话触发钩子后显示在刘海。
-      阻塞点:Codex 需 ① 重启重载 hooks ② 交互式信任新钩子;且 Claude Code 侧禁止运行
-      `--dangerously-bypass-hook-trust`,无法由 Claude 代跑。
+- [x] 真实 Codex CLI 会话已通过 hooks 显示在刘海；完成状态与同 session resume 聊天均已验收。
 
 ## 4. 请 Codex 重点审的风险点
 1. **与 vibe-island 钩子共存冲突**:`PermissionRequest` 现同时挂 vibe-island-bridge 和本 bridge。
@@ -54,13 +53,13 @@
    (bridge 已 fail-open,但 Codex 端命令 not found 的表现待确认)。
 
 ## 5. 建议下一步
-- 用户用真实 CLI `codex` 验证(顺带完成信任+重载),回填第 3 节最后一项。
-- 若确认 ChatGPT.app 版 Codex 不执行命令钩子,评估改走 `notify` 机制兜底。
+- 发布前再用真实 Codex/Claude Code 原生 `PermissionRequest` 各触发一次，分别点击 allow/deny。
 - 扩展 Gemini(`~/.gemini/settings.json`)/Cursor(`~/.cursor/hooks.json`):仅需在 install.sh 加注册。
 
 ## 6. 是否建议合入
-建议:bridge 层与安装器逻辑可合入;但**风险点 1(与 vibe-island 的 PermissionRequest 冲突)
-请先定夺**——保留共存 or 独占。真实 Codex 显示验证通过前,不建议对外声称"Codex 已接通"。
+结论：决策钩子采用独占策略，已知观察钩子异步共存；Vibe Island 决策条目已精确迁出。
+真实 Codex 状态、完成边界和同会话 CLI 聊天均已验证，可以合入。原生 PermissionRequest
+的 allow/deny 双分支仍保留为发布前人工验收项。
 
 ---
 
@@ -68,9 +67,9 @@
 
 | 发现 | 处理 | 验证 |
 |---|---|---|
-| **[P1] PermissionRequest 需独占** | 安装器默认**不注册**本项目审批钩子(若已存在其他 PR 钩子),改为打印冲突命令;显式 `--migrate-permission "<exact cmd>"`(可重复)才移除指定旧命令并接管。观察类事件仍共存。 | 实测:实时 hooks.json 中 PR 现只剩 agentwatch+vibe-island,ours=0;单测 3a 冲突跳过、3b 迁移后独占 ✅ |
+| **[P1] PermissionRequest 需独占** | Codex 遇到未知 PR 钩子默认拒绝接管；显式 `--migrate-permission "<exact cmd>"` 才迁移。Claude Code 则从 PR 精确迁出已知 Vibe Island 决策命令，保留其观察事件/statusLine。已知观察钩子可异步共存。 | 实测：Claude/Codex 的 Vibe Island 决策钩子均已迁出；Codex AgentWatch 观察钩子 + Agent Notch 决策钩子各 1 条；单测覆盖冲突、迁移、共存、不误删与幂等 ✅ |
 | **[P1] 子串去重误删** | 改为**完整命令精确匹配**(`OWNED_COMMANDS` 列出当前+遗留完整命令);install/uninstall 共用同一规则。 | 单测:第三方 `/opt/other-project/notch-bridge.py --foo` 保留不删 ✅;幂等不叠加 ✅ |
-| **[P2] 内外层同为 300s 竞态** | 内层默认 **285s**(`NOTCH_PERMISSION_TIMEOUT` 可配),外层保持 300s,内层严格更小;非权限事件改用短超时(`NOTCH_SEND_TIMEOUT`=5s)。 | `bin/notch-bridge.py` 顶部常量;`py_compile` 通过 |
+| **[P2] 审批长时间阻塞** | Codex bridge 与 Claude 原生 hook 内层均为 **90s**，外层 105s；超时先 fail-open 到原生审批，App 随后清理过期 socket/审批状态。非权限事件为 5s。 | bridge 单测 + Python 编译 + Swift 构建 |
 | **[P2] Codex 不支持 Notification** | 从 Codex 注册表移除 `Notification`;观察类事件降为 **6 个**;README/文档口径同步。 | 实测:Notification 事件已无 ours(仅原 agentwatch)✅ |
 | **README ✅ 过强** | 权限行改为「协议已验证(codex 0.145.0 schema 一致),真实回合待验收」。 | README 已改 |
 
@@ -87,7 +86,7 @@
   精确删除 Vibe Island bridge；Claude statusLine 也只在精确命中时删除。
 - Claude 新增 `--lifecycle-only` 辅助钩子，不重复发送 UI 事件、不参与审批，只负责完成
   会话的延迟清理。
-- Codex/Claude 的 `Stop` 默认保留 300 秒后移出刘海；期间出现任何新活动都会取消旧清理。
+- Codex/Claude 的 `Stop` 默认保留 5 小时后移出刘海；期间出现任何新活动都会取消旧清理。
   运行中、压缩中、等待审批的项目不设过期时间。
 - 合成 transcript 拒绝包含路径穿越字符的 session id；卸载器删除文件前强制验证目标位于
   `~/.claude/projects/`；全新 Codex 环境会先创建 `~/.codex`。
