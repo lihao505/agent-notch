@@ -15,6 +15,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindowController: NSWindowController?
     private var settingsPresentationTask: Task<Void, Never>?
     private weak var trackedSettingsWindow: NSWindow?
+    private var terminationRequested = false
+
+    private static var isRunningUnitTests: Bool {
+        Foundation.ProcessInfo.processInfo.environment[
+            "XCTestConfigurationFilePath"
+        ] != nil
+    }
 
     static var shared: AppDelegate?
     let updater: SPUUpdater
@@ -43,12 +50,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A hosted XCTest process uses the app executable as its bundle loader.
+        // Do not start windows, hooks, or single-instance arbitration there;
+        // otherwise an installed Agent Notch makes the test host exit before
+        // XCTest establishes its control connection.
+        if Self.isRunningUnitTests {
+            return
+        }
         if !ensureSingleInstance() {
             NSApplication.shared.terminate(nil)
             return
         }
 
-        HookInstaller.installIfNeeded()
+        // Never infer consent from files that an older build may have written.
+        // Self-healing is allowed only after an explicit onboarding/settings
+        // opt-in, which is persisted independently from onboarding completion.
+        if UserDefaults.standard.bool(forKey: Self.onboardingCompletedKey),
+           HookInstaller.integrationsOptedIn {
+            Task.detached(priority: .utility) {
+                HookInstaller.installIfNeeded()
+            }
+        }
         NSApplication.shared.setActivationPolicy(.accessory)
 
         windowManager = WindowManager()
@@ -68,12 +90,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // A clean shutdown must make the app immediately indistinguishable
+        // from an offline bridge. Leaving the Unix socket behind made a real
+        // quit look ineffective and forced the next launch to recover stale
+        // state before it could accept hooks.
+        HookSocketServer.shared.stop()
         screenObserver = nil
         settingsPresentationTask?.cancel()
         settingsPresentationTask = nil
         removeOnboardingWindowObserver()
         removeSettingsWindowObservers()
         trackedSettingsWindow = nil
+    }
+
+    /// Close every Agent Notch surface and terminate the process. Keeping this
+    /// in AppDelegate gives the in-notch button one explicit, testable exit
+    /// path instead of relying on the source SwiftUI hierarchy to survive the
+    /// same click that dismisses the panel.
+    func quitCompletely() {
+        guard !terminationRequested else { return }
+        terminationRequested = true
+
+        settingsPresentationTask?.cancel()
+        settingsPresentationTask = nil
+        onboardingWindowController?.window?.orderOut(nil)
+        settingsWindowController?.window?.orderOut(nil)
+        windowController?.window?.orderOut(nil)
+        HookSocketServer.shared.stop()
+        NSApplication.shared.terminate(nil)
     }
 
     private func showOnboardingIfNeeded() {
@@ -92,8 +136,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let contentController = NSHostingController(
-            rootView: OnboardingView { [weak self] in
-                self?.finishOnboarding()
+            rootView: OnboardingView { [weak self] enableIntegrations in
+                self?.finishOnboarding(enableIntegrations: enableIntegrations)
             }
         )
         let window = NSWindow(contentViewController: contentController)
@@ -140,11 +184,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeMain()
     }
 
-    private func finishOnboarding() {
+    private func finishOnboarding(enableIntegrations: Bool) {
         UserDefaults.standard.set(
             true,
             forKey: Self.onboardingCompletedKey
         )
+        HookInstaller.setIntegrationsOptIn(enableIntegrations)
+        if enableIntegrations {
+            Task.detached(priority: .userInitiated) {
+                HookInstaller.installIfNeeded()
+            }
+        }
         onboardingWindowController?.window?.close()
     }
 

@@ -6,45 +6,99 @@
 //  Auto-installs Claude Code hooks on app launch
 //
 
+import Darwin
 import Foundation
 
-struct HookInstaller {
+/// Synchronous installer work is intentionally nonisolated. Every mutating
+/// entry point is serialized by `operationLock`, and UI call sites dispatch the
+/// potentially slow filesystem and Process work through `Task.detached`.
+/// Keeping this type outside the app's default MainActor isolation prevents an
+/// accidental actor hop back to the UI thread from those background tasks.
+nonisolated struct HookInstaller {
     private static let bridgeInstallFingerprintKey = "agentBridgeInstallFingerprint"
+    private static let integrationsOptInKey = "agentNotchIntegrationsOptIn.v1"
+    private static let lastInstallSucceededKey = "agentNotchLastInstallSucceeded.v1"
+    nonisolated private static let operationLock = NSLock()
     /// Increment whenever installer ownership/coexistence semantics change,
     /// so an app update with the same marketing/build version still repairs
     /// an already-installed bridge configuration on next launch.
-    private static let bridgeInstallRevision = "permission-owner-migration-v3"
+    private static let bridgeInstallRevision = "ordered-lifecycle-events-v6"
+
+    /// Configuration mutation is allowed only after an explicit onboarding or
+    /// settings action. The absence of this key intentionally means `false` for
+    /// upgrades from builds that installed hooks automatically.
+    static var integrationsOptedIn: Bool {
+        UserDefaults.standard.bool(forKey: integrationsOptInKey)
+    }
+
+    /// `true` means consent exists but the last complete installation did not.
+    /// A conflict is intentionally reported as repair-needed instead of being
+    /// presented as a connected bridge.
+    static var integrationsNeedRepair: Bool {
+        integrationsOptedIn &&
+            !UserDefaults.standard.bool(forKey: lastInstallSucceededKey)
+    }
+
+    static func setIntegrationsOptIn(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: integrationsOptInKey)
+    }
 
     /// Install hook script and update settings.json on app launch
-    static func installIfNeeded() {
+    @discardableResult
+    static func installIfNeeded() -> Bool {
+        guard integrationsOptedIn else { return false }
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard integrationsOptedIn else { return false }
+
         let hooksDir = ClaudePaths.hooksDir
         let pythonScript = hooksDir.appendingPathComponent(ClaudePaths.hookScriptFileName)
         let legacyScript = hooksDir.appendingPathComponent(ClaudePaths.legacyHookScriptFileName)
 
-        try? FileManager.default.createDirectory(
-            at: hooksDir,
-            withIntermediateDirectories: true
-        )
-
-        if let bundled = Bundle.main.url(forResource: "claude-island-state", withExtension: "py") {
-            try? FileManager.default.removeItem(at: pythonScript)
-            try? FileManager.default.copyItem(at: bundled, to: pythonScript)
-            try? FileManager.default.setAttributes(
+        do {
+            try FileManager.default.createDirectory(
+                at: hooksDir,
+                withIntermediateDirectories: true
+            )
+            guard let bundled = Bundle.main.url(
+                forResource: "claude-island-state",
+                withExtension: "py"
+            ) else {
+                print("Agent Notch hook install skipped: bundled hook is missing")
+                UserDefaults.standard.set(false, forKey: lastInstallSucceededKey)
+                return false
+            }
+            let hookData = try Data(contentsOf: bundled)
+            try hookData.write(to: pythonScript, options: .atomic)
+            try FileManager.default.setAttributes(
                 [.posixPermissions: 0o755],
                 ofItemAtPath: pythonScript.path
             )
+        } catch {
+            print("Agent Notch hook install failed: \(error.localizedDescription)")
+            UserDefaults.standard.set(false, forKey: lastInstallSucceededKey)
+            return false
         }
+
         try? FileManager.default.removeItem(at: legacyScript)
 
-        updateSettings(at: ClaudePaths.settingsFile)
-        installBundledBridgeIfNeeded()
+        guard updateSettings(at: ClaudePaths.settingsFile) else {
+            UserDefaults.standard.set(false, forKey: lastInstallSucceededKey)
+            return false
+        }
+        let succeeded = installBundledBridgeIfNeeded()
+        UserDefaults.standard.set(succeeded, forKey: lastInstallSucceededKey)
+        return succeeded
     }
 
-    private static func updateSettings(at settingsURL: URL) {
-        var json: [String: Any] = [:]
-        if let data = try? Data(contentsOf: settingsURL),
-           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            json = existing
+    /// Returns false instead of replacing an unreadable existing file. A
+    /// malformed agent configuration is user-owned data and must be repaired
+    /// explicitly; silently treating it as `{}` would erase unrelated hooks.
+    @discardableResult
+    private static func updateSettings(at settingsURL: URL) -> Bool {
+        guard var json = loadSettingsSafely(at: settingsURL) else {
+            print("Agent Notch left unreadable settings untouched: \(settingsURL.path)")
+            return false
         }
 
         let python = detectPython()
@@ -88,7 +142,6 @@ struct HookInstaller {
         let hookEvents = supportedHookEvents(
             for: installedVersion,
             withMatcher: withMatcher,
-            withMatcherAndTimeout: withMatcherAndTimeout,
             withoutMatcher: withoutMatcher,
             preCompactConfig: preCompactConfig
         )
@@ -98,14 +151,150 @@ struct HookInstaller {
             hooks[event] = existing + config
         }
 
+        // A permission decision needs exactly one synchronous owner. Migrate
+        // only the exact Vibe Island commands we know, keep async observers,
+        // and leave every unknown synchronous hook untouched without adding
+        // Agent Notch as a second decision owner.
+        if let entries = hooks["PermissionRequest"] as? [[String: Any]] {
+            let migrated = entries.compactMap {
+                removingExactCommands(
+                    from: $0,
+                    commands: knownVibeIslandClaudePermissionCommands()
+                )
+            }
+            if migrated.isEmpty {
+                hooks.removeValue(forKey: "PermissionRequest")
+            } else {
+                hooks["PermissionRequest"] = migrated
+            }
+        }
+
+        let permissionEntries = hooks["PermissionRequest"] as? [[String: Any]]
+        let malformedPermissionConfiguration =
+            hooks["PermissionRequest"] != nil && permissionEntries == nil
+        if !malformedPermissionConfiguration,
+           !containsSynchronousHook(in: permissionEntries ?? []) {
+            hooks["PermissionRequest"] =
+                (permissionEntries ?? []) + withMatcherAndTimeout
+        } else {
+            print(
+                "Agent Notch did not take Claude PermissionRequest ownership " +
+                "because another synchronous hook is configured."
+            )
+        }
+
         json["hooks"] = hooks
 
-        if let data = try? JSONSerialization.data(
-            withJSONObject: json,
-            options: [.prettyPrinted, .sortedKeys]
-        ) {
-            try? data.write(to: settingsURL)
+        return writeSettingsAtomically(json, to: settingsURL)
+    }
+
+    private static func loadSettingsSafely(
+        at settingsURL: URL
+    ) -> [String: Any]? {
+        let resolvedURL = resolvedSettingsURL(settingsURL)
+        guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
+            return [:]
         }
+        do {
+            let data = try Data(contentsOf: resolvedURL)
+            guard let json = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any] else {
+                return nil
+            }
+            return json
+        } catch {
+            return nil
+        }
+    }
+
+    @discardableResult
+    private static func writeSettingsAtomically(
+        _ json: [String: Any],
+        to settingsURL: URL
+    ) -> Bool {
+        let fileManager = FileManager.default
+        let resolvedURL = resolvedSettingsURL(settingsURL)
+        do {
+            try fileManager.createDirectory(
+                at: resolvedURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+
+            if fileManager.fileExists(atPath: resolvedURL.path),
+               let existing = loadSettingsSafely(at: resolvedURL),
+               NSDictionary(dictionary: existing).isEqual(
+                   NSDictionary(dictionary: json)
+               ) {
+                return true
+            }
+
+            let existingAttributes = try? fileManager.attributesOfItem(
+                atPath: resolvedURL.path
+            )
+            if fileManager.fileExists(atPath: resolvedURL.path) {
+                let backupURL = resolvedURL.appendingPathExtension(
+                    "agent-notch.backup"
+                )
+                if !fileManager.fileExists(atPath: backupURL.path) {
+                    try fileManager.copyItem(at: resolvedURL, to: backupURL)
+                }
+            }
+
+            let data = try JSONSerialization.data(
+                withJSONObject: json,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            let permissions = existingAttributes?[.posixPermissions] ?? 0o600
+            let temporaryURL = resolvedURL.deletingLastPathComponent()
+                .appendingPathComponent(
+                    ".agent-notch-\(UUID().uuidString).tmp"
+                )
+            guard fileManager.createFile(
+                atPath: temporaryURL.path,
+                contents: data,
+                attributes: [.posixPermissions: permissions]
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            defer { try? fileManager.removeItem(at: temporaryURL) }
+
+            let handle = try FileHandle(forWritingTo: temporaryURL)
+            try handle.synchronize()
+            try handle.close()
+
+            guard rename(temporaryURL.path, resolvedURL.path) == 0 else {
+                throw POSIXError(
+                    POSIXErrorCode(rawValue: errno) ?? .EIO
+                )
+            }
+            try fileManager.setAttributes(
+                [.posixPermissions: permissions],
+                ofItemAtPath: resolvedURL.path
+            )
+            return true
+        } catch {
+            print("Agent Notch could not update \(resolvedURL.path): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Follow a valid or dangling settings symlink and replace its target, not
+    /// the link itself. This keeps dotfile-manager layouts intact.
+    private static func resolvedSettingsURL(_ settingsURL: URL) -> URL {
+        let fileManager = FileManager.default
+        guard let destination = try? fileManager.destinationOfSymbolicLink(
+            atPath: settingsURL.path
+        ) else {
+            return settingsURL
+        }
+        let destinationURL: URL
+        if destination.hasPrefix("/") {
+            destinationURL = URL(fileURLWithPath: destination)
+        } else {
+            destinationURL = settingsURL.deletingLastPathComponent()
+                .appendingPathComponent(destination)
+        }
+        return destinationURL.standardizedFileURL.resolvingSymlinksInPath()
     }
 
     // MARK: - Claude Code Version Detection
@@ -181,7 +370,6 @@ struct HookInstaller {
     private static func supportedHookEvents(
         for version: ClaudeCodeVersion?,
         withMatcher: [[String: Any]],
-        withMatcherAndTimeout: [[String: Any]],
         withoutMatcher: [[String: Any]],
         preCompactConfig: [[String: Any]]
     ) -> [(String, [[String: Any]])] {
@@ -190,7 +378,6 @@ struct HookInstaller {
             ("UserPromptSubmit", withoutMatcher),
             ("PreToolUse", withMatcher),
             ("PostToolUse", withMatcher),
-            ("PermissionRequest", withMatcherAndTimeout),
             ("Notification", withMatcher),
             ("Stop", withoutMatcher),
             ("SubagentStop", withoutMatcher),
@@ -255,50 +442,63 @@ struct HookInstaller {
     }
 
     /// Uninstall hooks from settings.json and remove script
-    static func uninstall() {
+    @discardableResult
+    static func uninstall() -> Bool {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         let hooksDir = ClaudePaths.hooksDir
         let pythonScript = hooksDir.appendingPathComponent(ClaudePaths.hookScriptFileName)
         let legacyScript = hooksDir.appendingPathComponent(ClaudePaths.legacyHookScriptFileName)
         let settings = ClaudePaths.settingsFile
 
-        try? FileManager.default.removeItem(at: pythonScript)
-        try? FileManager.default.removeItem(at: legacyScript)
-        _ = runBundledBridgeScript(named: "uninstall.sh")
-        UserDefaults.standard.removeObject(forKey: bridgeInstallFingerprintKey)
+        if FileManager.default.fileExists(atPath: settings.path) {
+            guard var json = loadSettingsSafely(at: settings) else {
+                print("Agent Notch left unreadable settings untouched: \(settings.path)")
+                return false
+            }
+            if var hooks = json["hooks"] as? [String: Any] {
+                let managedPaths = managedHookScriptPaths()
 
-        guard let data = try? Data(contentsOf: settings),
-              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              var hooks = json["hooks"] as? [String: Any] else {
-            return
-        }
-        let managedPaths = managedHookScriptPaths()
+                for (event, value) in hooks {
+                    if var entries = value as? [[String: Any]] {
+                        entries = entries.compactMap {
+                            removingAgentNotchHooks(
+                                from: $0,
+                                managedPaths: managedPaths
+                            )
+                        }
 
-        for (event, value) in hooks {
-            if var entries = value as? [[String: Any]] {
-                entries = entries.compactMap {
-                    removingAgentNotchHooks(from: $0, managedPaths: managedPaths)
+                        if entries.isEmpty {
+                            hooks.removeValue(forKey: event)
+                        } else {
+                            hooks[event] = entries
+                        }
+                    }
                 }
 
-                if entries.isEmpty {
-                    hooks.removeValue(forKey: event)
+                if hooks.isEmpty {
+                    json.removeValue(forKey: "hooks")
                 } else {
-                    hooks[event] = entries
+                    json["hooks"] = hooks
                 }
             }
+
+            guard writeSettingsAtomically(json, to: settings) else { return false }
         }
 
-        if hooks.isEmpty {
-            json.removeValue(forKey: "hooks")
-        } else {
-            json["hooks"] = hooks
+        for script in [pythonScript, legacyScript]
+            where FileManager.default.fileExists(atPath: script.path) {
+            do {
+                try FileManager.default.removeItem(at: script)
+            } catch {
+                print("Agent Notch could not remove \(script.path): \(error)")
+                return false
+            }
         }
-
-        if let data = try? JSONSerialization.data(
-            withJSONObject: json,
-            options: [.prettyPrinted, .sortedKeys]
-        ) {
-            try? data.write(to: settings)
-        }
+        let bridgeResult = runBundledBridgeScript(named: "uninstall.sh")
+        UserDefaults.standard.removeObject(forKey: bridgeInstallFingerprintKey)
+        UserDefaults.standard.set(false, forKey: lastInstallSucceededKey)
+        return bridgeResult.succeeded
     }
 
     private static func detectPython() -> String {
@@ -323,48 +523,179 @@ struct HookInstaller {
     /// switch as the native Claude integration. The shell scripts own exact,
     /// backed-up edits for Codex and CodeBuddy and deliberately refuse to take
     /// over a conflicting PermissionRequest decision hook by default.
-    private static func installBundledBridgeIfNeeded() {
+    private static func installBundledBridgeIfNeeded() -> Bool {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "0"
         let build = info?["CFBundleVersion"] as? String ?? "0"
-        let fingerprint = "\(version)-\(build)-\(bridgeInstallRevision)"
+        let baseFingerprint = "\(version)-\(build)-\(bridgeInstallRevision)"
         let installedBridge = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".multiagent-notch/bin/notch-bridge.py")
+        let currentSignature = bridgeConfigurationSignature()
+        let completeFingerprint =
+            "\(baseFingerprint)|\(currentSignature)|complete"
+        let storedFingerprint = UserDefaults.standard.string(
+            forKey: bridgeInstallFingerprintKey
+        )
 
-        if UserDefaults.standard.string(forKey: bridgeInstallFingerprintKey) == fingerprint,
+        if storedFingerprint == completeFingerprint,
            FileManager.default.isReadableFile(atPath: installedBridge.path) {
-            return
+            return true
+        }
+        let result = runBundledBridgeScript(named: "install.sh")
+        guard result.succeeded else {
+            UserDefaults.standard.removeObject(forKey: bridgeInstallFingerprintKey)
+            if !result.errorOutput.isEmpty {
+                print("Agent Notch bridge install failed: \(result.errorOutput)")
+            }
+            return false
         }
 
-        if runBundledBridgeScript(named: "install.sh") {
-            UserDefaults.standard.set(fingerprint, forKey: bridgeInstallFingerprintKey)
-        }
+        let status = result.output.contains(
+            "AGENT_NOTCH_INSTALL_STATUS=partial"
+        ) ? "partial" : "complete"
+        let finalFingerprint =
+            "\(baseFingerprint)|\(bridgeConfigurationSignature())|\(status)"
+        UserDefaults.standard.set(
+            finalFingerprint,
+            forKey: bridgeInstallFingerprintKey
+        )
+        return status == "complete"
     }
 
-    @discardableResult
-    private static func runBundledBridgeScript(named name: String) -> Bool {
-        guard let resources = Bundle.main.resourceURL else { return false }
+    private struct BridgeScriptResult {
+        let succeeded: Bool
+        let output: String
+        let errorOutput: String
+    }
+
+    private static func runBundledBridgeScript(
+        named name: String
+    ) -> BridgeScriptResult {
+        guard let resources = Bundle.main.resourceURL else {
+            return BridgeScriptResult(
+                succeeded: false,
+                output: "",
+                errorOutput: "App resources are unavailable."
+            )
+        }
         let script = resources
             .appendingPathComponent("AgentBridge", isDirectory: true)
             .appendingPathComponent(name)
-        guard FileManager.default.isReadableFile(atPath: script.path) else { return false }
+        guard FileManager.default.isReadableFile(atPath: script.path) else {
+            return BridgeScriptResult(
+                succeeded: false,
+                output: "",
+                errorOutput: "Missing bundled script: \(name)"
+            )
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script.path]
         process.currentDirectoryURL = script.deletingLastPathComponent()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        var environment = Foundation.ProcessInfo.processInfo.environment
+        environment["CLAUDE_CONFIG_DIR"] = ClaudePaths.claudeDir.path
+        environment["AGENT_NOTCH_CLAUDE_DIR"] = ClaudePaths.claudeDir.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let commonPaths = [
+            "\(home)/.local/bin",
+            "\(home)/.codex/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+        ]
+        environment["PATH"] = (
+            commonPaths + [environment["PATH"] ?? "/usr/bin:/bin"]
+        ).joined(separator: ":")
+        process.environment = environment
+
+        // Capture to private temporary files instead of pipes. The installer
+        // can print conflict details; waiting before draining a full pipe would
+        // deadlock the app.
+        let captureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "agent-notch-installer-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        let outputURL = captureDirectory.appendingPathComponent("stdout")
+        let errorURL = captureDirectory.appendingPathComponent("stderr")
+        do {
+            try FileManager.default.createDirectory(
+                at: captureDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            guard FileManager.default.createFile(
+                atPath: outputURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ), FileManager.default.createFile(
+                atPath: errorURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        } catch {
+            return BridgeScriptResult(
+                succeeded: false,
+                output: "",
+                errorOutput: error.localizedDescription
+            )
+        }
+        defer { try? FileManager.default.removeItem(at: captureDirectory) }
 
         do {
+            let outputHandle = try FileHandle(forWritingTo: outputURL)
+            let errorHandle = try FileHandle(forWritingTo: errorURL)
+            process.standardOutput = outputHandle
+            process.standardError = errorHandle
             try process.run()
             process.waitUntilExit()
-            return process.terminationStatus == 0
+            try outputHandle.close()
+            try errorHandle.close()
+            let output = String(
+                data: try Data(contentsOf: outputURL),
+                encoding: .utf8
+            ) ?? ""
+            let errorOutput = String(
+                data: try Data(contentsOf: errorURL),
+                encoding: .utf8
+            ) ?? ""
+            return BridgeScriptResult(
+                succeeded: process.terminationStatus == 0,
+                output: output,
+                errorOutput: errorOutput
+            )
         } catch {
             // Keep the native Claude hook functional if an optional agent bridge
             // cannot be installed on this machine.
-            return false
+            return BridgeScriptResult(
+                succeeded: false,
+                output: "",
+                errorOutput: error.localizedDescription
+            )
         }
+    }
+
+    private static func bridgeConfigurationSignature() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let paths = [
+            ClaudePaths.settingsFile,
+            home.appendingPathComponent(".codex/hooks.json"),
+            home.appendingPathComponent(".codebuddy/settings.json"),
+        ]
+        return paths.map { url in
+            let resolved = resolvedSettingsURL(url)
+            guard let attributes = try? FileManager.default.attributesOfItem(
+                atPath: resolved.path
+            ) else {
+                return "\(url.path)=missing"
+            }
+            let size = attributes[.size] as? NSNumber ?? 0
+            let modified = (attributes[.modificationDate] as? Date)?
+                .timeIntervalSince1970 ?? 0
+            return "\(url.path)=\(size):\(modified)"
+        }.joined(separator: "|")
     }
 
     private static func managedHookScriptPaths() -> Set<String> {
@@ -373,6 +704,50 @@ struct HookInstaller {
             (hooksDirectory as NSString).appendingPathComponent(ClaudePaths.hookScriptFileName),
             (hooksDirectory as NSString).appendingPathComponent(ClaudePaths.legacyHookScriptFileName),
         ].map { ($0 as NSString).standardizingPath })
+    }
+
+    private static func knownVibeIslandClaudePermissionCommands() -> Set<String> {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return [
+            #"/bin/sh -c '[ -x "$HOME/.vibe-island/bin/vibe-island-bridge" ] && "$HOME/.vibe-island/bin/vibe-island-bridge" --source claude; exit 0'"#,
+            "'\(home)/.vibe-island/bin/vibe-island-bridge' --source claude",
+        ]
+    }
+
+    nonisolated private static func removingExactCommands(
+        from entry: [String: Any],
+        commands: Set<String>
+    ) -> [String: Any]? {
+        guard var entryHooks = entry["hooks"] as? [[String: Any]] else {
+            // Preserve an unfamiliar schema. The caller treats it as a
+            // synchronous conflict rather than trying to normalize it.
+            return entry
+        }
+        entryHooks.removeAll {
+            guard let command = $0["command"] as? String else { return false }
+            return commands.contains(
+                command.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        guard !entryHooks.isEmpty else { return nil }
+
+        var updatedEntry = entry
+        updatedEntry["hooks"] = entryHooks
+        return updatedEntry
+    }
+
+    nonisolated private static func containsSynchronousHook(
+        in entries: [[String: Any]]
+    ) -> Bool {
+        for entry in entries {
+            guard let entryHooks = entry["hooks"] as? [[String: Any]] else {
+                return true
+            }
+            for hook in entryHooks where hook["async"] as? Bool != true {
+                return true
+            }
+        }
+        return false
     }
 
     nonisolated private static func removingAgentNotchHooks(
@@ -418,7 +793,8 @@ struct HookInstaller {
             scriptPath.removeLast()
         }
 
-        let candidate = (scriptPath as NSString).standardizingPath
+        let candidate = ((scriptPath as NSString).expandingTildeInPath as NSString)
+            .standardizingPath
         return managedPaths.contains(candidate)
     }
 }

@@ -17,6 +17,9 @@ class ClaudeSessionMonitor: ObservableObject {
     @Published var pendingInstances: [SessionState] = []
 
     private var cancellables = Set<AnyCancellable>()
+    private var hookEventTask: Task<Void, Never>?
+    private var hookEventContinuation: AsyncStream<SessionEvent>.Continuation?
+    private var isMonitoring = false
 
     init() {
         SessionStore.shared.sessionsPublisher
@@ -32,16 +35,31 @@ class ClaudeSessionMonitor: ObservableObject {
     // MARK: - Monitoring Lifecycle
 
     func startMonitoring() {
-        // Start periodic status rechecking
-        Task {
-            await SessionStore.shared.startPeriodicStatusCheck()
+        guard !isMonitoring else { return }
+        isMonitoring = true
+
+        // HookSocketServer accepts connections on one serial queue, but
+        // launching an unstructured Task for every callback does not preserve
+        // that order. One AsyncStream consumer keeps PreToolUse,
+        // PermissionRequest, PostToolUse and Stop in wire order; SessionStore's
+        // event timestamps provide a second guard across separate hook
+        // processes.
+        let (hookEvents, continuation) = AsyncStream.makeStream(
+            of: SessionEvent.self
+        )
+        hookEventContinuation = continuation
+        hookEventTask = Task {
+            for await event in hookEvents {
+                guard !Task.isCancelled else { break }
+                await SessionStore.shared.process(event)
+            }
         }
 
+        // Start accepting fresh hooks before disk restoration yields to parser
+        // I/O. SessionStore resolves the race by keeping the newest timestamp.
         HookSocketServer.shared.start(
             onEvent: { event in
-                Task {
-                    await SessionStore.shared.process(.hookReceived(event))
-                }
+                continuation.yield(.hookReceived(event))
 
                 if event.sessionPhase == .processing {
                     Task { @MainActor in
@@ -67,17 +85,26 @@ class ClaudeSessionMonitor: ObservableObject {
                 }
             },
             onPermissionFailure: { sessionId, toolUseId in
-                Task {
-                    await SessionStore.shared.process(
-                        .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
-                    )
-                }
+                continuation.yield(.permissionSocketFailed(
+                    sessionId: sessionId,
+                    toolUseId: toolUseId
+                ))
             }
         )
+
+        Task {
+            await SessionStore.shared.startPeriodicStatusCheck()
+        }
     }
 
     func stopMonitoring() {
+        guard isMonitoring else { return }
+        isMonitoring = false
         HookSocketServer.shared.stop()
+        hookEventContinuation?.finish()
+        hookEventContinuation = nil
+        hookEventTask?.cancel()
+        hookEventTask = nil
         Task {
             await SessionStore.shared.stopPeriodicStatusCheck()
         }
@@ -87,15 +114,14 @@ class ClaudeSessionMonitor: ObservableObject {
 
     func approvePermission(
         sessionId: String,
-        expectedToolUseId: String? = nil
+        expectedToolUseId: String
     ) {
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission else {
                 return
             }
-            if let expectedToolUseId,
-               permission.toolUseId != expectedToolUseId {
+            if permission.toolUseId != expectedToolUseId {
                 return
             }
             let toolUseId = permission.toolUseId
@@ -103,8 +129,7 @@ class ClaudeSessionMonitor: ObservableObject {
             HookSocketServer.shared.respondToPermission(
                 toolUseId: toolUseId,
                 sessionId: sessionId,
-                decision: "allow",
-                allowSessionFallback: expectedToolUseId == nil
+                decision: "allow"
             ) { delivered in
                 Task {
                     await SessionStore.shared.process(
@@ -119,7 +144,7 @@ class ClaudeSessionMonitor: ObservableObject {
 
     func denyPermission(
         sessionId: String,
-        expectedToolUseId: String? = nil,
+        expectedToolUseId: String,
         reason: String?
     ) {
         Task {
@@ -127,8 +152,7 @@ class ClaudeSessionMonitor: ObservableObject {
                   let permission = session.activePermission else {
                 return
             }
-            if let expectedToolUseId,
-               permission.toolUseId != expectedToolUseId {
+            if permission.toolUseId != expectedToolUseId {
                 return
             }
             let toolUseId = permission.toolUseId
@@ -137,8 +161,7 @@ class ClaudeSessionMonitor: ObservableObject {
                 toolUseId: toolUseId,
                 sessionId: sessionId,
                 decision: "deny",
-                reason: reason,
-                allowSessionFallback: expectedToolUseId == nil
+                reason: reason
             ) { delivered in
                 Task {
                     await SessionStore.shared.process(
@@ -154,11 +177,16 @@ class ClaudeSessionMonitor: ObservableObject {
     /// Answer an interactive PreToolUse request. Claude Code requires the
     /// original tool input to be echoed back together with the selected
     /// answers, then explicitly allowed.
-    func answerQuestions(sessionId: String, answers: [String: String]) {
+    func answerQuestions(
+        sessionId: String,
+        expectedToolUseId: String,
+        answers: [String: String]
+    ) {
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
-                  permission.toolName == "AskUserQuestion" else {
+                  permission.toolName == "AskUserQuestion",
+                  permission.toolUseId == expectedToolUseId else {
                 return
             }
 
@@ -184,11 +212,12 @@ class ClaudeSessionMonitor: ObservableObject {
 
     /// ExitPlanMode also requires an echoed updatedInput when it is handled
     /// through a PreToolUse integration.
-    func approvePlan(sessionId: String) {
+    func approvePlan(sessionId: String, expectedToolUseId: String) {
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
-                  permission.toolName == "ExitPlanMode" else {
+                  permission.toolName == "ExitPlanMode",
+                  permission.toolUseId == expectedToolUseId else {
                 return
             }
 

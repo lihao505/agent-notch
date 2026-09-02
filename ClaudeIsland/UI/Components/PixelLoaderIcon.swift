@@ -21,7 +21,7 @@ struct PixelLoaderIcon: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: Self.frameDuration)) { context in
+        TimelineView(.periodic(from: .now, by: Self.frameDuration)) { context in
             let elapsed = context.date.timeIntervalSinceReferenceDate
             let frameIndex =
                 Int(elapsed / Self.frameDuration) % Self.frameNames.count
@@ -88,7 +88,7 @@ struct WaitingPixelIndicatorIcon: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+        TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { context in
             let progress = context.date.timeIntervalSinceReferenceDate
                 .truncatingRemainder(dividingBy: Self.orbitDuration)
                 / Self.orbitDuration

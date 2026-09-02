@@ -59,6 +59,13 @@ struct SessionState: Equatable, Identifiable, Sendable {
 
     var lastActivity: Date
     var createdAt: Date
+    /// Latest bridge event that was allowed to change the lifecycle phase.
+    /// Tool bookkeeping may still accept older events, but their phase cannot
+    /// overwrite a newer Stop, permission request, or new-turn signal.
+    var lastHookEventAt: Date?
+    /// Native Codex boundary for the currently observed turn. Unlike token or
+    /// tool activity, this changes only when a genuinely new turn starts.
+    var lastCodexTurnStartedAt: Date?
     /// Set only after a turn has actually produced its completion signal.
     /// A newly launched session that is merely waiting for its first prompt is
     /// not considered completed.
@@ -89,6 +96,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
         needsClearReconciliation: Bool = false,
         lastActivity: Date = Date(),
         createdAt: Date = Date(),
+        lastHookEventAt: Date? = nil,
+        lastCodexTurnStartedAt: Date? = nil,
         completedAt: Date? = nil
     ) {
         self.sessionId = sessionId
@@ -106,6 +115,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.needsClearReconciliation = needsClearReconciliation
         self.lastActivity = lastActivity
         self.createdAt = createdAt
+        self.lastHookEventAt = lastHookEventAt
+        self.lastCodexTurnStartedAt = lastCodexTurnStartedAt
         self.completedAt = completedAt
     }
 

@@ -54,6 +54,7 @@ struct NotchStudioSettingsView: View {
     @State private var selection: NotchStudioSection = .general
     @State private var launchAtLogin = false
     @State private var hooksInstalled = false
+    @State private var hooksNeedRepair = false
     @State private var notificationSound = AppSettings.notificationSound
     @State private var previewState: NotchPreviewState = .idle
     @Namespace private var sectionSelectionNamespace
@@ -997,8 +998,12 @@ struct NotchStudioSettingsView: View {
                 settingToggle(
                     t("Claude hooks", "Claude 钩子"),
                     detail: t(
-                        "Receive lifecycle and permission events locally.",
-                        "在本地接收生命周期与权限事件。"
+                        hooksNeedRepair
+                            ? "Enabled, but installation needs repair. Toggle off and on to retry."
+                            : "Receive lifecycle and permission events locally.",
+                        hooksNeedRepair
+                            ? "已授权，但安装需要修复。关闭后重新开启即可重试。"
+                            : "在本地接收生命周期与权限事件。"
                     ),
                     isOn: Binding(
                         get: { hooksInstalled },
@@ -1198,7 +1203,8 @@ struct NotchStudioSettingsView: View {
 
     private func refreshSystemState() {
         launchAtLogin = SMAppService.mainApp.status == .enabled
-        hooksInstalled = HookInstaller.isInstalled()
+        hooksInstalled = HookInstaller.integrationsOptedIn
+        hooksNeedRepair = HookInstaller.integrationsNeedRepair
         notificationSound = AppSettings.notificationSound
         screenSelector.refreshScreens()
     }
@@ -1217,12 +1223,25 @@ struct NotchStudioSettingsView: View {
     }
 
     private func toggleHooks() {
-        if hooksInstalled {
-            HookInstaller.uninstall()
-        } else {
-            HookInstaller.installIfNeeded()
+        let shouldEnable = !HookInstaller.integrationsOptedIn
+        HookInstaller.setIntegrationsOptIn(shouldEnable)
+        hooksInstalled = shouldEnable
+        hooksNeedRepair = shouldEnable
+        Task {
+            let succeeded = await Task.detached(priority: .userInitiated) {
+                if shouldEnable {
+                    return HookInstaller.installIfNeeded()
+                } else {
+                    return HookInstaller.uninstall()
+                }
+            }.value
+            if !shouldEnable, !succeeded {
+                // Do not claim the bridge is off while config cleanup failed.
+                HookInstaller.setIntegrationsOptIn(true)
+            }
+            hooksInstalled = HookInstaller.integrationsOptedIn
+            hooksNeedRepair = HookInstaller.integrationsNeedRepair
         }
-        hooksInstalled = HookInstaller.isInstalled()
     }
 
     private func chooseClaudeDirectory() {
@@ -1245,8 +1264,17 @@ struct NotchStudioSettingsView: View {
     private func applyClaudeDirectory(_ path: String) {
         AppSettings.claudeDirectoryName = path
         ClaudePaths.invalidateCache()
-        HookInstaller.installIfNeeded()
-        hooksInstalled = HookInstaller.isInstalled()
+        if HookInstaller.integrationsOptedIn {
+            hooksNeedRepair = true
+            Task {
+                _ = await Task.detached(priority: .userInitiated) {
+                    HookInstaller.installIfNeeded()
+                }.value
+                hooksInstalled = HookInstaller.integrationsOptedIn
+                hooksNeedRepair = HookInstaller.integrationsNeedRepair
+            }
+        }
+        hooksInstalled = HookInstaller.integrationsOptedIn
     }
 
     private func openAccessibilitySettings() {

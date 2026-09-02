@@ -416,6 +416,10 @@ final class NotchPreferences: ObservableObject {
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: url.deletingLastPathComponent().path
+            )
             let data = try JSONSerialization.data(
                 withJSONObject: [
                     "mode": approvalMode.rawValue,
@@ -424,6 +428,10 @@ final class NotchPreferences: ObservableObject {
                 options: [.sortedKeys]
             )
             try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
         } catch {
             print("Failed to write approval policy: \(error)")
         }

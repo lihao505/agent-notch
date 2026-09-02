@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  TerminalColors.swift
 //  ClaudeIsland
 //

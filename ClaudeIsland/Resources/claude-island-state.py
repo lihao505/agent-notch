@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified by lihao505 for Agent Notch, 2026.
 """
 Claude Island Hook
 - Sends session state to ClaudeIsland.app via Unix socket
@@ -7,11 +8,56 @@ Claude Island Hook
 import json
 import os
 import socket
+import stat
 import sys
+import time
+import uuid
 
-SOCKET_PATH = "/tmp/claude-island.sock"
+
+def default_socket_path():
+    """Return Agent Notch's per-user socket without touching upstream paths."""
+    override = os.environ.get("AGENT_NOTCH_SOCKET", "").strip()
+    if override:
+        return override
+    return f"/tmp/agent-notch-{os.getuid()}.sock"
+
+
+SOCKET_PATH = default_socket_path()
 PERMISSION_TIMEOUT_SECONDS = 90
 SEND_TIMEOUT_SECONDS = 5
+APPROVAL_POLICY_FILE = os.path.join(
+    os.path.expanduser("~"), ".multiagent-notch", "approval-policy.json"
+)
+APPROVAL_MODES = {"ask", "auto", "trusted"}
+MANUAL_INTERACTION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+
+
+def current_approval_mode(session_id=None):
+    """Read the app-owned approval policy; malformed or absent means ask."""
+    candidate = os.environ.get("NOTCH_APPROVAL_MODE", "").strip().lower()
+    if candidate in APPROVAL_MODES:
+        return candidate
+    try:
+        with open(APPROVAL_POLICY_FILE) as policy_file:
+            policy = json.load(policy_file)
+        if not isinstance(policy, dict):
+            return "ask"
+        sessions = policy.get("sessions", {})
+        if session_id and isinstance(sessions, dict):
+            candidate = str(sessions.get(session_id, "")).lower()
+            if candidate in APPROVAL_MODES:
+                return candidate
+        candidate = str(policy.get("mode", "ask")).lower()
+        return candidate if candidate in APPROVAL_MODES else "ask"
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        return "ask"
+
+
+def should_auto_approve(session_id, tool_name):
+    """Auto/trusted applies to tools, never structured user interactions."""
+    if tool_name in MANUAL_INTERACTION_TOOLS:
+        return False
+    return current_approval_mode(session_id) in ("auto", "trusted")
 
 
 def get_tty():
@@ -52,13 +98,28 @@ def get_tty():
 
 def send_event(state):
     """Send event to app, return response if any"""
+    is_permission = state.get("status") == "waiting_for_approval"
+    sock = None
     try:
+        before = _private_socket_info(SOCKET_PATH)
+        if before is None:
+            return False if not is_permission else None
+
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        is_permission = state.get("status") == "waiting_for_approval"
         sock.settimeout(
             PERMISSION_TIMEOUT_SECONDS if is_permission else SEND_TIMEOUT_SECONDS
         )
         sock.connect(SOCKET_PATH)
+
+        after = _private_socket_info(SOCKET_PATH)
+        if (
+            after is None
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or _peer_uid(sock) != os.getuid()
+        ):
+            sock.close()
+            return False if not is_permission else None
+
         sock.sendall(json.dumps(state).encode())
 
         # For permission requests, wait for response
@@ -69,9 +130,56 @@ def send_event(state):
                 return json.loads(response.decode())
         else:
             sock.close()
+            return True
 
         return None
-    except (socket.error, OSError, json.JSONDecodeError):
+    except (socket.error, OSError, ValueError, json.JSONDecodeError):
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return False if not is_permission else None
+
+
+def _private_socket_info(sock_path):
+    """Accept only a private, same-user Unix socket (never a symlink)."""
+    try:
+        info = os.lstat(sock_path)
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return None
+    return info
+
+
+def _peer_uid(sock):
+    """Return the connected Unix peer UID using macOS/BSD getpeereid."""
+    method = getattr(sock, "getpeereid", None)
+    if callable(method):
+        try:
+            return int(method()[0])
+        except (OSError, TypeError, ValueError):
+            return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        getpeereid = libc.getpeereid
+        uid = ctypes.c_uint()
+        gid = ctypes.c_uint()
+        getpeereid.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        getpeereid.restype = ctypes.c_int
+        if getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+            return None
+        return int(uid.value)
+    except (AttributeError, OSError, TypeError, ValueError):
         return None
 
 
@@ -95,6 +203,7 @@ def main():
         "session_id": session_id,
         "cwd": cwd,
         "event": event,
+        "observed_at": time.time(),
         "pid": claude_pid,
         "tty": tty,
     }
@@ -146,7 +255,39 @@ def main():
         state["tool"] = data.get("tool_name")
         state["tool_input"] = tool_input
         state["response_timeout_seconds"] = PERMISSION_TIMEOUT_SECONDS
-        # tool_use_id lookup handled by Swift-side cache from PreToolUse
+        # Claude can omit tool_use_id here. The ID only has to correlate the
+        # notch button with this exact blocking socket, so an event-local opaque
+        # value is safer than relying on timing-sensitive PreToolUse cache hits.
+        state["tool_use_id"] = (
+            data.get("tool_use_id")
+            or "permission-{}-{}".format(session_id, uuid.uuid4().hex)
+        )
+
+        # Read once so a concurrent settings change cannot make the branch
+        # decision and the emitted policy disagree.
+        approval_mode = current_approval_mode(session_id)
+        if (
+            state["tool"] not in MANUAL_INTERACTION_TOOLS
+            and approval_mode in ("auto", "trusted")
+        ):
+            # Keep the activity visible, but do not open a second blocking
+            # socket when the user explicitly selected auto/trusted mode.
+            state["status"] = "processing"
+            state["approval_mode"] = approval_mode
+            app_is_live = send_event(state) is True
+            # Auto is scoped to a live Agent Notch run. If the app quit or
+            # crashed, return no decision so Claude falls back to its native
+            # prompt. Trusted is the explicit offline-persistent choice.
+            if approval_mode == "auto" and not app_is_live:
+                sys.exit(0)
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "allow"},
+                }
+            }
+            print(json.dumps(output))
+            sys.exit(0)
 
         # Send to app and wait for decision
         response = send_event(state)
@@ -173,7 +314,7 @@ def main():
                         "hookEventName": "PermissionRequest",
                         "decision": {
                             "behavior": "deny",
-                            "message": reason or "Denied by user via ClaudeIsland",
+                            "message": reason or "Denied by user via Agent Notch",
                         },
                     }
                 }

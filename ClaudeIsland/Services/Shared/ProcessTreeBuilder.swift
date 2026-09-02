@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ProcessTreeBuilder.swift
 //  ClaudeIsland
 //
@@ -6,6 +7,62 @@
 //
 
 import Foundation
+
+private final class ProcessTopologyCache: @unchecked Sendable {
+    nonisolated static let shared = ProcessTopologyCache()
+
+    private let lock = NSLock()
+    nonisolated(unsafe) private var tree: [Int: ProcessInfo] = [:]
+    nonisolated(unsafe) private var capturedAt = Date.distantPast
+
+    nonisolated init() {}
+
+    nonisolated func value(maxAge: TimeInterval) -> [Int: ProcessInfo]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard Date().timeIntervalSince(capturedAt) <= maxAge else {
+            return nil
+        }
+        return tree
+    }
+
+    nonisolated func store(_ tree: [Int: ProcessInfo]) {
+        lock.lock()
+        self.tree = tree
+        capturedAt = Date()
+        lock.unlock()
+    }
+}
+
+private final class ProcessWorkingDirectoryCache: @unchecked Sendable {
+    nonisolated static let shared = ProcessWorkingDirectoryCache()
+
+    nonisolated private struct Entry {
+        let capturedAt: Date
+        let path: String?
+    }
+
+    private let lock = NSLock()
+    nonisolated(unsafe) private var entries: [Int: Entry] = [:]
+
+    nonisolated init() {}
+
+    nonisolated func value(for pid: Int, maxAge: TimeInterval) -> String?? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entries[pid],
+              Date().timeIntervalSince(entry.capturedAt) <= maxAge else {
+            return nil
+        }
+        return .some(entry.path)
+    }
+
+    nonisolated func store(_ path: String?, for pid: Int) {
+        lock.lock()
+        entries[pid] = Entry(capturedAt: Date(), path: path)
+        lock.unlock()
+    }
+}
 
 /// Information about a process in the tree
 struct ProcessInfo: Sendable {
@@ -28,8 +85,14 @@ struct ProcessTreeBuilder: Sendable {
 
     private nonisolated init() {}
 
-    /// Build a process tree mapping PID -> ProcessInfo
-    nonisolated func buildTree() -> [Int: ProcessInfo] {
+    /// Build a process tree mapping PID -> ProcessInfo. Hook bursts commonly
+    /// ask the same question several times within one render cycle, so reuse a
+    /// short snapshot instead of spawning `/bin/ps` for every event.
+    nonisolated func buildTree(forceRefresh: Bool = false) -> [Int: ProcessInfo] {
+        if !forceRefresh,
+           let cached = ProcessTopologyCache.shared.value(maxAge: 0.4) {
+            return cached
+        }
         guard let output = ProcessExecutor.shared.runSyncOrNil("/bin/ps", arguments: ["-eo", "pid,ppid,tty,comm"]) else {
             return [:]
         }
@@ -51,6 +114,7 @@ struct ProcessTreeBuilder: Sendable {
             tree[pid] = ProcessInfo(pid: pid, ppid: ppid, command: command, tty: tty)
         }
 
+        ProcessTopologyCache.shared.store(tree)
         return tree
     }
 
@@ -127,7 +191,14 @@ struct ProcessTreeBuilder: Sendable {
 
     /// Get working directory for a process using lsof
     nonisolated func getWorkingDirectory(forPid pid: Int) -> String? {
+        if let cached = ProcessWorkingDirectoryCache.shared.value(
+            for: pid,
+            maxAge: 0.5
+        ) {
+            return cached
+        }
         guard let output = ProcessExecutor.shared.runSyncOrNil("/usr/sbin/lsof", arguments: ["-p", String(pid), "-Fn"]) else {
+            ProcessWorkingDirectoryCache.shared.store(nil, for: pid)
             return nil
         }
 
@@ -136,10 +207,13 @@ struct ProcessTreeBuilder: Sendable {
             if line == "fcwd" {
                 foundCwd = true
             } else if foundCwd && line.hasPrefix("n") {
-                return String(line.dropFirst())
+                let path = String(line.dropFirst())
+                ProcessWorkingDirectoryCache.shared.store(path, for: pid)
+                return path
             }
         }
 
+        ProcessWorkingDirectoryCache.shared.store(nil, for: pid)
         return nil
     }
 }

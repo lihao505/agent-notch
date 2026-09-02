@@ -8,9 +8,10 @@
   [![License](https://img.shields.io/badge/license-Apache--2.0-34d399.svg)](LICENSE.md)
 </div>
 
-Agent Notch 是一个本地优先的 macOS 工具，目前支持 Claude Code、Codex 和
-CodeBuddy 的任务状态。它会根据任务数量调整刘海尺寸，并提供会话标题、用量、
-对话跳转、Codex 回复和逐会话审批策略。
+Agent Notch 是一个本地优先的 macOS 工具，当前主要面向 Claude Code 与 Codex。
+它会根据任务数量调整刘海尺寸，并提供会话标题、用量、对话跳转、Codex 回复和
+逐会话审批策略。**CodeBuddy 集成目前标记为 Experimental**：仓库已经包含观察
+Bridge 与 CLI 续接适配，但尚未完成真实完整回合验收，不应视为稳定兼容承诺。
 
 ## 项目状态
 
@@ -19,6 +20,7 @@ CodeBuddy 的任务状态。它会根据任务数量调整刘海尺寸，并提�
 
 Claude Code、Codex 和 CodeBuddy 的协议会随各自版本变化。审批与自动信任功能仍
 需在对应工具的真实版本上逐项验收；不要在未确认兼容性时将其视为安全边界。
+CodeBuddy 在完成发布清单中的真实会话验收前始终保持 Experimental 标识。
 
 ## 当前能力
 
@@ -54,8 +56,9 @@ xcodebuild \
 内部 Xcode scheme 暂时保留 `ClaudeIsland`，这是上游兼容性技术标识，不是产品名。
 生成的应用、Bundle ID 和公开品牌均为 Agent Notch。
 
-应用首次启动会安装随包附带的 `AgentBridge`：Claude 使用原生 Hook，Codex 和
-CodeBuddy 使用观察 Bridge。也可在源码目录手动执行：
+首次引导中只有明确选择“启用并开始”后，应用才会安装随包附带的
+`AgentBridge`；选择跳过不会修改任何 Agent 配置。Claude 使用原生 Hook，Codex 使用
+观察 Bridge；CodeBuddy 的观察 Bridge 属于 Experimental 接入。也可在源码目录手动执行：
 
 ```bash
 ./AgentBridge/install.sh

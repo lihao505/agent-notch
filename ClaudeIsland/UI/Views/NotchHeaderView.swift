@@ -63,7 +63,11 @@ struct VibePetIcon: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: timelineInterval)) { context in
+        // `.animation` remains display-link driven even when the requested
+        // interval is one second. A periodic schedule preserves the authored
+        // frame cadence without waking the collapsed notch at screen refresh
+        // rate while the pet is holding an idle frame.
+        TimelineView(.periodic(from: .now, by: timelineInterval)) { context in
             let frameName = displayedFrameName(at: context.date)
 
             if let frameImage = Self.frameImage(named: frameName) {
@@ -312,7 +316,7 @@ struct PetStateSignalIcon: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: interval)) { context in
+        TimelineView(.periodic(from: .now, by: interval)) { context in
             let phase = Int(
                 context.date.timeIntervalSinceReferenceDate / interval
             )
@@ -436,7 +440,7 @@ struct CompactPetCompanionIcon: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: interval)) { context in
+        TimelineView(.periodic(from: .now, by: interval)) { context in
             let elapsed = context.date.timeIntervalSinceReferenceDate
             let phase = Int(elapsed / interval)
             let breath = (sin(elapsed * .pi) + 1) / 2

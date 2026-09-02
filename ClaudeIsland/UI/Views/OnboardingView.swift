@@ -9,7 +9,9 @@ import SwiftUI
 
 @MainActor
 struct OnboardingView: View {
-    let onFinish: () -> Void
+    /// `true` means the user explicitly chose to enable local agent hooks.
+    /// Skipping or closing the guide keeps every agent config untouched.
+    let onFinish: (Bool) -> Void
 
     @StateObject private var preferences = NotchPreferences.shared
     @State private var page = 0
@@ -116,7 +118,7 @@ struct OnboardingView: View {
             .buttonStyle(.plain)
 
             Button(t("Skip", "跳过")) {
-                onFinish()
+                onFinish(false)
             }
             .buttonStyle(.plain)
             .font(.system(size: 11, weight: .semibold))
@@ -243,19 +245,28 @@ struct OnboardingView: View {
                 )
             }
         default:
-            HStack(spacing: 8) {
-                compactFeature(
-                    "bubble.left.and.text.bubble.right",
-                    t("Reply", "直接回复")
-                )
-                compactFeature(
-                    "checkmark.shield",
-                    t("Approve", "处理审批")
-                )
-                compactFeature(
-                    "arrow.up.forward.app",
-                    t("Switch", "切换对话")
-                )
+            VStack(spacing: 9) {
+                HStack(spacing: 8) {
+                    compactFeature(
+                        "bubble.left.and.text.bubble.right",
+                        t("Reply", "直接回复")
+                    )
+                    compactFeature(
+                        "checkmark.shield",
+                        t("Approve", "处理审批")
+                    )
+                    compactFeature(
+                        "arrow.up.forward.app",
+                        t("Switch", "切换对话")
+                    )
+                }
+                Text(t(
+                    "Get started enables local hooks for supported agents. No conversation data is uploaded by Agent Notch.",
+                    "“启用并开始”会为受支持的智能体安装本地 Hook；Agent Notch 不会上传对话数据。"
+                ))
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.white.opacity(0.40))
+                .multilineTextAlignment(.center)
             }
         }
     }
@@ -295,7 +306,7 @@ struct OnboardingView: View {
 
             Button {
                 if page == pageCount - 1 {
-                    onFinish()
+                    onFinish(true)
                 } else {
                     page += 1
                 }
@@ -303,7 +314,7 @@ struct OnboardingView: View {
                 HStack(spacing: 8) {
                     Text(
                         page == pageCount - 1
-                            ? t("Get started", "开始使用")
+                            ? t("Enable & start", "启用并开始")
                             : t("Continue", "继续")
                     )
                     Image(
@@ -494,5 +505,5 @@ struct OnboardingView: View {
 }
 
 #Preview {
-    OnboardingView {}
+    OnboardingView { _ in }
 }

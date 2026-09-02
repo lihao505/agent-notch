@@ -8,13 +8,17 @@
 //
 
 import Combine
+import Darwin
 import Foundation
 import os.log
 
 /// Central state manager for all Claude sessions
 /// Uses Swift actor for thread-safe state mutations
 actor SessionStore {
-    static let shared = SessionStore()
+    static let shared = SessionStore(
+        persistenceEnabled: true,
+        fileSyncEnabled: true
+    )
 
     /// Logger for session store (nonisolated static for cross-context access)
     nonisolated static let logger = Logger(subsystem: "com.claudeisland", category: "Session")
@@ -31,7 +35,31 @@ actor SessionStore {
         let phase: String?
         let lastActivity: Date
         let createdAt: Date
+        let lastHookEventAt: Date?
+        let lastCodexTurnStartedAt: Date?
         let completedAt: Date?
+    }
+
+    /// Latest privacy-minimized lifecycle observation written by the bridge.
+    /// This is separate from `PersistedSession`: the bridge keeps updating it
+    /// while Agent Notch is not running, which closes the mid-turn launch gap.
+    private struct BridgeSessionSnapshot: Decodable {
+        let version: Int
+        let observedAt: TimeInterval
+        let sessionId: String
+        let cwd: String
+        let source: String
+        let event: String
+        let status: String
+        let pid: Int?
+        let tty: String?
+
+        enum CodingKeys: String, CodingKey {
+            case version
+            case observedAt = "observed_at"
+            case sessionId = "session_id"
+            case cwd, source, event, status, pid, tty
+        }
     }
 
     // MARK: - State
@@ -52,9 +80,28 @@ actor SessionStore {
     /// event. Normal hook delivery remains immediate.
     private let statusCheckIntervalSeconds: UInt64 = 1
 
+    /// Codex Desktop can occasionally miss the terminal hook/row (for example
+    /// after a crash). Native rollout progress normally updates far more often;
+    /// after this quiet period an old active boundary is no longer credible.
+    private let codexActiveStaleInterval: TimeInterval = 10 * 60
+
+    /// A live PID plus a recent observation prevents PID reuse from reviving an
+    /// unrelated process. This is intentionally longer than a typical tool run
+    /// so Agent Notch can still join long-running work already in progress.
+    private let bridgeSnapshotMaximumAge: TimeInterval = 24 * 60 * 60
+
+    private static let bridgeSnapshotMaximumBytes: UInt64 = 64 * 1024
+
     /// Restoration is deliberately deferred until monitoring starts, so the
     /// actor is fully initialized before any filesystem or process inspection.
     private var didRestorePersistedSessions = false
+
+    /// Rollout discovery closes the gap when Codex Desktop omits a
+    /// UserPromptSubmit hook. The watermark is captured before each scan and
+    /// overlapped slightly so a file write racing the enumeration is retried.
+    private var lastCodexDiscoverySweepAt: Date?
+    private let persistenceEnabled: Bool
+    private let fileSyncEnabled: Bool
 
     // MARK: - Published State (for UI)
 
@@ -68,7 +115,12 @@ actor SessionStore {
 
     // MARK: - Initialization
 
-    private init() {}
+    /// Dependency switches keep reducer tests isolated from the user's live
+    /// session files while production continues using the shared instance.
+    init(persistenceEnabled: Bool, fileSyncEnabled: Bool) {
+        self.persistenceEnabled = persistenceEnabled
+        self.fileSyncEnabled = fileSyncEnabled
+    }
 
     // MARK: - Event Processing
 
@@ -143,6 +195,8 @@ actor SessionStore {
 
     private func processHookEvent(_ event: HookEvent) async {
         let sessionId = event.sessionId
+        let receivedAt = Date()
+        let observedAt = event.lifecycleObservedDate(receivedAt: receivedAt)
         let eventSource = event.source == nil
             ? AgentSource.claude
             : AgentSource(hookValue: event.source)
@@ -159,27 +213,60 @@ actor SessionStore {
             return
         }
 
-        var session = sessions[sessionId] ?? createSession(from: event)
+        let isNewSession = !sessions.keys.contains(sessionId)
+        var session = sessions[sessionId] ?? createSession(
+            from: event,
+            observedAt: observedAt
+        )
+        let shouldApplyLifecycle = session.lastHookEventAt.map {
+            observedAt >= $0
+        } ?? true
 
-        session.pid = event.pid
-        if event.source != nil {
-            session.source = AgentSource(hookValue: event.source)
+        if shouldApplyLifecycle {
+            let normalizedTTY = event.tty?.replacingOccurrences(
+                of: "/dev/",
+                with: ""
+            )
+            let pidChanged = session.pid != event.pid
+            let ttyChanged = normalizedTTY.map { session.tty != $0 } ?? false
+            session.pid = event.pid
+            if event.source != nil {
+                session.source = AgentSource(hookValue: event.source)
+            }
+            // Process ancestry is topology, not lifecycle state. Resolve it
+            // only when the session first appears or its PID/TTY changes;
+            // periodic reconciliation remains the fallback for a missed race.
+            if let pid = event.pid,
+               isNewSession || pidChanged || ttyChanged {
+                let tree = ProcessTreeBuilder.shared.buildTree(
+                    forceRefresh: isNewSession || pidChanged
+                )
+                session.isInTmux = ProcessTreeBuilder.shared.isInTmux(
+                    pid: pid,
+                    tree: tree
+                )
+            }
+            if let normalizedTTY {
+                session.tty = normalizedTTY
+            }
+            session.lastHookEventAt = observedAt
+            session.lastActivity = max(session.lastActivity, observedAt)
+        } else {
+            Self.logger.info(
+                "Ignoring stale phase event \(event.event, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
+            )
         }
-        if let pid = event.pid {
-            let tree = ProcessTreeBuilder.shared.buildTree()
-            session.isInTmux = ProcessTreeBuilder.shared.isInTmux(pid: pid, tree: tree)
-        }
-        if let tty = event.tty {
-            session.tty = tty.replacingOccurrences(of: "/dev/", with: "")
-        }
-        session.lastActivity = Date()
 
         if event.status == "ended" {
+            guard shouldApplyLifecycle else {
+                sessions[sessionId] = session
+                return
+            }
             if event.event == "SessionExpired" {
                 sessions.removeValue(forKey: sessionId)
             } else {
                 session.phase = .ended
-                session.completedAt = session.completedAt ?? Date()
+                session.completedAt = session.completedAt ?? observedAt
                 session.pid = nil
                 sessions[sessionId] = session
             }
@@ -187,18 +274,20 @@ actor SessionStore {
             return
         }
 
-        // A retained completed conversation can be resumed with the same native
-        // session id. Revive it only for unambiguous new-turn signals; delayed
-        // tool/notification hooks must not resurrect a finished task.
-        let startsNewTurn = event.event == "SessionStart" ||
-            event.event == "UserPromptSubmit" ||
-            event.event == "PermissionRequest"
-        if session.phase == .ended && startsNewTurn {
+        let newPhase = event.determinePhase()
+
+        // Any fresh active signal can recover a resumed conversation when
+        // UserPromptSubmit was dropped. SessionStart alone is intentionally
+        // excluded because opening a dormant session is not a new turn.
+        let startsNewTurn = shouldApplyLifecycle && (
+            newPhase.isActive ||
+            newPhase.isWaitingForApproval
+        )
+        if startsNewTurn &&
+           (session.phase == .ended || session.completedAt != nil) {
             session.phase = .idle
             session.completedAt = nil
         }
-
-        let newPhase = event.determinePhase()
 
         let isDuplicateInteractiveObservation: Bool
         if case .waitingForApproval(let permission) = session.phase {
@@ -209,7 +298,11 @@ actor SessionStore {
             isDuplicateInteractiveObservation = false
         }
 
-        if isDuplicateInteractiveObservation {
+        let previousPhase = session.phase
+        if !shouldApplyLifecycle {
+            // Tool tracking below still consumes the event. Only its lifecycle
+            // mutation is stale.
+        } else if isDuplicateInteractiveObservation {
             Self.logger.debug(
                 "Keeping interactive approval state for duplicate PreToolUse observation"
             )
@@ -224,18 +317,28 @@ actor SessionStore {
             event.event == "StopFailure" ||
             (event.event == "Notification" &&
                 event.notificationType == "idle_prompt")
-        if isCompletionSignal {
+        if shouldApplyLifecycle && isCompletionSignal {
             // Completion must be visible even when a missed start/tool hook
             // left the session in idle. Relying only on canTransition used to
             // set completedAt while leaving phase == idle, so the compact
             // completion animation could never appear.
             session.phase = .waitingForInput
-            session.completedAt = Date()
-        } else if newPhase.isActive ||
-                    newPhase.isWaitingForApproval ||
-                    event.event == "UserPromptSubmit" ||
-                    event.event == "SessionStart" {
+            session.completedAt = observedAt
+        } else if shouldApplyLifecycle && (
+                    newPhase.isActive ||
+                    newPhase.isWaitingForApproval
+                  ) {
             session.completedAt = nil
+        }
+
+        if shouldApplyLifecycle && previousPhase != session.phase {
+            let latencyMs = max(
+                0,
+                Int(receivedAt.timeIntervalSince(observedAt) * 1_000)
+            )
+            Self.logger.info(
+                "Phase \(String(describing: previousPhase), privacy: .public) -> \(String(describing: session.phase), privacy: .public) via \(event.event, privacy: .public) (\(latencyMs)ms)"
+            )
         }
 
         if event.event == "PermissionRequest", let toolUseId = event.toolUseId {
@@ -246,18 +349,21 @@ actor SessionStore {
         processToolTracking(event: event, session: &session)
         processSubagentTracking(event: event, session: &session)
 
-        if event.event == "Stop" {
-            session.subagentState = SubagentState()
+        if shouldApplyLifecycle && isCompletionSignal {
+            finalizeDanglingTools(in: &session)
         }
 
         sessions[sessionId] = session
 
-        if event.shouldSyncFile {
+        if fileSyncEnabled && event.shouldSyncFile {
             scheduleFileSync(sessionId: sessionId, cwd: event.cwd)
         }
     }
 
-    private func createSession(from event: HookEvent) -> SessionState {
+    private func createSession(
+        from event: HookEvent,
+        observedAt: Date
+    ) -> SessionState {
         let source = event.source == nil ? .claude : AgentSource(hookValue: event.source)
         let codexTitle = source == .codex
             ? ConversationParser.codexThreadTitle(sessionId: event.sessionId)
@@ -278,7 +384,10 @@ actor SessionStore {
                 lastToolName: nil,
                 firstUserMessage: nil,
                 lastUserMessageDate: nil
-            )
+            ),
+            lastActivity: observedAt,
+            createdAt: observedAt,
+            lastHookEventAt: observedAt
         )
     }
 
@@ -651,13 +760,20 @@ actor SessionStore {
     // MARK: - File Update Processing
 
     private func processFileUpdate(_ payload: FileUpdatePayload) async {
-        guard var session = sessions[payload.sessionId] else { return }
-
-        // Update conversationInfo from JSONL (summary, lastMessage, etc.)
+        // Update summary/last-message metadata from the parser's current
+        // snapshot. For native transcripts this must not advance the shared
+        // message cursor: rows appended after the payload was created belong
+        // to the next incremental sync.
         let conversationInfo = await ConversationParser.shared.parse(
             sessionId: payload.sessionId,
-            cwd: session.cwd
+            cwd: payload.cwd
         )
+
+        // ConversationParser is another actor, so this actor may process a
+        // Stop/PermissionRequest/SessionExpired while the file is being read.
+        // Re-fetch after the await instead of mutating a snapshot that could
+        // now be stale or whose session may already have been removed.
+        guard var session = sessions[payload.sessionId] else { return }
         session.conversationInfo = conversationInfo
 
         // Handle /clear reconciliation - remove items that no longer exist in parser state
@@ -785,34 +901,76 @@ actor SessionStore {
             session: &session
         )
 
-        await populateSubagentToolsFromAgentFiles(
+        // Commit all synchronous transcript changes before the subagent parser
+        // yields this actor again.
+        sessions[payload.sessionId] = session
+
+        let subagentDecorations = await loadSubagentToolsFromAgentFiles(
             sessionId: payload.sessionId,
-            session: &session,
+            session: session,
             cwd: payload.cwd,
             structuredResults: payload.structuredResults
         )
 
-        sessions[payload.sessionId] = session
+        guard var latestSession = sessions[payload.sessionId] else {
+            // SessionExpired/SessionEnd arrived while subagent files were read.
+            // Never resurrect the removed session from the pre-await snapshot.
+            return
+        }
+
+        // Only merge the fields produced by the awaited subagent reads into the
+        // latest value. A concurrent Stop/PermissionRequest may have changed
+        // phase, completion, tool status, or even cleared chat items; none of
+        // those authoritative fields are copied back from the old snapshot.
+        for decoration in subagentDecorations {
+            guard let index = latestSession.chatItems.firstIndex(where: {
+                $0.id == decoration.taskToolId
+            }), case .toolCall(var tool) = latestSession.chatItems[index].type else {
+                continue
+            }
+            tool.subagentTools = decoration.tools
+            latestSession.chatItems[index] = ChatHistoryItem(
+                id: decoration.taskToolId,
+                type: .toolCall(tool),
+                timestamp: latestSession.chatItems[index].timestamp
+            )
+            if let description = decoration.description {
+                latestSession.subagentState.agentDescriptions[
+                    decoration.agentId
+                ] = description
+            }
+        }
+        sessions[payload.sessionId] = latestSession
         publishState()
 
         await emitToolCompletionEvents(
             sessionId: payload.sessionId,
-            session: session,
+            session: latestSession,
             completedToolIds: payload.completedToolIds,
             toolResults: payload.toolResults,
             structuredResults: payload.structuredResults
         )
     }
 
-    /// Populate subagent tools for Task/Agent tools using their agent JSONL files
-    private func populateSubagentToolsFromAgentFiles(
+    private struct SubagentFileDecoration {
+        let taskToolId: String
+        let agentId: String
+        let description: String?
+        let tools: [SubagentToolCall]
+    }
+
+    /// Read Task/Agent JSONL files without retaining an inout SessionState
+    /// across actor suspension. The caller merges these narrow decorations into
+    /// the latest session after the await.
+    private func loadSubagentToolsFromAgentFiles(
         sessionId: String,
-        session: inout SessionState,
+        session: SessionState,
         cwd: String,
         structuredResults: [String: ToolResultData]
-    ) async {
+    ) async -> [SubagentFileDecoration] {
+        var decorations: [SubagentFileDecoration] = []
         for i in 0..<session.chatItems.count {
-            guard case .toolCall(var tool) = session.chatItems[i].type,
+            guard case .toolCall(let tool) = session.chatItems[i].type,
                   tool.isSubagentContainer,
                   let structuredResult = structuredResults[session.chatItems[i].id],
                   case .task(let taskResult) = structuredResult,
@@ -820,12 +978,9 @@ actor SessionStore {
 
             let taskToolId = session.chatItems[i].id
 
-            // Store agentId → description mapping for AgentOutputTool display
-            if let description = session.subagentState.activeTasks[taskToolId]?.description {
-                session.subagentState.agentDescriptions[taskResult.agentId] = description
-            } else if let description = tool.input["description"] {
-                session.subagentState.agentDescriptions[taskResult.agentId] = description
-            }
+            let description = session.subagentState.activeTasks[
+                taskToolId
+            ]?.description ?? tool.input["description"]
 
             let subagentToolInfos = await ConversationParser.shared.parseSubagentTools(
                 sessionId: sessionId,
@@ -835,7 +990,7 @@ actor SessionStore {
 
             guard !subagentToolInfos.isEmpty else { continue }
 
-            tool.subagentTools = subagentToolInfos.map { info in
+            let tools = subagentToolInfos.map { info in
                 SubagentToolCall(
                     id: info.id,
                     name: info.name,
@@ -844,15 +999,18 @@ actor SessionStore {
                     timestamp: parseTimestamp(info.timestamp) ?? Date()
                 )
             }
+            decorations.append(SubagentFileDecoration(
+                taskToolId: taskToolId,
+                agentId: taskResult.agentId,
+                description: description,
+                tools: tools
+            ))
 
-            session.chatItems[i] = ChatHistoryItem(
-                id: taskToolId,
-                type: .toolCall(tool),
-                timestamp: session.chatItems[i].timestamp
+            Self.logger.debug(
+                "Loaded \(tools.count) subagent tools for Task \(taskToolId.prefix(12), privacy: .public) from agent \(taskResult.agentId.prefix(8), privacy: .public)"
             )
-
-            Self.logger.debug("Populated \(subagentToolInfos.count) subagent tools for Task \(taskToolId.prefix(12), privacy: .public) from agent \(taskResult.agentId.prefix(8), privacy: .public)")
         }
+        return decorations
     }
 
     /// Emit toolCompleted events for tools that have results in JSONL but aren't marked complete yet
@@ -984,6 +1142,27 @@ actor SessionStore {
         }
     }
 
+    /// A terminal turn signal is authoritative even if a PostToolUse row or
+    /// hook was dropped. Leaving those placeholders running made every later
+    /// idle turn look permanently active.
+    private func finalizeDanglingTools(in session: inout SessionState) {
+        for index in session.chatItems.indices {
+            guard case .toolCall(var tool) = session.chatItems[index].type,
+                  tool.status == .running ||
+                    tool.status == .waitingForApproval else {
+                continue
+            }
+            tool.status = .interrupted
+            session.chatItems[index] = ChatHistoryItem(
+                id: session.chatItems[index].id,
+                type: .toolCall(tool),
+                timestamp: session.chatItems[index].timestamp
+            )
+        }
+        session.toolTracker.inProgress.removeAll()
+        session.subagentState = SubagentState()
+    }
+
     // MARK: - Interrupt Processing
 
     private func processInterrupt(sessionId: String) async {
@@ -1048,7 +1227,9 @@ actor SessionStore {
         let toolResults = await ConversationParser.shared.toolResults(for: sessionId)
         let structuredResults = await ConversationParser.shared.structuredResults(for: sessionId)
 
-        // Also parse conversationInfo (summary, lastMessage, etc.)
+        // Read metadata from the state populated above. Native metadata reads
+        // deliberately do not advance the message cursor, so rows appended
+        // between these calls remain available to the next incremental sync.
         let conversationInfo = await ConversationParser.shared.parse(
             sessionId: sessionId,
             cwd: cwd
@@ -1103,6 +1284,22 @@ actor SessionStore {
         // Sort by timestamp
         session.chatItems.sort { $0.timestamp < $1.timestamp }
 
+        // A restored Claude process can outlive a turn whose Stop hook was
+        // missed. Its existing final assistant row is still an authoritative
+        // completion boundary when history is first loaded.
+        reconcilePhaseFromTranscript(
+            payload: FileUpdatePayload(
+                sessionId: sessionId,
+                cwd: session.cwd,
+                messages: messages,
+                isIncremental: false,
+                completedToolIds: completedTools,
+                toolResults: toolResults,
+                structuredResults: structuredResults
+            ),
+            session: &session
+        )
+
         sessions[sessionId] = session
     }
 
@@ -1111,10 +1308,9 @@ actor SessionStore {
     private func scheduleFileSync(sessionId: String, cwd: String) {
         // Cancel existing sync
         cancelPendingSync(sessionId: sessionId)
-        let refreshMetadataOnly = sessions[sessionId]?.source == .codex
 
         // Schedule new debounced sync
-        pendingSyncs[sessionId] = Task { [weak self, syncDebounceNs, refreshMetadataOnly] in
+        pendingSyncs[sessionId] = Task { [weak self, syncDebounceNs] in
             try? await Task.sleep(nanoseconds: syncDebounceNs)
             guard !Task.isCancelled else { return }
 
@@ -1128,10 +1324,12 @@ actor SessionStore {
                 await self?.process(.clearDetected(sessionId: sessionId))
             }
 
-            // Codex can append only a turn_context/thread_settings row when
-            // the desktop permission mode changes. There is no chat message
-            // in that update, but conversationInfo still has to be refreshed.
-            guard !result.newMessages.isEmpty || result.clearDetected || refreshMetadataOnly else {
+            // Metadata-only and tool-result rows still need reconciliation,
+            // but an unchanged Codex rollout must not trigger another title,
+            // policy-tail, or full transcript read every second.
+            guard !result.newMessages.isEmpty ||
+                    result.clearDetected ||
+                    result.fileAdvanced else {
                 return
             }
 
@@ -1168,6 +1366,29 @@ actor SessionStore {
         guard session.source != .codex else { return }
         guard !session.phase.isWaitingForApproval else { return }
 
+        let lastMessage = payload.messages.max(by: {
+            $0.timestamp < $1.timestamp
+        })
+        let lastAssistantStartsTool = lastMessage?.content.contains { block in
+            if case .toolUse = block { return true }
+            return false
+        } ?? false
+
+        // A text-only final assistant turn is a terminal boundary. Close any
+        // stale tool placeholders before looking at the historical tool list;
+        // otherwise a missed result from an old turn wins forever.
+        if let lastMessage,
+           lastMessage.role == .assistant,
+           !lastAssistantStartsTool,
+           !lastMessage.textContent.trimmingCharacters(
+                in: .whitespacesAndNewlines
+           ).isEmpty {
+            finalizeDanglingTools(in: &session)
+            session.phase = .waitingForInput
+            session.completedAt = session.completedAt ?? Date()
+            return
+        }
+
         let hasRunningTool = session.chatItems.contains { item in
             guard case .toolCall(let tool) = item.type else {
                 return false
@@ -1182,21 +1403,13 @@ actor SessionStore {
             return
         }
 
-        guard let lastMessage = payload.messages.max(by: {
-            $0.timestamp < $1.timestamp
-        }) else {
+        guard let lastMessage else {
             return
         }
 
         if lastMessage.role == .user {
             session.phase = .processing
             session.completedAt = nil
-        } else if lastMessage.role == .assistant,
-                  !lastMessage.textContent.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                  ).isEmpty {
-            session.phase = .waitingForInput
-            session.completedAt = Date()
         }
     }
 
@@ -1207,6 +1420,7 @@ actor SessionStore {
         if !didRestorePersistedSessions {
             didRestorePersistedSessions = true
             await restorePersistedSessions()
+            await restoreBridgeSessionSnapshots()
         }
 
         guard statusCheckTask == nil else { return }
@@ -1233,6 +1447,22 @@ actor SessionStore {
     private func recheckAllSessions() async {
         var stateChanged = false
         let now = Date()
+
+        let discoveryStartedAt = Date()
+        let discoveryThreshold = lastCodexDiscoverySweepAt ??
+            now.addingTimeInterval(-codexActiveStaleInterval)
+        let discoveredCodexTasks = await ConversationParser.shared
+            .discoverCodexTasks(modifiedAfter: discoveryThreshold)
+        lastCodexDiscoverySweepAt = discoveryStartedAt.addingTimeInterval(-2)
+        for observation in discoveredCodexTasks {
+            if reconcileCodexLifecycle(
+                observation,
+                now: now,
+                allowCreation: true
+            ) {
+                stateChanged = true
+            }
+        }
 
         for sessionId in Array(sessions.keys) {
             guard var session = sessions[sessionId] else {
@@ -1263,41 +1493,27 @@ actor SessionStore {
                 session = latestSession
 
                 if session.lastActivity <= observedLastActivity {
-                    switch lifecycle {
-                    case .active:
-                        if !session.phase.isWaitingForApproval &&
-                           (session.completedAt != nil ||
-                            !session.phase.isActive) {
-                            session.phase = .processing
-                            session.completedAt = nil
-                            sessions[sessionId] = session
-                            stateChanged = true
-                        }
-                    case .completed(let completedAt):
-                        // A live PermissionRequest is newer and more
-                        // authoritative than a completed marker left by the
-                        // previous turn. Never let periodic rollout polling
-                        // dismiss an actionable approval card.
-                        if !session.phase.isWaitingForApproval &&
-                           (session.completedAt == nil ||
-                            session.phase != .waitingForInput) {
-                            session.phase = .waitingForInput
-                            session.completedAt = completedAt ?? now
-                            sessions[sessionId] = session
-                            stateChanged = true
-                        }
-                    case .missing:
-                        if now.timeIntervalSince(session.lastActivity) >=
-                            SessionRetentionPolicy.missingCodexGracePeriod {
-                            sessions.removeValue(forKey: sessionId)
-                            cancelPendingSync(sessionId: sessionId)
-                            stateChanged = true
-                            continue
-                        }
-                    case .unknown:
-                        break
+                    let observation = CodexTaskObservation(
+                        sessionId: sessionId,
+                        cwd: session.cwd,
+                        lifecycle: lifecycle,
+                        fileModifiedAt: now
+                    )
+                    if reconcileCodexLifecycle(
+                        observation,
+                        now: now,
+                        allowCreation: false
+                    ) {
+                        stateChanged = true
+                    }
+                    if !sessions.keys.contains(sessionId) {
+                        continue
                     }
                 }
+                guard let reconciledSession = sessions[sessionId] else {
+                    continue
+                }
+                session = reconciledSession
             }
 
             if session.phase == .ended {
@@ -1343,6 +1559,167 @@ actor SessionStore {
         }
     }
 
+    /// Merge Codex's native turn boundary without letting generic activity
+    /// evidence cross a completion boundary. This is the central arbitration
+    /// rule shared by discovery and the one-second fallback poll.
+    @discardableResult
+    private func reconcileCodexLifecycle(
+        _ observation: CodexTaskObservation,
+        now: Date,
+        allowCreation: Bool
+    ) -> Bool {
+        let sessionId = observation.sessionId
+
+        switch observation.lifecycle {
+        case .active(let turnStartedAt, let lastEvidenceAt):
+            let evidenceAt = lastEvidenceAt ??
+                turnStartedAt ??
+                observation.fileModifiedAt
+
+            guard var session = sessions[sessionId] else {
+                guard allowCreation,
+                      now.timeIntervalSince(evidenceAt) <
+                        codexActiveStaleInterval else {
+                    return false
+                }
+                let projectName = URL(
+                    fileURLWithPath: observation.cwd
+                ).lastPathComponent
+                let title = ConversationParser.codexThreadTitle(
+                    sessionId: sessionId
+                )
+                sessions[sessionId] = SessionState(
+                    sessionId: sessionId,
+                    cwd: observation.cwd,
+                    projectName: projectName,
+                    source: .codex,
+                    phase: .processing,
+                    conversationInfo: ConversationInfo(
+                        summary: title,
+                        lastMessage: nil,
+                        lastMessageRole: nil,
+                        lastToolName: nil,
+                        firstUserMessage: nil,
+                        lastUserMessageDate: nil
+                    ),
+                    lastActivity: evidenceAt,
+                    createdAt: turnStartedAt ?? evidenceAt,
+                    lastCodexTurnStartedAt: turnStartedAt
+                )
+                scheduleFileSync(
+                    sessionId: sessionId,
+                    cwd: observation.cwd
+                )
+                Self.logger.info(
+                    "Discovered active Codex turn \(sessionId.prefix(8), privacy: .public) from native rollout"
+                )
+                return true
+            }
+
+            let newestEvidenceAt = max(
+                evidenceAt,
+                session.lastHookEventAt ?? .distantPast
+            )
+            let isStale = now.timeIntervalSince(newestEvidenceAt) >=
+                codexActiveStaleInterval
+            if !session.phase.isWaitingForApproval && isStale {
+                guard session.completedAt == nil ||
+                        session.phase != .waitingForInput else {
+                    return false
+                }
+                session.phase = .waitingForInput
+                session.completedAt = now
+                finalizeDanglingTools(in: &session)
+                sessions[sessionId] = session
+                return true
+            }
+
+            if let completedAt = session.completedAt {
+                // Token counts and commentary from the completed turn can be
+                // newer than Stop. Only a genuinely newer task_started (or a
+                // safe fallback boundary) may revive the card.
+                guard let turnStartedAt,
+                      turnStartedAt > completedAt else {
+                    return false
+                }
+            }
+
+            let previousPhase = session.phase
+            let previousCompletion = session.completedAt
+            let previousActivity = session.lastActivity
+            session.source = .codex
+            session.lastCodexTurnStartedAt = turnStartedAt ??
+                session.lastCodexTurnStartedAt
+            session.lastActivity = max(session.lastActivity, evidenceAt)
+            if !session.phase.isWaitingForApproval &&
+               !session.phase.isActive {
+                session.phase = .processing
+            }
+            if !session.phase.isWaitingForApproval {
+                session.completedAt = nil
+            }
+            sessions[sessionId] = session
+            return previousPhase != session.phase ||
+                previousCompletion != session.completedAt ||
+                previousActivity != session.lastActivity
+
+        case .completed(let completedAt):
+            guard var session = sessions[sessionId],
+                  !session.phase.isWaitingForApproval else {
+                return false
+            }
+            let completionEvidenceAt = completedAt ??
+                observation.fileModifiedAt
+            if session.completedAt == nil,
+               let lastHookEventAt = session.lastHookEventAt,
+               lastHookEventAt > completionEvidenceAt {
+                return false
+            }
+            if let turnStartedAt = session.lastCodexTurnStartedAt,
+               turnStartedAt > completionEvidenceAt {
+                return false
+            }
+            guard session.completedAt == nil ||
+                    session.phase != .waitingForInput else {
+                return false
+            }
+            session.phase = .waitingForInput
+            session.completedAt = completionEvidenceAt
+            session.lastActivity = max(
+                session.lastActivity,
+                completionEvidenceAt
+            )
+            finalizeDanglingTools(in: &session)
+            sessions[sessionId] = session
+            return true
+
+        case .missing:
+            guard sessions[sessionId] != nil,
+                  let session = sessions[sessionId],
+                  now.timeIntervalSince(session.lastActivity) >=
+                    SessionRetentionPolicy.missingCodexGracePeriod else {
+                return false
+            }
+            sessions.removeValue(forKey: sessionId)
+            cancelPendingSync(sessionId: sessionId)
+            return true
+
+        case .unknown:
+            guard var session = sessions[sessionId],
+                  !session.phase.isWaitingForApproval,
+                  session.phase.isActive,
+                  now.timeIntervalSince(session.lastActivity) >=
+                    codexActiveStaleInterval else {
+                return false
+            }
+            session.phase = .waitingForInput
+            session.completedAt = now
+            finalizeDanglingTools(in: &session)
+            sessions[sessionId] = session
+            return true
+        }
+    }
+
     /// Check if a process is still running
     private nonisolated func isProcessRunning(pid: Int) -> Bool {
         return kill(Int32(pid), 0) == 0
@@ -1354,7 +1731,9 @@ actor SessionStore {
         pruneCompletedSessions()
         let sortedSessions = Array(sessions.values).sorted { $0.projectName < $1.projectName }
         sessionsSubject.send(sortedSessions)
-        persistActiveSessions()
+        if persistenceEnabled {
+            persistActiveSessions()
+        }
     }
 
     private func pruneCompletedSessions(now: Date = Date()) {
@@ -1390,9 +1769,16 @@ actor SessionStore {
             .appendingPathComponent("active-sessions.json", isDirectory: false)
     }
 
-    /// Persist sessions with a live backing process plus recent completions.
-    /// The monitor still exposes at most one completed row in the notch; the
-    /// backing records keep an already-open chat stable across app restarts.
+    private static var bridgeSnapshotDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".multiagent-notch", isDirectory: true)
+            .appendingPathComponent("session-state", isDirectory: true)
+    }
+
+    /// Persist sessions with a live backing process, recent native Codex
+    /// activity, or a recent completion. Codex Desktop tasks discovered from
+    /// rollouts intentionally have no per-task PID; dropping them here makes
+    /// a correctly discovered mid-turn card disappear again on restart.
     private func persistActiveSessions() {
         let now = Date()
         let active = sessions.values.compactMap { session -> PersistedSession? in
@@ -1406,7 +1792,15 @@ actor SessionStore {
             let livePid = session.pid.flatMap {
                 isProcessRunning(pid: $0) ? $0 : nil
             }
-            guard isRecentCompletion || livePid != nil else { return nil }
+            let hasRecentNativeCodexActivity = session.source == .codex &&
+                session.phase.isActive &&
+                now.timeIntervalSince(session.lastActivity) <
+                    codexActiveStaleInterval
+            guard isRecentCompletion ||
+                    livePid != nil ||
+                    hasRecentNativeCodexActivity else {
+                return nil
+            }
 
             return PersistedSession(
                 sessionId: session.sessionId,
@@ -1418,6 +1812,8 @@ actor SessionStore {
                 phase: session.phase.description,
                 lastActivity: session.lastActivity,
                 createdAt: session.createdAt,
+                lastHookEventAt: session.lastHookEventAt,
+                lastCodexTurnStartedAt: session.lastCodexTurnStartedAt,
                 completedAt: session.completedAt
             )
         }
@@ -1428,10 +1824,18 @@ actor SessionStore {
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: url.deletingLastPathComponent().path
+            )
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(active).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
         } catch {
             Self.logger.error(
                 "Failed to persist active sessions: \(error.localizedDescription, privacy: .public)"
@@ -1458,9 +1862,25 @@ actor SessionStore {
 
         let processTree = ProcessTreeBuilder.shared.buildTree()
         var restoredCount = 0
-        var restoredSessions: [(sessionId: String, cwd: String)] = []
+        var restoredActiveSessions: [(sessionId: String, cwd: String)] = []
 
         let now = Date()
+        let retainedCompletionIds = Set(
+            persisted
+                .filter { item in
+                    guard let completedAt = item.completedAt else {
+                        return false
+                    }
+                    return now.timeIntervalSince(completedAt) <
+                        SessionRetentionPolicy.completedLifetime
+                }
+                .sorted {
+                    ($0.completedAt ?? .distantPast) >
+                        ($1.completedAt ?? .distantPast)
+                }
+                .prefix(SessionRetentionPolicy.maximumVisibleCompleted)
+                .map(\.sessionId)
+        )
         for item in persisted where !sessions.keys.contains(item.sessionId) {
             let source = AgentSource(rawValue: item.source) ?? .unknown
             if SessionRetentionPolicy.isIgnoredProbe(
@@ -1481,7 +1901,9 @@ actor SessionStore {
             } else {
                 isRecentCompletion = false
             }
-            guard livePid != nil || isRecentCompletion else {
+            guard livePid != nil ||
+                    (isRecentCompletion &&
+                        retainedCompletionIds.contains(item.sessionId)) else {
                 continue
             }
 
@@ -1506,7 +1928,16 @@ actor SessionStore {
                 lifecycleCompletion = item.completedAt
             }
             let restoredPhase: SessionPhase
-            if case .active = codexLifecycle {
+            let lifecycleStartsNewerTurn: Bool
+            if case .active(let turnStartedAt, _) = codexLifecycle,
+               let turnStartedAt {
+                lifecycleStartsNewerTurn = item.completedAt.map {
+                    turnStartedAt > $0
+                } ?? true
+            } else {
+                lifecycleStartsNewerTurn = false
+            }
+            if lifecycleStartsNewerTurn {
                 restoredPhase = .processing
             } else if lifecycleCompletion != nil {
                 restoredPhase = item.phase == "ended"
@@ -1543,25 +1974,208 @@ actor SessionStore {
                 ),
                 lastActivity: item.lastActivity,
                 createdAt: item.createdAt,
-                completedAt: lifecycleCompletion
+                lastHookEventAt: item.lastHookEventAt,
+                lastCodexTurnStartedAt: item.lastCodexTurnStartedAt,
+                completedAt: lifecycleStartsNewerTurn
+                    ? nil
+                    : lifecycleCompletion
             )
 
+            // The socket starts concurrently with restoration. A fresh hook is
+            // authoritative and must not be overwritten by an older disk row
+            // after the parser await above yields this actor.
+            if let current = sessions[item.sessionId],
+               current.lastActivity >= item.lastActivity {
+                continue
+            }
             sessions[item.sessionId] = session
-            restoredSessions.append((item.sessionId, item.cwd))
+            if lifecycleCompletion == nil {
+                restoredActiveSessions.append((item.sessionId, item.cwd))
+            }
             restoredCount += 1
         }
 
         publishState()
-        // A restored idle session may have no new JSONL rows, so an incremental
-        // sync would leave its title at the cwd fallback (for example "project").
-        // Load the existing transcript once to restore the real task title and
-        // chat before periodic incremental monitoring resumes.
-        for item in restoredSessions {
+        // Only active sessions need eager chat restoration. Recent completed
+        // cards keep lightweight metadata and load their potentially enormous
+        // transcript lazily if the user explicitly opens the conversation.
+        for item in restoredActiveSessions {
             await loadHistoryFromFile(sessionId: item.sessionId, cwd: item.cwd)
         }
         if restoredCount > 0 {
             Self.logger.info("Restored \(restoredCount) active sessions")
         }
+    }
+
+    /// Import active bridge observations that were written while the app was
+    /// offline. Completed/idle observations are deliberately ignored: the
+    /// normal app snapshot already owns completion retention, and an approval
+    /// socket cannot be reconstructed after restart.
+    private func restoreBridgeSessionSnapshots() async {
+        let directory = Self.bridgeSnapshotDirectory
+        guard Self.isOwnedDirectory(directory) else { return }
+
+        let resourceKeys: Set<URLResourceKey> = [
+            .fileSizeKey,
+            .contentModificationDateKey,
+        ]
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        let activeStatuses: Set<String> = [
+            "starting",
+            "processing",
+            "running_tool",
+            "compacting",
+            "waiting_for_approval",
+        ]
+        let now = Date()
+        let processTree = ProcessTreeBuilder.shared.buildTree()
+        var restored: [(sessionId: String, cwd: String)] = []
+
+        for file in files where file.pathExtension == "json" {
+            guard Self.isOwnedRegularFile(file),
+                  let values = try? file.resourceValues(forKeys: resourceKeys),
+                  let byteCount = values.fileSize,
+                  byteCount > 0,
+                  UInt64(byteCount) <= Self.bridgeSnapshotMaximumBytes,
+                  let data = try? Data(contentsOf: file),
+                  let snapshot = try? JSONDecoder().decode(
+                    BridgeSessionSnapshot.self,
+                    from: data
+                  ),
+                  snapshot.version == 1,
+                  !snapshot.sessionId.isEmpty,
+                  !snapshot.cwd.isEmpty,
+                  activeStatuses.contains(snapshot.status),
+                  let pid = snapshot.pid,
+                  pid > 1,
+                  isProcessRunning(pid: pid) else {
+                continue
+            }
+
+            let observedAt = Date(timeIntervalSince1970: snapshot.observedAt)
+            let age = now.timeIntervalSince(observedAt)
+            guard age >= -5 * 60,
+                  age <= bridgeSnapshotMaximumAge else {
+                continue
+            }
+
+            let source = AgentSource(hookValue: snapshot.source)
+            let projectName = URL(
+                fileURLWithPath: snapshot.cwd
+            ).lastPathComponent
+            guard !SessionRetentionPolicy.isIgnoredProbe(
+                source: source,
+                cwd: snapshot.cwd,
+                projectName: projectName
+            ) else {
+                continue
+            }
+
+            // Codex has an explicit native turn boundary. It wins over a stale
+            // active hook snapshot left by a dropped Stop event.
+            if source == .codex {
+                let lifecycle = await ConversationParser.shared
+                    .codexTaskLifecycle(sessionId: snapshot.sessionId)
+                if case .completed = lifecycle {
+                    continue
+                }
+            }
+
+            // A hook may arrive while the lifecycle parser above is awaiting.
+            // Keep the newer in-memory observation in that race.
+            if let current = sessions[snapshot.sessionId],
+               current.lastActivity >= observedAt {
+                continue
+            }
+
+            let restoredPhase: SessionPhase = snapshot.status == "compacting"
+                ? .compacting
+                : .processing
+            if var existing = sessions[snapshot.sessionId] {
+                existing.source = source
+                existing.pid = pid
+                existing.tty = snapshot.tty?.replacingOccurrences(
+                    of: "/dev/",
+                    with: ""
+                )
+                existing.isInTmux = ProcessTreeBuilder.shared.isInTmux(
+                    pid: pid,
+                    tree: processTree
+                )
+                existing.phase = restoredPhase
+                existing.lastActivity = observedAt
+                existing.lastHookEventAt = observedAt
+                existing.completedAt = nil
+                sessions[snapshot.sessionId] = existing
+            } else {
+                let codexTitle = source == .codex
+                    ? ConversationParser.codexThreadTitle(
+                        sessionId: snapshot.sessionId
+                    )
+                    : nil
+                sessions[snapshot.sessionId] = SessionState(
+                    sessionId: snapshot.sessionId,
+                    cwd: snapshot.cwd,
+                    projectName: projectName,
+                    source: source,
+                    pid: pid,
+                    tty: snapshot.tty?.replacingOccurrences(
+                        of: "/dev/",
+                        with: ""
+                    ),
+                    isInTmux: ProcessTreeBuilder.shared.isInTmux(
+                        pid: pid,
+                        tree: processTree
+                    ),
+                    phase: restoredPhase,
+                    conversationInfo: ConversationInfo(
+                        summary: codexTitle,
+                        lastMessage: nil,
+                        lastMessageRole: nil,
+                        lastToolName: nil,
+                        firstUserMessage: nil,
+                        lastUserMessageDate: nil
+                    ),
+                    lastActivity: observedAt,
+                    createdAt: observedAt,
+                    lastHookEventAt: observedAt
+                )
+            }
+            restored.append((snapshot.sessionId, snapshot.cwd))
+        }
+
+        guard !restored.isEmpty else { return }
+        publishState()
+        for item in restored {
+            await loadHistoryFromFile(
+                sessionId: item.sessionId,
+                cwd: item.cwd
+            )
+        }
+        Self.logger.info(
+            "Restored \(restored.count) sessions from offline bridge snapshots"
+        )
+    }
+
+    private nonisolated static func isOwnedDirectory(_ url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return (metadata.st_mode & S_IFMT) == S_IFDIR &&
+            metadata.st_uid == getuid()
+    }
+
+    private nonisolated static func isOwnedRegularFile(_ url: URL) -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return (metadata.st_mode & S_IFMT) == S_IFREG &&
+            metadata.st_uid == getuid()
     }
 
     // MARK: - Queries

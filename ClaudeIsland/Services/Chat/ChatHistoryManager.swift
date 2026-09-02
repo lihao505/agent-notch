@@ -71,6 +71,33 @@ class ChatHistoryManager: ObservableObject {
         await SessionStore.shared.process(.fileUpdated(payload))
     }
 
+    /// Native transcript rows eventually replace optimistic CLI rows. Keep an
+    /// optimistic row only until the same role/text arrives within the turn's
+    /// reconciliation window; this policy belongs beside transcript sync, not
+    /// in the SwiftUI view that happens to render the result.
+    func reconcile(
+        nativeHistory: [ChatHistoryItem],
+        optimisticHistory: [ChatHistoryItem]
+    ) -> [ChatHistoryItem] {
+        var merged = nativeHistory
+        let nativeMessages = nativeHistory.compactMap(messageTextAndRole)
+
+        for item in optimisticHistory where item.id.hasPrefix("cli-") {
+            guard let candidate = messageTextAndRole(item) else { continue }
+            let hasNativeEquivalent = nativeMessages.contains { native in
+                native.role == candidate.role
+                    && native.text == candidate.text
+                    && abs(native.timestamp.timeIntervalSince(
+                        candidate.timestamp
+                    )) < 300
+            }
+            if !hasNativeEquivalent {
+                merged.append(item)
+            }
+        }
+        return merged.sorted { $0.timestamp < $1.timestamp }
+    }
+
     func clearHistory(for sessionId: String) {
         jsonlParsedSessions.remove(sessionId)
         histories.removeValue(forKey: sessionId)
@@ -119,6 +146,26 @@ class ChatHistoryManager: ObservableObject {
         }
 
         return items.filter { !subagentToolIds.contains($0.id) }
+    }
+
+    private func messageTextAndRole(
+        _ item: ChatHistoryItem
+    ) -> (role: String, text: String, timestamp: Date)? {
+        let role: String
+        let rawText: String
+        switch item.type {
+        case .user(let text):
+            role = "user"
+            rawText = text
+        case .assistant(let text):
+            role = "assistant"
+            rawText = text
+        default:
+            return nil
+        }
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return (role, text, item.timestamp)
     }
 }
 

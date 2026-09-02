@@ -150,7 +150,10 @@ struct ClaudeDirPickerRow: View {
         currentValue = path
         AppSettings.claudeDirectoryName = path
         ClaudePaths.invalidateCache()
-        HookInstaller.installIfNeeded()
+        guard HookInstaller.integrationsOptedIn else { return }
+        Task.detached(priority: .userInitiated) {
+            HookInstaller.installIfNeeded()
+        }
     }
 }
 

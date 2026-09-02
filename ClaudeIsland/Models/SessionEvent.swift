@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  SessionEvent.swift
 //  ClaudeIsland
 //
@@ -127,6 +128,24 @@ struct ToolCompletionResult: Sendable {
 // MARK: - Hook Event Extensions
 
 extension HookEvent {
+    /// Bridge processes stamp events before doing any I/O. Use that time to
+    /// order phase transitions, but reject implausible values so a malformed
+    /// local payload cannot suppress every later state change.
+    nonisolated func lifecycleObservedDate(
+        receivedAt: Date = Date()
+    ) -> Date {
+        guard let observedAt,
+              observedAt.isFinite else {
+            return receivedAt
+        }
+        let candidate = Date(timeIntervalSince1970: observedAt)
+        guard candidate <= receivedAt.addingTimeInterval(5 * 60),
+              candidate >= receivedAt.addingTimeInterval(-24 * 60 * 60) else {
+            return receivedAt
+        }
+        return candidate
+    }
+
     /// Determine the target session phase based on this hook event
     nonisolated func determinePhase() -> SessionPhase {
         // PreCompact takes priority

@@ -27,30 +27,87 @@ Design notes
   schema); other agents can override via DECISION_FORMATTERS below.
 """
 import json
+import math
 import os
 import re
 import socket
-import subprocess
+import stat
 import sys
 import time
 import uuid
 
-DEFAULT_SOCKET = "/tmp/claude-island.sock"
+
+def default_socket_path():
+    """Return Agent Notch's per-user socket without touching upstream paths."""
+    override = os.environ.get("AGENT_NOTCH_SOCKET", "").strip()
+    if override:
+        return override
+    return f"/tmp/agent-notch-{os.getuid()}.sock"
+
+
+DEFAULT_SOCKET = default_socket_path()
+
+
+def bounded_env_seconds(name, default, minimum=0.1, maximum=90.0):
+    """Read a finite timeout without letting hook configuration break turns."""
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return min(maximum, max(minimum, value))
+
+
+def bounded_env_int(name, default, minimum=0, maximum=30 * 24 * 60 * 60):
+    """Read a bounded integer setting, falling back on malformed input."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+    return min(maximum, max(minimum, value))
+
+
 # Seconds the bridge waits for a notch decision on PermissionRequest.
 # MUST stay strictly below the agent's outer hook timeout (see install.sh: 105)
 # so we win the race and exit 0 gracefully instead of being killed mid-flight.
-PERMISSION_TIMEOUT = int(os.environ.get("NOTCH_PERMISSION_TIMEOUT", "90"))
+PERMISSION_TIMEOUT = bounded_env_seconds(
+    "NOTCH_PERMISSION_TIMEOUT", 90, minimum=0.1, maximum=90
+)
 # Fire-and-forget connect/send budget for non-permission events.
-SEND_TIMEOUT = int(os.environ.get("NOTCH_SEND_TIMEOUT", "5"))
+SEND_TIMEOUT = bounded_env_seconds(
+    "NOTCH_SEND_TIMEOUT", 5, minimum=0.1, maximum=5
+)
 # A completed turn may remain available for up to five hours. The app shows at
 # most one completed row and hides it early when active work gets crowded. Any
 # new activity cancels the pending removal.
-COMPLETED_TTL = int(os.environ.get("NOTCH_COMPLETED_TTL", "18000"))
+COMPLETED_TTL = bounded_env_int("NOTCH_COMPLETED_TTL", 18000)
 SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 APPROVAL_POLICY_FILE = os.path.join(
     os.path.expanduser("~"), ".multiagent-notch", "approval-policy.json"
 )
 APPROVAL_MODES = {"ask", "auto", "trusted"}
+
+
+def claude_config_dir():
+    """Resolve the Claude root selected in Agent Notch's installer.
+
+    Codex/CodeBuddy hook processes do not reliably inherit
+    CLAUDE_CONFIG_DIR, so the installer also stores this non-secret path in
+    Agent Notch's private state directory.
+    """
+    environment = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if environment:
+        return os.path.abspath(os.path.expanduser(environment))
+    config = os.path.expanduser("~/.multiagent-notch/config.json")
+    try:
+        with open(config) as source:
+            value = json.load(source).get("claude_config_dir", "")
+        if isinstance(value, str) and value.strip():
+            return os.path.abspath(os.path.expanduser(value.strip()))
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        pass
+    return os.path.expanduser("~/.claude")
 
 
 # --------------------------------------------------------------------------- #
@@ -62,10 +119,6 @@ def parse_args(argv):
         "socket": DEFAULT_SOCKET,
         "event": None,
         "lifecycle_only": False,
-        "cleanup_token": None,
-        "cleanup_session": None,
-        "cleanup_cwd": "",
-        "cleanup_delay": COMPLETED_TTL,
     }
     i = 0
     while i < len(argv):
@@ -78,18 +131,6 @@ def parse_args(argv):
             opts["event"] = argv[i + 1]; i += 2
         elif a == "--lifecycle-only":
             opts["lifecycle_only"] = True; i += 1
-        elif a == "--cleanup-token" and i + 1 < len(argv):
-            opts["cleanup_token"] = argv[i + 1]; i += 2
-        elif a == "--cleanup-session" and i + 1 < len(argv):
-            opts["cleanup_session"] = argv[i + 1]; i += 2
-        elif a == "--cleanup-cwd" and i + 1 < len(argv):
-            opts["cleanup_cwd"] = argv[i + 1]; i += 2
-        elif a == "--cleanup-delay" and i + 1 < len(argv):
-            try:
-                opts["cleanup_delay"] = max(0, int(argv[i + 1]))
-            except ValueError:
-                pass
-            i += 2
         else:
             i += 1
     return opts
@@ -160,7 +201,7 @@ def _synthetic_paths(cwd, session_id):
     if not SAFE_SESSION_ID.fullmatch(session_id):
         raise ValueError("unsafe session id")
     proj = cwd.replace("/", "-").replace(".", "-")
-    d = os.path.expanduser("~/.claude/projects/" + proj)
+    d = os.path.join(claude_config_dir(), "projects", proj)
     return d, os.path.join(d, session_id + ".jsonl")
 
 
@@ -196,6 +237,7 @@ def _compact_tracked_synthetic(path):
                 output.write(compact)
                 output.flush()
                 os.fsync(output.fileno())
+            os.chmod(temporary, 0o600)
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
@@ -231,11 +273,13 @@ def _append_jsonl(directory, path, obj, session_id):
             ensure_ascii=False,
             separators=(",", ":"),
         ) + "\n")
+    os.chmod(path, 0o600)
     # Track written files so uninstall can clean them (Codex ids look like
     # Claude ids, so a filename alone isn't distinguishable otherwise).
     try:
         idx_dir = os.path.expanduser("~/.multiagent-notch")
         os.makedirs(idx_dir, exist_ok=True)
+        os.chmod(idx_dir, 0o700)
         idx = os.path.join(idx_dir, "synthetic-files.txt")
         existing = set()
         if os.path.exists(idx):
@@ -244,6 +288,8 @@ def _append_jsonl(directory, path, obj, session_id):
         if path not in existing:
             with open(idx, "a") as f:
                 f.write(path + "\n")
+        if os.path.exists(idx):
+            os.chmod(idx, 0o600)
     except Exception:
         pass
 
@@ -359,12 +405,30 @@ def write_synthetic(source, session_id, cwd, event, data):
 
 
 def send_event(sock_path, state, expect_reply):
+    s = None
     try:
+        before = _private_socket_info(sock_path)
+        if before is None:
+            return False if not expect_reply else None
+
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         # Long budget only when we actually block for a decision; otherwise a
         # short budget so a hung socket can't stall the agent's turn.
         s.settimeout(PERMISSION_TIMEOUT if expect_reply else SEND_TIMEOUT)
         s.connect(sock_path)
+
+        # Re-check the pathname after connect to close the lstat/connect race,
+        # then authenticate the connected Unix peer itself.  A predictable
+        # /tmp pathname must never be enough to impersonate Agent Notch.
+        after = _private_socket_info(sock_path)
+        if (
+            after is None
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or _peer_uid(s) != os.getuid()
+        ):
+            s.close()
+            return False if not expect_reply else None
+
         s.sendall(json.dumps(state).encode())
         if expect_reply:
             resp = s.recv(4096)
@@ -373,8 +437,60 @@ def send_event(sock_path, state, expect_reply):
                 return json.loads(resp.decode())
         else:
             s.close()
+            return True
         return None
-    except (socket.error, OSError, json.JSONDecodeError):
+    except (socket.error, OSError, ValueError, json.JSONDecodeError):
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+        return False if not expect_reply else None
+
+
+def _private_socket_info(sock_path):
+    """Return lstat data only for this user's private Unix socket."""
+    try:
+        info = os.lstat(sock_path)
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return None
+    return info
+
+
+def _peer_uid(sock):
+    """Return a connected Unix peer's effective UID on macOS/BSD.
+
+    CPython does not expose ``getpeereid`` on every macOS build, so use the
+    libc API as the portable fallback for the app's supported platform.  A
+    missing/failed credential check is intentionally treated as untrusted.
+    """
+    method = getattr(sock, "getpeereid", None)
+    if callable(method):
+        try:
+            return int(method()[0])
+        except (OSError, TypeError, ValueError):
+            return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        getpeereid = libc.getpeereid
+        uid = ctypes.c_uint()
+        gid = ctypes.c_uint()
+        getpeereid.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        getpeereid.restype = ctypes.c_int
+        if getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+            return None
+        return int(uid.value)
+    except (AttributeError, OSError, TypeError, ValueError):
         return None
 
 
@@ -394,75 +510,291 @@ def _cleanup_marker(source, session_id):
     return directory, os.path.join(directory, key + ".json")
 
 
+def _session_snapshot(source, session_id):
+    """Return the private path for one agent's latest lifecycle observation."""
+    key = uuid.uuid5(uuid.NAMESPACE_URL, f"{source}|{session_id}").hex
+    directory = os.path.expanduser("~/.multiagent-notch/session-state")
+    return directory, os.path.join(directory, key + ".json")
+
+
+def _real_private_directory(path, create=False):
+    """Return a real private directory, never following a state-dir symlink."""
+    parent = os.path.dirname(path)
+    try:
+        try:
+            parent_info = os.lstat(parent)
+        except FileNotFoundError:
+            if not create:
+                return None
+            os.mkdir(parent, 0o700)
+            parent_info = os.lstat(parent)
+        if (
+            stat.S_ISLNK(parent_info.st_mode)
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.getuid()
+        ):
+            return None
+        os.chmod(parent, 0o700)
+        if create:
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                pass
+        info = os.lstat(path)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+        ):
+            return None
+        os.chmod(path, 0o700)
+        return path
+    except OSError:
+        return None
+
+
+def _regular_cleanup_marker(path):
+    """Accept only an owned marker file, never a directory or symlink."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.getuid()
+    )
+
+
+def _unlink_regular_cleanup_marker(path):
+    if not _regular_cleanup_marker(path):
+        return False
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def persist_session_snapshot(state, observed_at=None):
+    """Atomically retain enough state for an app launched mid-turn.
+
+    The snapshot deliberately excludes prompts and tool input. A permission
+    socket cannot survive an app restart, so the reader restores any recorded
+    approval wait as ordinary processing and waits for a fresh live hook.
+    """
+    if not isinstance(state, dict):
+        return None
+    source = state.get("source")
+    session_id = state.get("session_id")
+    cwd = state.get("cwd")
+    if not all(isinstance(value, str) and value for value in (
+        source, session_id, cwd
+    )):
+        return None
+
+    timestamp = (
+        state.get("observed_at", time.time())
+        if observed_at is None
+        else observed_at
+    )
+    try:
+        timestamp = float(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+
+    directory, path = _session_snapshot(source, session_id)
+    directory = _real_private_directory(directory, create=True)
+    if directory is None:
+        return None
+    path = os.path.join(directory, os.path.basename(path))
+    if os.path.lexists(path) and not _regular_cleanup_marker(path):
+        return None
+
+    payload = {
+        "version": 1,
+        "observed_at": timestamp,
+        "session_id": session_id,
+        "cwd": cwd,
+        "source": source,
+        "event": state.get("event") if isinstance(state.get("event"), str) else "",
+        "status": state.get("status") if isinstance(state.get("status"), str) else "unknown",
+    }
+    pid = state.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        payload["pid"] = pid
+    tty = state.get("tty")
+    if isinstance(tty, str) and tty:
+        payload["tty"] = tty
+
+    temporary = path + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(payload, output, separators=(",", ":"), sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        return path
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return None
+
+
+def remove_session_snapshot(source, session_id):
+    if not isinstance(source, str) or not isinstance(session_id, str):
+        return False
+    _, path = _session_snapshot(source, session_id)
+    return _unlink_regular_cleanup_marker(path)
+
+
 def cancel_scheduled_cleanup(source, session_id):
     _, marker = _cleanup_marker(source, session_id)
-    try:
-        os.unlink(marker)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+    _unlink_regular_cleanup_marker(marker)
 
 
 def schedule_cleanup(source, session_id, cwd, sock_path, delay=None):
-    """Schedule removal after Stop; a later active event invalidates the token."""
+    """Persist expiry metadata without creating a long-lived sleep process.
+
+    SessionStore independently enforces the same five-hour retention while the
+    app is running.  The marker is a fallback: a later bridge invocation emits
+    SessionExpired for markers whose deadline passed while the app was away.
+    """
     ttl = COMPLETED_TTL if delay is None else max(0, delay)
-    if ttl < 0 or not session_id or session_id == "unknown":
+    if not session_id or session_id == "unknown":
         return None
 
     directory, marker = _cleanup_marker(source, session_id)
     token = uuid.uuid4().hex
+    directory = _real_private_directory(directory, create=True)
+    if directory is None:
+        return None
+    marker = os.path.join(directory, os.path.basename(marker))
+    if os.path.lexists(marker) and not _regular_cleanup_marker(marker):
+        return None
+    temporary = marker + "." + token + ".tmp"
     try:
-        os.makedirs(directory, exist_ok=True)
-        temporary = marker + "." + token + ".tmp"
-        with open(temporary, "w") as f:
-            json.dump({"token": token, "created_at": time.time()}, f)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w") as f:
+            created_at = time.time()
+            json.dump({
+                "token": token,
+                "created_at": created_at,
+                "expires_at": created_at + ttl,
+                "source": source,
+                "session_id": session_id,
+                "cwd": cwd,
+            }, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temporary, 0o600)
         os.replace(temporary, marker)
-        subprocess.Popen(
-            [
-                sys.executable,
-                os.path.abspath(__file__),
-                "--source", source,
-                "--socket", sock_path,
-                "--cleanup-token", token,
-                "--cleanup-session", session_id,
-                "--cleanup-cwd", cwd,
-                "--cleanup-delay", str(ttl),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
         return token
-    except (OSError, ValueError):
+    except (OSError, TypeError, ValueError):
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
         return None
 
 
-def run_cleanup_job(opts):
-    """Detached worker: remove only if no newer activity replaced the token."""
-    token = opts["cleanup_token"]
-    session_id = opts["cleanup_session"]
-    if not token or not session_id:
-        return
-    time.sleep(opts["cleanup_delay"])
-    _, marker = _cleanup_marker(opts["source"], session_id)
+def process_expired_cleanups(sock_path, now=None):
+    """Expire due markers during a normal hook invocation; never sleep."""
+    directory = os.path.expanduser("~/.multiagent-notch/session-cleanup")
+    current_time = time.time() if now is None else now
+    expired = 0
+    directory = _real_private_directory(directory, create=False)
+    if directory is None:
+        return expired
     try:
-        with open(marker) as f:
-            current = json.load(f)
-        if current.get("token") != token:
-            return
-        send_event(opts["socket"], {
-            "session_id": session_id,
-            "cwd": opts["cleanup_cwd"],
-            "event": "SessionExpired",
-            "status": "ended",
-            "source": opts["source"],
-        }, expect_reply=False)
-        os.unlink(marker)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return
+        names = os.listdir(directory)
+    except OSError:
+        return expired
+
+    for name in names:
+        if re.fullmatch(r"[a-f0-9]{32}\.json", name) is None:
+            continue
+        marker = os.path.join(directory, name)
+        if not _regular_cleanup_marker(marker):
+            continue
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(marker, flags)
+            with os.fdopen(descriptor) as marker_file:
+                opened_info = os.fstat(marker_file.fileno())
+                if (
+                    not stat.S_ISREG(opened_info.st_mode)
+                    or opened_info.st_uid != os.getuid()
+                ):
+                    raise OSError("cleanup marker owner/type changed")
+                current = json.load(marker_file)
+            if not isinstance(current, dict):
+                raise ValueError("cleanup marker is not an object")
+            raw_expiry = current.get("expires_at")
+            if raw_expiry is None:
+                # v1 markers only stored a token + creation time and cannot be
+                # correlated back to a session. Let their original five-hour
+                # window elapse, then remove them instead of retaining them
+                # forever. SessionStore independently applies the same TTL.
+                created_at = float(current.get("created_at"))
+                if not math.isfinite(created_at):
+                    raise ValueError("cleanup marker has invalid creation time")
+                legacy_expiry = created_at + COMPLETED_TTL
+                if legacy_expiry > current_time:
+                    continue
+                if _unlink_regular_cleanup_marker(marker):
+                    expired += 1
+                continue
+            expiry = float(raw_expiry)
+            if not math.isfinite(expiry):
+                raise ValueError("cleanup marker has invalid expiry")
+            if expiry > current_time:
+                continue
+            session_id = current.get("session_id")
+            source = current.get("source")
+            cwd = current.get("cwd", "")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("cleanup marker has no session id")
+            if not isinstance(source, str) or not source:
+                raise ValueError("cleanup marker has no source")
+            if not isinstance(cwd, str):
+                raise ValueError("cleanup marker has invalid cwd")
+            # The completed snapshot has now outlived the UI retention window.
+            # Remove it even if the app is currently offline; the cleanup marker
+            # remains available to clear a separately persisted app card later.
+            remove_session_snapshot(source, session_id)
+            delivered = send_event(sock_path, {
+                "session_id": session_id,
+                "cwd": cwd,
+                "event": "SessionExpired",
+                "status": "ended",
+                "source": source,
+            }, expect_reply=False)
+            # Keep the marker when the app is offline. A later normal event can
+            # retry, so expiration is never silently lost.
+            if delivered is True and _unlink_regular_cleanup_marker(marker):
+                expired += 1
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            # Invalid project-owned markers cannot be useful again. Removing
+            # them prevents permanent state-dir growth without touching any
+            # file outside this narrowly scoped directory.
+            _unlink_regular_cleanup_marker(marker)
+    return expired
 
 
 # --------------------------------------------------------------------------- #
@@ -566,10 +898,6 @@ def main():
     opts = parse_args(sys.argv[1:])
     source = opts["source"]
 
-    if opts["cleanup_token"]:
-        run_cleanup_job(opts)
-        sys.exit(0)
-
     raw = sys.stdin.read()
     debug_log(source, raw, note="recv")
 
@@ -595,23 +923,25 @@ def main():
     if event in ACTIVE_EVENTS:
         cancel_scheduled_cleanup(source, session_id)
 
-    if opts["lifecycle_only"]:
-        if event == "Stop":
-            schedule_cleanup(source, session_id, cwd, opts["socket"])
-        sys.exit(0)
+    # Handle due fallback markers only after cancelling this session's marker,
+    # so a resumed conversation can never be expired immediately before its
+    # new activity event is delivered.
+    process_expired_cleanups(opts["socket"])
 
-    # Write the synthetic transcript BEFORE emitting the socket event, so the
-    # file exists when the app starts watching this session's JSONL.
-    write_synthetic(source, session_id, cwd, event, data)
-
+    # Generate the lifecycle timestamp before any transcript or socket I/O.
+    # Separate hook processes can otherwise arrive at the app out of order;
+    # this observation time lets SessionStore reject a delayed older phase
+    # without discarding its tool bookkeeping.
+    observed_at = time.time()
     state = {
         "session_id": session_id,
         "cwd": cwd,
         "event": event,
         "status": status,
+        "observed_at": observed_at,
         "pid": os.getppid(),
         "tty": get_tty(),
-        # extra field ignored by the app but handy for future app-side theming
+        # Extra field ignored by the socket server but used by startup restore.
         "source": source,
     }
     if event in ("PreToolUse", "PostToolUse", "PostToolUseFailure",
@@ -635,6 +965,20 @@ def main():
         state["message"] = data.get("message")
         state["status"] = "waiting_for_input" if ntype == "idle_prompt" else "notification"
 
+    if event in ("SessionEnd", "SessionExpired") or state["status"] == "ended":
+        remove_session_snapshot(source, session_id)
+    else:
+        persist_session_snapshot(state, observed_at=observed_at)
+
+    if opts["lifecycle_only"]:
+        if event == "Stop":
+            schedule_cleanup(source, session_id, cwd, opts["socket"])
+        sys.exit(0)
+
+    # Write the synthetic transcript BEFORE emitting the socket event, so the
+    # file exists when the app starts watching this session's JSONL.
+    write_synthetic(source, session_id, cwd, event, data)
+
     # ---- PermissionRequest: block for a decision, then answer the agent ---- #
     if event == "PermissionRequest":
         state["response_timeout_seconds"] = PERMISSION_TIMEOUT
@@ -645,7 +989,15 @@ def main():
             # permissions; AskUserQuestion / ExitPlanMode stay manual below.
             state["status"] = "processing"
             state["approval_mode"] = approval_mode
-            send_event(opts["socket"], state, expect_reply=False)
+            app_is_live = send_event(
+                opts["socket"], state, expect_reply=False
+            ) is True
+            # Auto is deliberately an in-app, current-run convenience. If the
+            # app quit or crashed, emit no decision and let the agent show its
+            # own approval prompt. Trusted is the explicit offline-persistent
+            # choice and may still allow without a live socket.
+            if approval_mode == "auto" and not app_is_live:
+                sys.exit(0)
             fmt = DECISION_FORMATTERS.get(source, format_decision)
             out = fmt(source, "allow", "") if fmt is format_decision \
                 else fmt("allow", "")

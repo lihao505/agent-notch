@@ -10,6 +10,70 @@
 import Foundation
 import os.log
 
+/// Codex rewrites its small title index when tasks are created or renamed.
+/// Cache the decoded map by file signature so every one-second status pass
+/// does not reread and reverse-scan the complete index once per session.
+nonisolated private final class CodexThreadTitleIndex: @unchecked Sendable {
+    static let shared = CodexThreadTitleIndex()
+
+    private let lock = NSLock()
+    private var modificationDate: Date?
+    private var fileSize: UInt64?
+    private var titles: [String: String] = [:]
+
+    private init() {}
+
+    func title(for sessionId: String) -> String? {
+        let index = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/session_index.jsonl")
+        guard let attributes = try? FileManager.default.attributesOfItem(
+            atPath: index.path
+        ),
+        let currentModificationDate = attributes[.modificationDate] as? Date,
+        let currentFileSize = (attributes[.size] as? NSNumber)?.uint64Value else {
+            return nil
+        }
+
+        lock.lock()
+        if modificationDate == currentModificationDate,
+           fileSize == currentFileSize {
+            let result = titles[sessionId]
+            lock.unlock()
+            return result
+        }
+        lock.unlock()
+
+        guard let content = try? String(contentsOf: index, encoding: .utf8) else {
+            return nil
+        }
+        var refreshed: [String: String] = [:]
+        for line in content.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(
+                      with: data
+                  ) as? [String: Any],
+                  let id = row["id"] as? String,
+                  let rawTitle = row["thread_name"] as? String else {
+                continue
+            }
+            let title = rawTitle.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            if !title.isEmpty {
+                refreshed[id] = title
+            }
+        }
+
+        lock.lock()
+        modificationDate = currentModificationDate
+        fileSize = currentFileSize
+        titles = refreshed
+        let result = refreshed[sessionId]
+        lock.unlock()
+        return result
+    }
+}
+
 /// Token usage information from a session
 struct UsageInfo: Equatable {
     var inputTokens: Int = 0
@@ -65,10 +129,20 @@ struct ConversationInfo: Equatable {
 /// evidence that Codex is still working. Native turn boundaries and Codex's
 /// explicitly phased `final_answer` message are.
 nonisolated enum CodexTaskLifecycle: Equatable, Sendable {
-    case active(Date?)
+    /// `turnStartedAt` is the authoritative generation boundary. Activity
+    /// such as token counts may advance `lastEvidenceAt`, but must never make
+    /// an already completed turn look like a newly started one.
+    case active(turnStartedAt: Date?, lastEvidenceAt: Date?)
     case completed(Date?)
     case missing
     case unknown
+}
+
+nonisolated struct CodexTaskObservation: Sendable {
+    let sessionId: String
+    let cwd: String
+    let lifecycle: CodexTaskLifecycle
+    let fileModifiedAt: Date
 }
 
 actor ConversationParser {
@@ -90,13 +164,10 @@ actor ConversationParser {
 
     private var incrementalState: [String: IncrementalParseState] = [:]
     private var codexRolloutPaths: [String: URL] = [:]
-    private var codexLifecycleCache: [
-        String: (
-            fileSize: UInt64,
-            modificationDate: Date?,
-            lifecycle: CodexTaskLifecycle
-        )
-    ] = [:]
+    private var codexLifecycleState: [String: CodexLifecycleParseState] = [:]
+    private var codexMetadataCache: [String: (sessionId: String, cwd: String)] = [:]
+    private var codexRolloutIndexInitialized = false
+    private var codexIndexedDirectoryModificationDates: [String: Date] = [:]
 
     private enum NativeConversationKind {
         case codex
@@ -119,6 +190,37 @@ actor ConversationParser {
         var structuredResults: [String: ToolResultData] = [:]  // Structured results keyed by tool_use_id
         var lastClearOffset: UInt64 = 0  // Offset of last /clear command (0 = none or at start)
         var clearPending: Bool = false  // True if a /clear was just detected
+        var nativeApprovalMode: ApprovalMode?
+    }
+
+    /// A separate cursor for the small subset of Codex rollout rows that
+    /// determine whether a turn is still active. Keeping this independent from
+    /// chat parsing lets the one-second status poll consume only newly appended
+    /// bytes instead of repeatedly splitting and decoding a one-megabyte tail.
+    private struct CodexLifecycleParseState {
+        var isInitialized = false
+        /// End of the bytes already read from disk. `pending` contains any
+        /// unterminated row from those bytes, so the file itself is never
+        /// reread merely because the writer stopped in the middle of a row.
+        var readOffset: UInt64 = 0
+        var modificationDate: Date?
+        var deviceNumber: UInt64?
+        var fileNumber: UInt64?
+        var lifecycle: CodexTaskLifecycle = .unknown
+        var turnStartedAt: Date?
+        var lastEvidenceAt: Date?
+        var pending = Data()
+        /// Last bytes immediately preceding `readOffset`. This cheap anchor
+        /// detects a truncate-and-regrow that happens between two status polls.
+        var anchor = Data()
+        /// An initial one-megabyte tail can begin in the middle of a JSON row.
+        /// Discard through its newline without retaining an arbitrarily large
+        /// compacted/context row.
+        var discardingLeadingPartial = false
+        /// Once a row is known to be irrelevant or exceeds the event-row hard
+        /// limit, stream past it without retaining any more bytes until LF.
+        var discardingCurrentLine = false
+        var currentLineIsEventMessage = false
     }
 
     /// Parsed tool result data
@@ -151,7 +253,15 @@ actor ConversationParser {
         // may contain Shell/Bash hook placeholders, so never use it for the
         // user-visible chat when a native file is available.
         if nativeConversationURL(sessionId: sessionId, cwd: cwd) != nil {
-            let messages = parseFullConversation(sessionId: sessionId, cwd: cwd)
+            // This is a metadata snapshot, not a transcript-consumption API.
+            // Advancing the shared native cursor here can lose a row appended
+            // after parseIncremental returned: this call would consume it, but
+            // its message would not be present in the already-created update
+            // payload. Only parseIncremental/parseFullConversation may advance
+            // the native cursor; a later incremental tick will consume any row
+            // appended after this snapshot.
+            let state = incrementalState[sessionId] ?? IncrementalParseState()
+            let messages = state.messages
             let firstUser = messages.first(where: { $0.role == .user })?.textContent
             let last = messages.last(where: { !$0.textContent.isEmpty })
             let lastRole: String?
@@ -161,10 +271,11 @@ actor ConversationParser {
                 lastRole = nil
             }
             let title = Self.codexThreadTitle(sessionId: sessionId)
-            let nativeApprovalMode = nativeApprovalMode(
-                sessionId: sessionId,
-                cwd: cwd
-            )
+            // The incremental scan sees every turn_context/settings row once,
+            // so it remains authoritative even when a long turn pushes the
+            // policy row outside the one-megabyte tail fallback.
+            let nativeApprovalMode = state.nativeApprovalMode ??
+                nativeApprovalMode(sessionId: sessionId, cwd: cwd)
 
             return ConversationInfo(
                 summary: title,
@@ -220,26 +331,7 @@ actor ConversationParser {
     /// Older synthetic transcripts may predate summary rows, so use this as a
     /// title-only fallback instead of showing the cwd basename ("project").
     nonisolated static func codexThreadTitle(sessionId: String) -> String? {
-        let index = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/session_index.jsonl")
-        guard let content = try? String(contentsOf: index, encoding: .utf8) else {
-            return nil
-        }
-
-        for line in content.split(separator: "\n").reversed() {
-            guard line.contains(sessionId),
-                  let data = line.data(using: .utf8),
-                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  row["id"] as? String == sessionId,
-                  let rawTitle = row["thread_name"] as? String else {
-                continue
-            }
-            let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !title.isEmpty {
-                return title
-            }
-        }
-        return nil
+        CodexThreadTitleIndex.shared.title(for: sessionId)
     }
 
     /// Read the latest Codex approval policy from its native rollout. This is
@@ -258,41 +350,70 @@ actor ConversationParser {
         guard let fileSize = try? handle.seekToEnd() else { return nil }
         let tailBudget: UInt64 = 1_048_576
         let startOffset = fileSize > tailBudget ? fileSize - tailBudget : 0
-        guard (try? handle.seek(toOffset: startOffset)) != nil,
-              let data = try? handle.readToEnd(),
-              var text = String(data: data, encoding: .utf8) else {
+        // Include the byte immediately before the tail. It tells us whether
+        // startOffset is already a line boundary without ever trying to decode
+        // a UTF-8 scalar that the byte budget split in half.
+        let readOffset = startOffset > 0 ? startOffset - 1 : 0
+        guard (try? handle.seek(toOffset: readOffset)) != nil,
+              let data = try? handle.readToEnd() else {
             return nil
         }
-        if startOffset > 0, let firstNewline = text.firstIndex(of: "\n") {
-            text.removeSubrange(...firstNewline)
-        }
 
-        for line in text.split(separator: "\n").reversed() {
-            guard let lineData = line.data(using: .utf8),
-                  let row = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let rowType = row["type"] as? String,
-                  let payload = row["payload"] as? [String: Any] else {
+        for lineData in Self.completeJSONLLines(
+            in: data,
+            hasLeadingProbeByte: startOffset > 0
+        ).reversed() {
+            guard let row = try? JSONSerialization.jsonObject(
+                with: lineData
+            ) as? [String: Any] else {
                 continue
             }
 
-            let policy: String?
-            switch rowType {
-            case "turn_context":
-                policy = payload["approval_policy"] as? String
-            case "event_msg":
-                guard payload["type"] as? String == "thread_settings_applied" else {
-                    continue
-                }
-                policy = (payload["thread_settings"] as? [String: Any])?["approval_policy"] as? String
-            default:
-                continue
-            }
-
-            if let mode = Self.approvalMode(forCodexPolicy: policy) {
+            if let mode = Self.codexApprovalMode(from: row) {
                 return mode
             }
         }
         return nil
+    }
+
+    /// Return only complete JSONL rows from a byte tail. Prefix and suffix
+    /// fragments are removed as Data, before UTF-8/JSON decoding. This keeps a
+    /// tail boundary inside Chinese text or an emoji from invalidating all
+    /// otherwise complete rows that follow it.
+    nonisolated private static func completeJSONLLines(
+        in data: Data,
+        hasLeadingProbeByte: Bool
+    ) -> [Data] {
+        guard !data.isEmpty else { return [] }
+
+        var completeStart = data.startIndex
+        if hasLeadingProbeByte {
+            if data[data.startIndex] == 0x0A {
+                completeStart = data.index(after: data.startIndex)
+            } else {
+                guard let firstNewline = data.firstIndex(of: 0x0A) else {
+                    return []
+                }
+                completeStart = data.index(after: firstNewline)
+            }
+        }
+        guard completeStart < data.endIndex,
+              let lastNewline = data[completeStart...].lastIndex(of: 0x0A),
+              completeStart <= lastNewline else {
+            return []
+        }
+
+        var lines: [Data] = []
+        var lineStart = completeStart
+        while lineStart <= lastNewline,
+              let newline = data[lineStart...].firstIndex(of: 0x0A),
+              newline <= lastNewline {
+            if lineStart < newline {
+                lines.append(data.subdata(in: lineStart..<newline))
+            }
+            lineStart = data.index(after: newline)
+        }
+        return lines
     }
 
     nonisolated private static func approvalMode(forCodexPolicy policy: String?) -> ApprovalMode? {
@@ -306,11 +427,35 @@ actor ConversationParser {
         }
     }
 
-    /// Read only the tail of Codex Desktop's native rollout and return its
-    /// latest turn boundary. This is intentionally independent from the
-    /// synthetic chat transcript used by the notch UI.
+    nonisolated private static func codexApprovalMode(
+        from row: [String: Any]
+    ) -> ApprovalMode? {
+        guard let rowType = row["type"] as? String,
+              let payload = row["payload"] as? [String: Any] else {
+            return nil
+        }
+
+        let policy: String?
+        switch rowType {
+        case "turn_context":
+            policy = payload["approval_policy"] as? String
+        case "event_msg":
+            guard payload["type"] as? String == "thread_settings_applied" else {
+                return nil
+            }
+            policy = (payload["thread_settings"] as? [String: Any])?["approval_policy"] as? String
+        default:
+            return nil
+        }
+        return approvalMode(forCodexPolicy: policy)
+    }
+
+    /// Read Codex Desktop's native rollout and return its latest turn boundary.
+    /// The first observation scans at most the final one megabyte; subsequent
+    /// observations consume only bytes appended after the saved cursor.
     func codexTaskLifecycle(sessionId: String) -> CodexTaskLifecycle {
         guard let rolloutURL = codexRolloutURL(sessionId: sessionId) else {
+            codexLifecycleState.removeValue(forKey: sessionId)
             return .missing
         }
         // URL resource values can remain cached on a long-lived URL instance.
@@ -325,93 +470,739 @@ actor ConversationParser {
         }
         let fileSize = size.uint64Value
         let modificationDate = attributes[.modificationDate] as? Date
-        if let cached = codexLifecycleCache[sessionId],
-           cached.fileSize == fileSize,
-           cached.modificationDate == modificationDate {
-            return cached.lifecycle
+        let deviceNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value
+        let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+
+        var state = codexLifecycleState[sessionId] ??
+            CodexLifecycleParseState()
+        let fileIdentityChanged = state.isInitialized && (
+            (state.deviceNumber != nil && deviceNumber != nil &&
+                state.deviceNumber != deviceNumber) ||
+            (state.fileNumber != nil && fileNumber != nil &&
+                state.fileNumber != fileNumber)
+        )
+        let sameSizeRewrite = state.isInitialized &&
+            fileSize == state.readOffset &&
+            state.modificationDate != modificationDate
+        var mustReset = !state.isInitialized ||
+            fileSize < state.readOffset ||
+            fileIdentityChanged ||
+            sameSizeRewrite
+
+        if !mustReset && fileSize == state.readOffset {
+            state.modificationDate = modificationDate
+            state.deviceNumber = deviceNumber
+            state.fileNumber = fileNumber
+            codexLifecycleState[sessionId] = state
+            return state.lifecycle
         }
 
         guard let handle = try? FileHandle(forReadingFrom: rolloutURL) else {
             codexRolloutPaths.removeValue(forKey: sessionId)
-            codexLifecycleCache.removeValue(forKey: sessionId)
+            codexLifecycleState.removeValue(forKey: sessionId)
             return .missing
         }
         defer { try? handle.close() }
 
-        let tailBudget: UInt64 = 1_048_576
-        guard let fileSize = try? handle.seekToEnd() else {
-            return .unknown
-        }
-        let startOffset = fileSize > tailBudget
-            ? fileSize - tailBudget
-            : 0
-        do {
-            try handle.seek(toOffset: startOffset)
-        } catch {
-            return .unknown
-        }
-
-        guard let data = try? handle.readToEnd(),
-              var text = String(data: data, encoding: .utf8) else {
-            return .unknown
-        }
-        if startOffset > 0, let firstNewline = text.firstIndex(of: "\n") {
-            text.removeSubrange(...firstNewline)
-        }
-
-        var lifecycle = CodexTaskLifecycle.unknown
-        for line in text.split(separator: "\n").reversed() {
-            guard line.contains("\"event_msg\""),
-                  let data = line.data(using: .utf8),
-                  let row = try? JSONSerialization.jsonObject(
-                    with: data
-                  ) as? [String: Any],
-                  row["type"] as? String == "event_msg",
-                  let payload = row["payload"] as? [String: Any],
-                  let type = payload["type"] as? String else {
-                continue
+        // A rollout can be truncated and regrown past the previous cursor
+        // between one-second polls. Size alone cannot detect that race, so
+        // compare the tiny saved anchor whenever the file changed and grew.
+        if !mustReset,
+           modificationDate != state.modificationDate,
+           !state.anchor.isEmpty {
+            let anchorOffset = state.readOffset - UInt64(state.anchor.count)
+            do {
+                try handle.seek(toOffset: anchorOffset)
+                let currentAnchor = try handle.read(
+                    upToCount: state.anchor.count
+                )
+                if currentAnchor != state.anchor {
+                    mustReset = true
+                }
+            } catch {
+                mustReset = true
             }
+        }
 
-            let timestamp = (row["timestamp"] as? String)
-                .flatMap(Self.parseISO8601)
-            if type == "agent_message",
-               payload["phase"] as? String == "final_answer" {
-                // Codex Desktop renders this message before it appends
-                // task_complete (normally about a second later). Treat the
-                // explicit final phase as the completion boundary so the
-                // notch stops showing work as soon as the user sees the final
-                // answer. Commentary agent messages never enter this branch.
-                lifecycle = .completed(timestamp)
+        if mustReset {
+            state = CodexLifecycleParseState()
+            state.isInitialized = true
+            // A long, tool-heavy turn can push its latest task_started many
+            // megabytes behind the file tail. Locate the newest authoritative
+            // lifecycle boundary backwards, then parse forward from there.
+            // This keeps the generation exact without serially decoding a
+            // multi-megabyte historical rollout during app startup.
+            state.readOffset = Self.codexLifecycleInitialReadOffset(
+                at: rolloutURL,
+                fileSize: fileSize
+            )
+            if state.readOffset > 0 {
+                do {
+                    try handle.seek(toOffset: state.readOffset - 1)
+                    let previousByte = try handle.read(upToCount: 1)?.first
+                    state.discardingLeadingPartial = previousByte != 0x0A
+                } catch {
+                    state.discardingLeadingPartial = true
+                }
+            }
+        }
+
+        do {
+            try handle.seek(toOffset: state.readOffset)
+        } catch {
+            codexLifecycleState.removeValue(forKey: sessionId)
+            return state.lifecycle
+        }
+
+        // Limit this pass to the size captured above. If Codex appends while
+        // we read, the next status tick starts exactly at this snapshot's end.
+        var remaining = fileSize - state.readOffset
+        while remaining > 0 {
+            let requested = Int(min(
+                UInt64(Self.codexLifecycleReadChunkSize),
+                remaining
+            ))
+            let chunk: Data
+            do {
+                guard let data = try handle.read(upToCount: requested),
+                      !data.isEmpty else {
+                    break
+                }
+                chunk = data
+            } catch {
                 break
             }
-            switch type {
-            case "task_started":
-                lifecycle = .active(timestamp)
-            case "task_complete":
-                lifecycle = .completed(timestamp)
-            case "user_message":
-                // A long turn can append more than the one-megabyte tail
-                // budget before it finishes, pushing task_started out of the
-                // scan window. The latest user message is still an
-                // authoritative active-turn boundary.
-                lifecycle = .active(timestamp)
-            case "agent_message"
-                where payload["phase"] as? String == "commentary":
-                // Likewise, ongoing commentary is positive evidence that the
-                // current turn is active. A final answer is handled above.
-                lifecycle = .active(timestamp)
-            default:
-                continue
-            }
-            break
+            state.readOffset += UInt64(chunk.count)
+            remaining -= UInt64(chunk.count)
+            Self.updateCodexLifecycleAnchor(chunk, state: &state)
+            Self.consumeCodexLifecycleData(chunk, state: &state)
         }
 
-        codexLifecycleCache[sessionId] = (
-            fileSize: fileSize,
-            modificationDate: modificationDate,
-            lifecycle: lifecycle
-        )
-        return lifecycle
+        state.modificationDate = modificationDate
+        state.deviceNumber = deviceNumber
+        state.fileNumber = fileNumber
+        codexLifecycleState[sessionId] = state
+        return state.lifecycle
+    }
+
+    /// Discover Codex turns from native rollout writes, independently of
+    /// hook delivery. Codex Desktop can omit UserPromptSubmit for a resumed
+    /// task, which otherwise leaves Agent Notch idle until the first tool.
+    /// Only metadata is stat'ed for the full tree; lifecycle bytes are parsed
+    /// for files that changed inside the caller's narrow time window.
+    func discoverCodexTasks(
+        modifiedAfter: Date
+    ) -> [CodexTaskObservation] {
+        ensureCodexRolloutIndex()
+        refreshRecentCodexRolloutIndex()
+
+        var observations: [CodexTaskObservation] = []
+        let indexedRollouts = codexRolloutPaths
+        for (sessionId, url) in indexedRollouts {
+            guard let attributes = try? FileManager.default.attributesOfItem(
+                atPath: url.path
+            ),
+            let fileType = attributes[.type] as? FileAttributeType,
+            fileType == .typeRegular,
+            let modifiedAt = attributes[.modificationDate] as? Date,
+            modifiedAt >= modifiedAfter,
+            let metadata = codexSessionMetadata(at: url) else {
+                continue
+            }
+
+            observations.append(CodexTaskObservation(
+                sessionId: sessionId,
+                cwd: metadata.cwd,
+                lifecycle: codexTaskLifecycle(
+                    sessionId: sessionId
+                ),
+                fileModifiedAt: modifiedAt
+            ))
+        }
+        return observations
+    }
+
+    private func codexSessionsRootURL() -> URL {
+        if let override = Foundation.ProcessInfo.processInfo.environment[
+            "AGENT_NOTCH_CODEX_SESSIONS_ROOT"
+        ]?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines),
+           !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions", isDirectory: true)
+    }
+
+    /// Build the historical rollout index once. The one-second discovery poll
+    /// then stats known files and only scans the few date directories where a
+    /// brand-new task can appear, instead of recursively walking all history.
+    private func ensureCodexRolloutIndex() {
+        guard !codexRolloutIndexInitialized else { return }
+        codexRolloutIndexInitialized = true
+        indexCodexRollouts(recursivelyUnder: codexSessionsRootURL())
+    }
+
+    private func refreshRecentCodexRolloutIndex(now: Date = Date()) {
+        let root = codexSessionsRootURL()
+        let calendar = Calendar(identifier: .gregorian)
+        for daysAgo in 0...2 {
+            guard let date = calendar.date(
+                byAdding: .day,
+                value: -daysAgo,
+                to: now
+            ) else {
+                continue
+            }
+            let components = calendar.dateComponents(
+                [.year, .month, .day],
+                from: date
+            )
+            guard let year = components.year,
+                  let month = components.month,
+                  let day = components.day else {
+                continue
+            }
+            let directory = root
+                .appendingPathComponent(String(format: "%04d", year))
+                .appendingPathComponent(String(format: "%02d", month))
+                .appendingPathComponent(String(format: "%02d", day))
+            guard let attributes = try? FileManager.default.attributesOfItem(
+                atPath: directory.path
+            ),
+            let modificationDate = attributes[.modificationDate] as? Date,
+            codexIndexedDirectoryModificationDates[directory.path]
+                != modificationDate else {
+                continue
+            }
+            indexCodexRollouts(recursivelyUnder: directory)
+            codexIndexedDirectoryModificationDates[directory.path]
+                = modificationDate
+        }
+    }
+
+    private func indexCodexRollouts(recursivelyUnder root: URL) {
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return
+        }
+        for case let url as URL in enumerator {
+            guard url.pathExtension == "jsonl",
+                  url.lastPathComponent.hasPrefix("rollout-"),
+                  let metadata = codexSessionMetadata(at: url) else {
+                continue
+            }
+            codexRolloutPaths[metadata.sessionId] = url
+        }
+    }
+
+    private func codexSessionMetadata(
+        at url: URL
+    ) -> (sessionId: String, cwd: String)? {
+        if let cached = codexMetadataCache[url.path] {
+            return cached
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        guard let prefix = try? handle.read(upToCount: 256 * 1024),
+              let newline = prefix.firstIndex(of: 0x0A),
+              let row = try? JSONSerialization.jsonObject(
+                with: prefix[..<newline]
+              ) as? [String: Any],
+              row["type"] as? String == "session_meta",
+              let payload = row["payload"] as? [String: Any],
+              let sessionId = payload["id"] as? String,
+              !sessionId.isEmpty,
+              let cwd = payload["cwd"] as? String,
+              !cwd.isEmpty else {
+            return nil
+        }
+        let metadata = (sessionId: sessionId, cwd: cwd)
+        codexMetadataCache[url.path] = metadata
+        return metadata
+    }
+
+    private nonisolated static let codexLifecycleTailBudget: UInt64 = 1_048_576
+    private nonisolated static let codexLifecycleReadChunkSize = 256 * 1_024
+    private nonisolated static let codexLifecycleAnchorSize = 64
+    /// Lifecycle event rows are normally a few hundred bytes. Four MiB leaves
+    /// generous room for a large final answer while making a malformed or
+    /// unexpectedly huge event row safe to ignore until its terminating LF.
+    private nonisolated static let codexLifecycleMaxEventRowSize =
+        4 * 1_024 * 1_024
+
+    private enum CodexLifecycleLineClassification {
+        case eventMessage
+        case irrelevant
+        case incomplete
+    }
+
+    private enum CodexJSONScanResult {
+        case complete
+        case incomplete
+        case invalid
+    }
+
+    /// Find the newest real lifecycle boundary without decoding every JSONL
+    /// row. Candidate strings can also occur inside tool output, so the whole
+    /// containing row is parsed and verified before its offset is accepted.
+    nonisolated private static func codexLifecycleInitialReadOffset(
+        at url: URL,
+        fileSize: UInt64
+    ) -> UInt64 {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              !data.isEmpty else {
+            return fileSize > codexLifecycleTailBudget
+                ? fileSize - codexLifecycleTailBudget
+                : 0
+        }
+
+        let eventMessageNeedle = Data("\"type\":\"event_msg\"".utf8)
+        let boundaryNeedles = [
+            "\"task_started\"",
+            "\"task_complete\"",
+            "\"turn_aborted\"",
+            "\"task_aborted\"",
+            "\"task_cancelled\"",
+            "\"task_canceled\"",
+            "\"turn_cancelled\"",
+            "\"turn_canceled\"",
+            "\"task_failed\"",
+            "\"turn_failed\"",
+            "\"thread_rolled_back\"",
+            "\"final_answer\""
+        ].map { Data($0.utf8) }
+
+        var lineEnd = data.endIndex
+        if lineEnd > data.startIndex,
+           data[data.index(before: lineEnd)] == 0x0A {
+            lineEnd = data.index(before: lineEnd)
+        }
+        while lineEnd > data.startIndex {
+            let precedingNewline = data[..<lineEnd].lastIndex(of: 0x0A)
+            let lineStart = precedingNewline
+                .map { data.index(after: $0) } ?? data.startIndex
+            let line = data[lineStart..<lineEnd]
+            if line.count <= codexLifecycleMaxEventRowSize,
+               line.range(of: eventMessageNeedle) != nil,
+               boundaryNeedles.contains(where: {
+                   line.range(of: $0) != nil
+               }),
+               let row = try? JSONSerialization.jsonObject(with: line)
+                    as? [String: Any],
+               isCodexLifecycleBoundary(row) {
+                return UInt64(lineStart)
+            }
+            guard let precedingNewline else { break }
+            lineEnd = precedingNewline
+        }
+
+        return fileSize > codexLifecycleTailBudget
+            ? fileSize - codexLifecycleTailBudget
+            : 0
+    }
+
+    nonisolated private static func isCodexLifecycleBoundary(
+        _ row: [String: Any]
+    ) -> Bool {
+        guard row["type"] as? String == "event_msg",
+              let payload = row["payload"] as? [String: Any],
+              let type = payload["type"] as? String else {
+            return false
+        }
+        if type == "agent_message" {
+            return payload["phase"] as? String == "final_answer"
+        }
+        return type == "task_started" || [
+            "task_complete",
+            "turn_aborted",
+            "task_aborted",
+            "task_cancelled",
+            "task_canceled",
+            "turn_cancelled",
+            "turn_canceled",
+            "task_failed",
+            "turn_failed",
+            "thread_rolled_back"
+        ].contains(type)
+    }
+
+    nonisolated private static func updateCodexLifecycleAnchor(
+        _ data: Data,
+        state: inout CodexLifecycleParseState
+    ) {
+        if data.count >= codexLifecycleAnchorSize {
+            state.anchor = Data(data.suffix(codexLifecycleAnchorSize))
+            return
+        }
+        state.anchor.append(data)
+        if state.anchor.count > codexLifecycleAnchorSize {
+            state.anchor.removeFirst(
+                state.anchor.count - codexLifecycleAnchorSize
+            )
+        }
+    }
+
+    /// Consume lifecycle JSONL with bounded memory. Top-level `type` is parsed
+    /// from the row prefix; known non-event rows are discarded immediately,
+    /// and oversized candidate event rows are streamed through to LF.
+    nonisolated private static func consumeCodexLifecycleData(
+        _ data: Data,
+        state: inout CodexLifecycleParseState
+    ) {
+        var cursor = data.startIndex
+        if state.discardingLeadingPartial {
+            guard let newline = data[cursor...].firstIndex(of: 0x0A) else {
+                return
+            }
+            cursor = data.index(after: newline)
+            state.discardingLeadingPartial = false
+        }
+
+        while cursor < data.endIndex {
+            if state.discardingCurrentLine {
+                guard let newline = data[cursor...].firstIndex(of: 0x0A) else {
+                    return
+                }
+                cursor = data.index(after: newline)
+                resetCodexLifecycleLineState(&state)
+                continue
+            }
+
+            let newline = data[cursor...].firstIndex(of: 0x0A)
+            let segmentEnd = newline ?? data.endIndex
+            let segmentCount = data.distance(
+                from: cursor,
+                to: segmentEnd
+            )
+            let available = codexLifecycleMaxEventRowSize -
+                state.pending.count
+
+            if segmentCount > available {
+                // Do not append beyond the hard cap. The remainder of this row
+                // is irrelevant to lifecycle state even if its JSON is valid.
+                state.pending.removeAll(keepingCapacity: false)
+                state.currentLineIsEventMessage = false
+                state.discardingCurrentLine = newline == nil
+            } else {
+                state.pending.append(contentsOf: data[cursor..<segmentEnd])
+                if !state.currentLineIsEventMessage {
+                    switch classifyCodexLifecycleLine(state.pending) {
+                    case .eventMessage:
+                        state.currentLineIsEventMessage = true
+                    case .irrelevant:
+                        state.pending.removeAll(keepingCapacity: false)
+                        state.discardingCurrentLine = newline == nil
+                    case .incomplete:
+                        break
+                    }
+                }
+
+                if newline != nil,
+                   state.currentLineIsEventMessage,
+                   let row = try? JSONSerialization.jsonObject(
+                    with: state.pending
+                   ) as? [String: Any] {
+                    applyCodexLifecycleRow(row, state: &state)
+                }
+            }
+
+            guard let newline else { return }
+            cursor = data.index(after: newline)
+            resetCodexLifecycleLineState(&state)
+        }
+    }
+
+    nonisolated private static func resetCodexLifecycleLineState(
+        _ state: inout CodexLifecycleParseState
+    ) {
+        state.pending.removeAll(keepingCapacity: true)
+        state.discardingCurrentLine = false
+        state.currentLineIsEventMessage = false
+    }
+
+    /// Parse just enough of a JSON object to classify its top-level `type`.
+    /// This avoids substring false positives from nested payloads and lets
+    /// response_item/context rows be released after their first read chunk.
+    nonisolated private static func classifyCodexLifecycleLine(
+        _ data: Data
+    ) -> CodexLifecycleLineClassification {
+        var index = data.startIndex
+        skipCodexJSONWhitespace(data, index: &index)
+        guard index < data.endIndex else { return .incomplete }
+        guard data[index] == 0x7B else { return .irrelevant } // {
+        index = data.index(after: index)
+
+        while true {
+            skipCodexJSONWhitespace(data, index: &index)
+            guard index < data.endIndex else { return .incomplete }
+            if data[index] == 0x7D { return .irrelevant } // }
+            if data[index] == 0x2C { // ,
+                index = data.index(after: index)
+                continue
+            }
+
+            var keyRange: Range<Data.Index>?
+            switch scanCodexJSONString(
+                data,
+                index: &index,
+                contentRange: &keyRange
+            ) {
+            case .incomplete:
+                return .incomplete
+            case .invalid:
+                return .irrelevant
+            case .complete:
+                break
+            }
+
+            skipCodexJSONWhitespace(data, index: &index)
+            guard index < data.endIndex else { return .incomplete }
+            guard data[index] == 0x3A else { return .irrelevant } // :
+            index = data.index(after: index)
+            skipCodexJSONWhitespace(data, index: &index)
+
+            let isTypeKey = keyRange.map {
+                data[$0].elementsEqual("type".utf8)
+            } ?? false
+            if isTypeKey {
+                var valueRange: Range<Data.Index>?
+                switch scanCodexJSONString(
+                    data,
+                    index: &index,
+                    contentRange: &valueRange
+                ) {
+                case .incomplete:
+                    return .incomplete
+                case .invalid:
+                    return .irrelevant
+                case .complete:
+                    let isEvent = valueRange.map {
+                        data[$0].elementsEqual("event_msg".utf8)
+                    } ?? false
+                    return isEvent ? .eventMessage : .irrelevant
+                }
+            }
+
+            switch skipCodexJSONValue(data, index: &index) {
+            case .complete:
+                continue
+            case .incomplete:
+                return .incomplete
+            case .invalid:
+                return .irrelevant
+            }
+        }
+    }
+
+    nonisolated private static func skipCodexJSONWhitespace(
+        _ data: Data,
+        index: inout Data.Index
+    ) {
+        while index < data.endIndex {
+            switch data[index] {
+            case 0x20, 0x09, 0x0D, 0x0A:
+                index = data.index(after: index)
+            default:
+                return
+            }
+        }
+    }
+
+    nonisolated private static func scanCodexJSONString(
+        _ data: Data,
+        index: inout Data.Index,
+        contentRange: inout Range<Data.Index>?
+    ) -> CodexJSONScanResult {
+        guard index < data.endIndex else { return .incomplete }
+        guard data[index] == 0x22 else { return .invalid } // "
+        index = data.index(after: index)
+        let contentStart = index
+        var escaped = false
+        while index < data.endIndex {
+            let byte = data[index]
+            if escaped {
+                escaped = false
+                index = data.index(after: index)
+            } else if byte == 0x5C { // \
+                escaped = true
+                index = data.index(after: index)
+            } else if byte == 0x22 {
+                contentRange = contentStart..<index
+                index = data.index(after: index)
+                return .complete
+            } else if byte < 0x20 {
+                return .invalid
+            } else {
+                index = data.index(after: index)
+            }
+        }
+        return .incomplete
+    }
+
+    nonisolated private static func skipCodexJSONValue(
+        _ data: Data,
+        index: inout Data.Index
+    ) -> CodexJSONScanResult {
+        guard index < data.endIndex else { return .incomplete }
+        if data[index] == 0x22 {
+            var unused: Range<Data.Index>?
+            return scanCodexJSONString(
+                data,
+                index: &index,
+                contentRange: &unused
+            )
+        }
+
+        if data[index] == 0x7B || data[index] == 0x5B { // { or [
+            var expectedClosers: [UInt8] = [
+                data[index] == 0x7B ? 0x7D : 0x5D,
+            ]
+            index = data.index(after: index)
+            var inString = false
+            var escaped = false
+            while index < data.endIndex {
+                let byte = data[index]
+                index = data.index(after: index)
+                if inString {
+                    if escaped {
+                        escaped = false
+                    } else if byte == 0x5C {
+                        escaped = true
+                    } else if byte == 0x22 {
+                        inString = false
+                    }
+                    continue
+                }
+                switch byte {
+                case 0x22:
+                    inString = true
+                case 0x7B:
+                    expectedClosers.append(0x7D)
+                case 0x5B:
+                    expectedClosers.append(0x5D)
+                case 0x7D, 0x5D:
+                    guard expectedClosers.last == byte else {
+                        return .invalid
+                    }
+                    expectedClosers.removeLast()
+                    if expectedClosers.isEmpty { return .complete }
+                default:
+                    break
+                }
+            }
+            return .incomplete
+        }
+
+        // Numbers, booleans, and null end at whitespace or an object/array
+        // delimiter. Validation of their spelling is left to JSONSerialization.
+        let valueStart = index
+        while index < data.endIndex {
+            switch data[index] {
+            case 0x20, 0x09, 0x0D, 0x0A, 0x2C, 0x7D, 0x5D:
+                return index > valueStart ? .complete : .invalid
+            default:
+                index = data.index(after: index)
+            }
+        }
+        return .incomplete
+    }
+
+    nonisolated private static func applyCodexLifecycleRow(
+        _ row: [String: Any],
+        state: inout CodexLifecycleParseState
+    ) {
+        guard row["type"] as? String == "event_msg",
+              let payload = row["payload"] as? [String: Any],
+              let type = payload["type"] as? String else {
+            return
+        }
+
+        let timestamp = (row["timestamp"] as? String)
+            .flatMap(parseISO8601)
+        if type == "token_count" {
+            // A token count immediately after an abort is not proof of a new
+            // turn. It only refreshes evidence for an already-active turn.
+            if case .active = state.lifecycle,
+               let timestamp {
+                state.lastEvidenceAt = max(
+                    state.lastEvidenceAt ?? .distantPast,
+                    timestamp
+                )
+                state.lifecycle = .active(
+                    turnStartedAt: state.turnStartedAt,
+                    lastEvidenceAt: state.lastEvidenceAt
+                )
+            }
+            return
+        }
+
+        if type == "agent_message",
+           payload["phase"] as? String == "final_answer" {
+            // Codex renders the final response shortly before task_complete.
+            state.lifecycle = .completed(timestamp)
+            return
+        }
+
+        switch type {
+        case "task_started":
+            state.turnStartedAt = timestamp
+            state.lastEvidenceAt = timestamp
+            state.lifecycle = .active(
+                turnStartedAt: timestamp,
+                lastEvidenceAt: timestamp
+            )
+        case "user_message":
+            if case .active = state.lifecycle {
+                state.lastEvidenceAt = max(
+                    state.lastEvidenceAt ?? .distantPast,
+                    timestamp ?? .distantPast
+                )
+            } else {
+                state.turnStartedAt = timestamp
+                state.lastEvidenceAt = timestamp
+            }
+            state.lifecycle = .active(
+                turnStartedAt: state.turnStartedAt,
+                lastEvidenceAt: state.lastEvidenceAt
+            )
+        case "agent_message"
+            where payload["phase"] as? String == "commentary":
+            if case .active = state.lifecycle {
+                state.lastEvidenceAt = max(
+                    state.lastEvidenceAt ?? .distantPast,
+                    timestamp ?? .distantPast
+                )
+            } else {
+                // If the initial tail began after task_started, commentary is
+                // still a safe active boundary for discovery. It is never
+                // allowed to override a later completion because completed
+                // state ignores token-only evidence above.
+                state.turnStartedAt = timestamp
+                state.lastEvidenceAt = timestamp
+            }
+            state.lifecycle = .active(
+                turnStartedAt: state.turnStartedAt,
+                lastEvidenceAt: state.lastEvidenceAt
+            )
+        case "task_complete",
+             "turn_aborted",
+             "task_aborted",
+             "task_cancelled",
+             "task_canceled",
+             "turn_cancelled",
+             "turn_canceled",
+             "task_failed",
+             "turn_failed",
+             "thread_rolled_back":
+            state.lifecycle = .completed(timestamp)
+        default:
+            break
+        }
     }
 
     private func codexRolloutURL(sessionId: String) -> URL? {
@@ -419,24 +1210,10 @@ actor ConversationParser {
            FileManager.default.fileExists(atPath: cached.path) {
             return cached
         }
-
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions", isDirectory: true)
-        let suffix = "-\(sessionId).jsonl"
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else {
-            return nil
-        }
-
-        for case let url as URL in enumerator
-        where url.lastPathComponent.hasSuffix(suffix) {
-            codexRolloutPaths[sessionId] = url
-            return url
-        }
-        return nil
+        codexRolloutPaths.removeValue(forKey: sessionId)
+        ensureCodexRolloutIndex()
+        refreshRecentCodexRolloutIndex()
+        return codexRolloutPaths[sessionId]
     }
 
     /// Parse JSONL content
@@ -623,7 +1400,10 @@ actor ConversationParser {
     /// Parse full conversation history for chat view (returns ALL messages - use sparingly)
     func parseFullConversation(sessionId: String, cwd: String) -> [ChatMessage] {
         if let native = nativeConversationURL(sessionId: sessionId, cwd: cwd) {
-            var state = IncrementalParseState()
+            // Explicit history loads may continue from the same cursor. Most
+            // importantly, routine metadata refreshes no longer reset this
+            // state and force another full rollout read.
+            var state = incrementalState[sessionId] ?? IncrementalParseState()
             _ = parseNativeNewLines(
                 filePath: native.url.path,
                 kind: native.kind,
@@ -654,12 +1434,16 @@ actor ConversationParser {
         let toolResults: [String: ToolResult]
         let structuredResults: [String: ToolResultData]
         let clearDetected: Bool
+        /// True when at least one complete JSONL row was consumed, including
+        /// metadata-only and tool-result rows that do not create chat messages.
+        let fileAdvanced: Bool
     }
 
     /// Parse only NEW messages since last call (efficient incremental updates)
     func parseIncremental(sessionId: String, cwd: String) -> IncrementalParseResult {
         if let native = nativeConversationURL(sessionId: sessionId, cwd: cwd) {
             var state = incrementalState[sessionId] ?? IncrementalParseState()
+            let previousOffset = state.lastFileOffset
             let newMessages = parseNativeNewLines(
                 filePath: native.url.path,
                 kind: native.kind,
@@ -672,7 +1456,8 @@ actor ConversationParser {
                 completedToolIds: [],
                 toolResults: [:],
                 structuredResults: [:],
-                clearDetected: false
+                clearDetected: false,
+                fileAdvanced: state.lastFileOffset != previousOffset
             )
         }
 
@@ -685,11 +1470,13 @@ actor ConversationParser {
                 completedToolIds: [],
                 toolResults: [:],
                 structuredResults: [:],
-                clearDetected: false
+                clearDetected: false,
+                fileAdvanced: false
             )
         }
 
         var state = incrementalState[sessionId] ?? IncrementalParseState()
+        let previousOffset = state.lastFileOffset
         let newMessages = parseNewLines(filePath: sessionFile, state: &state)
         let clearDetected = state.clearPending
         if clearDetected {
@@ -703,8 +1490,26 @@ actor ConversationParser {
             completedToolIds: state.completedToolIds,
             toolResults: state.toolResults,
             structuredResults: state.structuredResults,
-            clearDetected: clearDetected
+            clearDetected: clearDetected,
+            fileAdvanced: state.lastFileOffset != previousOffset
         )
+    }
+
+    /// Return only the complete UTF-8 JSONL prefix. Writers can be observed in
+    /// the middle of a row; advancing over that partial row loses it forever on
+    /// the next incremental read.
+    private nonisolated static func completeJSONLPrefix(
+        in data: Data
+    ) -> (text: String, byteCount: UInt64)? {
+        guard let newlineIndex = data.lastIndex(of: 0x0A) else {
+            return nil
+        }
+        let endIndex = data.index(after: newlineIndex)
+        let completeData = Data(data[..<endIndex])
+        guard let text = String(data: completeData, encoding: .utf8) else {
+            return nil
+        }
+        return (text, UInt64(completeData.count))
     }
 
     /// Parse only new lines since last read (incremental)
@@ -726,26 +1531,35 @@ actor ConversationParser {
         }
 
         if fileSize == state.lastFileOffset {
-            return state.messages
+            return []
         }
 
         do {
             try fileHandle.seek(toOffset: state.lastFileOffset)
         } catch {
-            return state.messages
+            return []
         }
 
+        let readOffset = state.lastFileOffset
         guard let newData = try? fileHandle.readToEnd(),
-              let newContent = String(data: newData, encoding: .utf8) else {
-            return state.messages
+              let completePrefix = Self.completeJSONLPrefix(in: newData) else {
+            return []
         }
 
         state.clearPending = false
-        let isIncrementalRead = state.lastFileOffset > 0
-        let lines = newContent.components(separatedBy: "\n")
+        let isIncrementalRead = readOffset > 0
+        let lines = completePrefix.text.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).dropLast()
         var newMessages: [ChatMessage] = []
+        var lineOffset = readOffset
 
-        for line in lines where !line.isEmpty {
+        for line in lines {
+            let lineLength = UInt64(line.utf8.count + 1)
+            defer { lineOffset += lineLength }
+            guard !line.isEmpty else { continue }
+
             if line.contains("<command-name>/clear</command-name>") {
                 state.messages = []
                 state.seenToolIds = []
@@ -756,7 +1570,7 @@ actor ConversationParser {
 
                 if isIncrementalRead {
                     state.clearPending = true
-                    state.lastClearOffset = state.lastFileOffset
+                    state.lastClearOffset = lineOffset
                     Self.logger.debug("/clear detected (new), will notify UI")
                 }
                 continue
@@ -810,7 +1624,7 @@ actor ConversationParser {
             }
         }
 
-        state.lastFileOffset = fileSize
+        state.lastFileOffset = readOffset + completePrefix.byteCount
         return newMessages
     }
 
@@ -914,52 +1728,131 @@ actor ConversationParser {
         if fileSize == state.lastFileOffset { return [] }
 
         let startOffset = state.lastFileOffset
-        guard (try? fileHandle.seek(toOffset: startOffset)) != nil,
-              let data = try? fileHandle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else {
+        guard (try? fileHandle.seek(toOffset: startOffset)) != nil else {
             return []
         }
 
+        // Rollouts contain large compacted/context rows that are irrelevant to
+        // the user-visible chat (individual rows can exceed 9 MB). Reading the
+        // whole remaining file into Data + String caused a large launch-time
+        // memory spike even after the repeated full-file scan was fixed. Keep
+        // only one incomplete JSONL row in memory and prefilter by the small set
+        // of row types we actually render before asking JSONSerialization to
+        // materialize an object graph.
+        let codexEventNeedle = Data("\"type\":\"event_msg\"".utf8)
+        let codexContextNeedle = Data("\"type\":\"turn_context\"".utf8)
+        let codexPayloadNeedles = [
+            Data("\"type\":\"user_message\"".utf8),
+            Data("\"type\":\"agent_message\"".utf8),
+            Data("\"type\":\"thread_settings_applied\"".utf8),
+        ]
+        let codeBuddyMessageNeedles = [
+            Data("\"type\":\"message\"".utf8),
+            Data("\"type\": \"message\"".utf8),
+        ]
+
         var newMessages: [ChatMessage] = []
-        var lineOffset = startOffset
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let lineLength = UInt64(line.utf8.count + 1)
-            defer { lineOffset += lineLength }
+        var pending = Data()
+        var pendingOffset = startOffset
+        let chunkSize = 256 * 1_024
 
-            guard let data = line.data(using: .utf8),
-                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
+        while true {
+            let chunk: Data
+            do {
+                guard let nextChunk = try fileHandle.read(
+                    upToCount: chunkSize
+                ), !nextChunk.isEmpty else {
+                    break
+                }
+                chunk = nextChunk
+            } catch {
+                break
+            }
+            pending.append(chunk)
+            var lineStart = pending.startIndex
+
+            while lineStart < pending.endIndex,
+                  let newline = pending[lineStart...].firstIndex(of: 0x0A) {
+                let lineRange = lineStart..<newline
+                let relativeOffset = pending.distance(
+                    from: pending.startIndex,
+                    to: lineStart
+                )
+                let lineOffset = pendingOffset + UInt64(relativeOffset)
+
+                let contains: (Data) -> Bool = { needle in
+                    pending.range(
+                        of: needle,
+                        options: [],
+                        in: lineRange
+                    ) != nil
+                }
+                let isRelevant: Bool
+                switch kind {
+                case .codex:
+                    isRelevant = !lineRange.isEmpty && (
+                        contains(codexContextNeedle) ||
+                        (contains(codexEventNeedle) &&
+                            codexPayloadNeedles.contains(where: contains))
+                    )
+                case .codeBuddy:
+                    isRelevant = !lineRange.isEmpty &&
+                        codeBuddyMessageNeedles.contains(where: contains)
+                }
+                if isRelevant {
+                    let lineData = pending.subdata(in: lineRange)
+                    if let row = try? JSONSerialization.jsonObject(
+                        with: lineData
+                    ) as? [String: Any] {
+                        if case .codex = kind,
+                           let mode = Self.codexApprovalMode(from: row) {
+                            state.nativeApprovalMode = mode
+                        }
+                        let parsed: (ChatRole, String, Date?)?
+                        switch kind {
+                        case .codex:
+                            parsed = Self.parseCodexNativeRow(row)
+                        case .codeBuddy:
+                            parsed = Self.parseCodeBuddyNativeRow(row)
+                        }
+
+                        if let (role, messageText, timestamp) = parsed {
+                            let cleaned = messageText.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            )
+                            if !cleaned.isEmpty {
+                                // The byte offset is stable across incremental
+                                // reads and unique for every native JSONL row.
+                                let message = ChatMessage(
+                                    id: "native-\(lineOffset)",
+                                    role: role,
+                                    timestamp: timestamp ?? Date(),
+                                    content: [.text(cleaned)]
+                                )
+                                state.messages.append(message)
+                                newMessages.append(message)
+                            }
+                        }
+                    }
+                }
+
+                lineStart = pending.index(after: newline)
             }
 
-            let parsed: (ChatRole, String, Date?)?
-            switch kind {
-            case .codex:
-                parsed = Self.parseCodexNativeRow(row)
-            case .codeBuddy:
-                parsed = Self.parseCodeBuddyNativeRow(row)
+            // Commit complete rows only. A writer may still be appending the
+            // final row; leaving it at the current file offset makes the next
+            // tick reread it rather than silently losing it.
+            if lineStart > pending.startIndex {
+                let consumed = pending.distance(
+                    from: pending.startIndex,
+                    to: lineStart
+                )
+                pending.removeSubrange(pending.startIndex..<lineStart)
+                pendingOffset += UInt64(consumed)
             }
-            guard let (role, messageText, timestamp) = parsed else { continue }
-
-            let cleaned = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleaned.isEmpty else { continue }
-
-            // The byte offset is stable across incremental reads and unique
-            // for each native JSONL row, so no actor-isolated hashing is
-            // needed here.
-            let id = "native-\(lineOffset)"
-            guard !state.messages.contains(where: { $0.id == id }) else { continue }
-
-            let message = ChatMessage(
-                id: id,
-                role: role,
-                timestamp: timestamp ?? Date(),
-                content: [.text(cleaned)]
-            )
-            state.messages.append(message)
-            newMessages.append(message)
         }
 
-        state.lastFileOffset = fileSize
+        state.lastFileOffset = pendingOffset
         return newMessages
     }
 

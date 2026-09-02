@@ -15,16 +15,29 @@
 		AA1000032F00000100A00101 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = AA1000132F00000100A00101 /* THIRD_PARTY_NOTICES.md */; };
 		AA1000042F00000100A00101 /* PRIVACY.md in Resources */ = {isa = PBXBuildFile; fileRef = AA1000142F00000100A00101 /* PRIVACY.md */; };
 		AA1000052F00000100A00101 /* AgentBridge in Resources */ = {isa = PBXBuildFile; fileRef = AA1000152F00000100A00101 /* AgentBridge */; };
+		AA1000062F00000100A00101 /* ThirdPartyLicenses in Resources */ = {isa = PBXBuildFile; fileRef = AA1000162F00000100A00101 /* ThirdPartyLicenses */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		FD33FD5D2EDF32D7002A6548 /* Claude Island.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Claude Island.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		BC1000012F10000100B00101 /* AgentNotchCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AgentNotchCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA1000112F00000100A00101 /* LICENSE.md */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE.md; sourceTree = "<group>"; };
 		AA1000122F00000100A00101 /* NOTICE */ = {isa = PBXFileReference; lastKnownFileType = text; path = NOTICE; sourceTree = "<group>"; };
 		AA1000132F00000100A00101 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
 		AA1000142F00000100A00101 /* PRIVACY.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = PRIVACY.md; sourceTree = "<group>"; };
 		AA1000152F00000100A00101 /* AgentBridge */ = {isa = PBXFileReference; lastKnownFileType = folder; path = AgentBridge; sourceTree = "<group>"; };
+		AA1000162F00000100A00101 /* ThirdPartyLicenses */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ThirdPartyLicenses; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXContainerItemProxy section */
+		BC1000022F10000100B00101 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FD33FD552EDF32D7002A6548 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FD33FD5C2EDF32D7002A6548;
+			remoteInfo = ClaudeIsland;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
 		FD33FD702EDF32D7002A6548 /* Exceptions for "ClaudeIsland" folder in "ClaudeIsland" target */ = {
@@ -45,9 +58,21 @@
 			path = ClaudeIsland;
 			sourceTree = "<group>";
 		};
+		BC1000032F10000100B00101 /* ClaudeIslandTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ClaudeIslandTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		BC1000042F10000100B00101 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		FD33FD5A2EDF32D7002A6548 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -64,11 +89,13 @@
 			isa = PBXGroup;
 			children = (
 				FD33FD5F2EDF32D7002A6548 /* ClaudeIsland */,
+				BC1000032F10000100B00101 /* ClaudeIslandTests */,
 				AA1000112F00000100A00101 /* LICENSE.md */,
 				AA1000122F00000100A00101 /* NOTICE */,
 				AA1000132F00000100A00101 /* THIRD_PARTY_NOTICES.md */,
 				AA1000142F00000100A00101 /* PRIVACY.md */,
 				AA1000152F00000100A00101 /* AgentBridge */,
+				AA1000162F00000100A00101 /* ThirdPartyLicenses */,
 				FD33FD5E2EDF32D7002A6548 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -77,6 +104,7 @@
 			isa = PBXGroup;
 			children = (
 				FD33FD5D2EDF32D7002A6548 /* Claude Island.app */,
+				BC1000012F10000100B00101 /* AgentNotchCoreTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -84,6 +112,29 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		BC1000052F10000100B00101 /* AgentNotchCoreTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BC10000B2F10000100B00101 /* Build configuration list for PBXNativeTarget "AgentNotchCoreTests" */;
+			buildPhases = (
+				BC1000062F10000100B00101 /* Sources */,
+				BC1000042F10000100B00101 /* Frameworks */,
+				BC1000072F10000100B00101 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				BC1000082F10000100B00101 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				BC1000032F10000100B00101 /* ClaudeIslandTests */,
+			);
+			name = AgentNotchCoreTests;
+			packageProductDependencies = (
+			);
+			productName = AgentNotchCoreTests;
+			productReference = BC1000012F10000100B00101 /* AgentNotchCoreTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		FD33FD5C2EDF32D7002A6548 /* ClaudeIsland */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = FD33FD682EDF32D8002A6548 /* Build configuration list for PBXNativeTarget "ClaudeIsland" */;
@@ -118,6 +169,10 @@
 				LastSwiftUpdateCheck = 2610;
 				LastUpgradeCheck = 2610;
 				TargetAttributes = {
+					BC1000052F10000100B00101 = {
+						CreatedOnToolsVersion = 26.1.1;
+						TestTargetID = FD33FD5C2EDF32D7002A6548;
+					};
 					FD33FD5C2EDF32D7002A6548 = {
 						CreatedOnToolsVersion = 26.1.1;
 					};
@@ -142,11 +197,19 @@
 			projectRoot = "";
 			targets = (
 				FD33FD5C2EDF32D7002A6548 /* ClaudeIsland */,
+				BC1000052F10000100B00101 /* AgentNotchCoreTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		BC1000072F10000100B00101 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		FD33FD5B2EDF32D7002A6548 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -156,12 +219,20 @@
 				AA1000032F00000100A00101 /* THIRD_PARTY_NOTICES.md in Resources */,
 				AA1000042F00000100A00101 /* PRIVACY.md in Resources */,
 				AA1000052F00000100A00101 /* AgentBridge in Resources */,
+				AA1000062F00000100A00101 /* ThirdPartyLicenses in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		BC1000062F10000100B00101 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		FD33FD592EDF32D7002A6548 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -172,6 +243,40 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
+		BC1000092F10000100B00101 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lihao505.AgentNotchCoreTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Agent Notch.app/Contents/MacOS/Agent Notch";
+			};
+			name = Debug;
+		};
+		BC10000A2F10000100B00101 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lihao505.AgentNotchCoreTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Agent Notch.app/Contents/MacOS/Agent Notch";
+			};
+			name = Release;
+		};
 		FD33FD662EDF32D8002A6548 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -361,6 +466,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		BC10000B2F10000100B00101 /* Build configuration list for PBXNativeTarget "AgentNotchCoreTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BC1000092F10000100B00101 /* Debug */,
+				BC10000A2F10000100B00101 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		FD33FD582EDF32D7002A6548 /* Build configuration list for PBXProject "ClaudeIsland" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -380,6 +494,14 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin PBXTargetDependency section */
+		BC1000082F10000100B00101 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FD33FD5C2EDF32D7002A6548 /* ClaudeIsland */;
+			targetProxy = BC1000022F10000100B00101 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCRemoteSwiftPackageReference section */
 		FD33FD712EDF32D7002A6548 /* XCRemoteSwiftPackageReference "swift-markdown" */ = {

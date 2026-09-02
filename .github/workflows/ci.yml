@@ -14,6 +14,15 @@ jobs:
         run: ./scripts/verify-release.sh
       - name: Test Agent Bridge
         run: python3 -B -m unittest discover -s AgentBridge/tests -v
+      - name: Test Swift lifecycle core
+        run: >
+          xcodebuild
+          -project ClaudeIsland.xcodeproj
+          -scheme ClaudeIsland
+          -configuration Debug
+          -destination 'platform=macOS'
+          CODE_SIGNING_ALLOWED=NO
+          test
       - name: Build Debug
         run: >
           xcodebuild

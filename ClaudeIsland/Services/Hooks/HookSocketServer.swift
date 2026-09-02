@@ -8,10 +8,11 @@
 //
 
 import Foundation
+import Darwin
 import os.log
 
 /// Logger for hook socket server
-private let logger = Logger(subsystem: "com.claudeisland", category: "Hooks")
+private let logger = Logger(subsystem: "com.agentnotch", category: "Hooks")
 
 /// Event received from Claude Code hooks
 struct HookEvent: Codable, Sendable {
@@ -19,6 +20,7 @@ struct HookEvent: Codable, Sendable {
     let cwd: String
     let event: String
     let status: String
+    let observedAt: TimeInterval?
     let source: String?
     let pid: Int?
     let tty: String?
@@ -32,6 +34,7 @@ struct HookEvent: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
         case cwd, event, status, source, pid, tty, tool
+        case observedAt = "observed_at"
         case toolInput = "tool_input"
         case toolUseId = "tool_use_id"
         case notificationType = "notification_type"
@@ -40,11 +43,12 @@ struct HookEvent: Codable, Sendable {
     }
 
     /// Create a copy with updated toolUseId
-    init(sessionId: String, cwd: String, event: String, status: String, source: String?, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?, responseTimeoutSeconds: Double? = nil) {
+    init(sessionId: String, cwd: String, event: String, status: String, observedAt: TimeInterval?, source: String?, pid: Int?, tty: String?, tool: String?, toolInput: [String: AnyCodable]?, toolUseId: String?, notificationType: String?, message: String?, responseTimeoutSeconds: Double? = nil) {
         self.sessionId = sessionId
         self.cwd = cwd
         self.event = event
         self.status = status
+        self.observedAt = observedAt
         self.source = source
         self.pid = pid
         self.tty = tty
@@ -125,13 +129,22 @@ typealias PermissionFailureHandler = @Sendable (_ sessionId: String, _ toolUseId
 /// Uses GCD DispatchSource for non-blocking I/O
 class HookSocketServer {
     static let shared = HookSocketServer()
-    static let socketPath = "/tmp/claude-island.sock"
+    static let socketPath: String = {
+        if let override = Foundation.ProcessInfo.processInfo.environment["AGENT_NOTCH_SOCKET"]?
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines),
+           !override.isEmpty {
+            return override
+        }
+        return "/tmp/agent-notch-\(getuid()).sock"
+    }()
+    private let path: String
 
     private var serverSocket: Int32 = -1
+    private var ownsSocketPath = false
     private var acceptSource: DispatchSourceRead?
     private var eventHandler: HookEventHandler?
     private var permissionFailureHandler: PermissionFailureHandler?
-    private let queue = DispatchQueue(label: "com.claudeisland.socket", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.agentnotch.socket", qos: .userInitiated)
 
     /// Pending permission requests indexed by toolUseId
     private var pendingPermissions: [String: PendingPermission] = [:]
@@ -143,7 +156,15 @@ class HookSocketServer {
     private var toolUseIdCache: [String: [String]] = [:]
     private let cacheLock = NSLock()
 
-    private init() {}
+    private convenience init() {
+        self.init(socketPath: Self.socketPath)
+    }
+
+    /// A dedicated path makes permission routing integration-testable without
+    /// touching the production app socket.
+    init(socketPath: String) {
+        self.path = socketPath
+    }
 
     /// Start the socket server
     func start(onEvent: @escaping HookEventHandler, onPermissionFailure: PermissionFailureHandler? = nil) {
@@ -158,7 +179,7 @@ class HookSocketServer {
         eventHandler = onEvent
         permissionFailureHandler = onPermissionFailure
 
-        unlink(Self.socketPath)
+        guard prepareSocketPath() else { return }
 
         serverSocket = socket(AF_UNIX, SOCK_STREAM, 0)
         guard serverSocket >= 0 else {
@@ -171,7 +192,15 @@ class HookSocketServer {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        Self.socketPath.withCString { ptr in
+        guard path.utf8.count < MemoryLayout.size(
+            ofValue: addr.sun_path
+        ) else {
+            logger.error("Socket path is too long")
+            close(serverSocket)
+            serverSocket = -1
+            return
+        }
+        path.withCString { ptr in
             withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
                 let pathBufferPtr = UnsafeMutableRawPointer(pathPtr)
                     .assumingMemoryBound(to: CChar.self)
@@ -191,17 +220,25 @@ class HookSocketServer {
             serverSocket = -1
             return
         }
+        ownsSocketPath = true
 
-        chmod(Self.socketPath, 0o600)
+        guard chmod(path, 0o600) == 0 else {
+            logger.error("Failed to restrict socket permissions: \(errno)")
+            close(serverSocket)
+            serverSocket = -1
+            unlinkOwnedSocketPath()
+            return
+        }
 
         guard listen(serverSocket, 10) == 0 else {
             logger.error("Failed to listen: \(errno)")
             close(serverSocket)
             serverSocket = -1
+            unlinkOwnedSocketPath()
             return
         }
 
-        logger.info("Listening on \(Self.socketPath, privacy: .public)")
+        logger.info("Listening on \(self.path, privacy: .public)")
 
         acceptSource = DispatchSource.makeReadSource(fileDescriptor: serverSocket, queue: queue)
         acceptSource?.setEventHandler { [weak self] in
@@ -220,7 +257,7 @@ class HookSocketServer {
     func stop() {
         acceptSource?.cancel()
         acceptSource = nil
-        unlink(Self.socketPath)
+        unlinkOwnedSocketPath()
 
         permissionsLock.lock()
         for (_, pending) in pendingPermissions {
@@ -230,6 +267,69 @@ class HookSocketServer {
         permissionsLock.unlock()
     }
 
+    /// Remove only a stale socket owned by this user. Never unlink another
+    /// running Agent Notch instance or an unrelated file/symlink in /tmp.
+    private func prepareSocketPath() -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            return errno == ENOENT
+        }
+
+        guard info.st_uid == getuid() else {
+            logger.error("Refusing socket path owned by another user")
+            return false
+        }
+
+        let fileType = info.st_mode & mode_t(S_IFMT)
+        guard fileType == mode_t(S_IFSOCK) else {
+            logger.error("Refusing non-socket path at \(self.path, privacy: .public)")
+            return false
+        }
+
+        if socketServerIsActive(at: path) {
+            logger.notice("Another Agent Notch instance already owns the socket")
+            return false
+        }
+
+        guard unlink(path) == 0 else {
+            logger.error("Failed to remove stale socket: \(errno)")
+            return false
+        }
+        return true
+    }
+
+    private func socketServerIsActive(at path: String) -> Bool {
+        let client = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard client >= 0 else { return false }
+        defer { close(client) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        guard path.utf8.count < MemoryLayout.size(ofValue: addr.sun_path) else {
+            logger.error("Socket path is too long")
+            return false
+        }
+        path.withCString { pointer in
+            withUnsafeMutablePointer(to: &addr.sun_path) { pathPointer in
+                UnsafeMutableRawPointer(pathPointer)
+                    .assumingMemoryBound(to: CChar.self)
+                    .initialize(from: pointer, count: path.utf8.count + 1)
+            }
+        }
+
+        return withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(client, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        } == 0
+    }
+
+    private func unlinkOwnedSocketPath() {
+        guard ownsSocketPath else { return }
+        unlink(path)
+        ownsSocketPath = false
+    }
+
     /// Respond to a pending permission request by toolUseId
     func respondToPermission(
         toolUseId: String,
@@ -237,7 +337,6 @@ class HookSocketServer {
         decision: String,
         reason: String? = nil,
         updatedInput: [String: AnyCodable]? = nil,
-        allowSessionFallback: Bool = true,
         completion: @escaping @Sendable (Bool) -> Void = { _ in }
     ) {
         queue.async { [weak self] in
@@ -247,32 +346,12 @@ class HookSocketServer {
             }
             let sent = self.sendPermissionResponse(
                 toolUseId: toolUseId,
+                sessionId: sessionId,
                 decision: decision,
                 reason: reason,
                 updatedInput: updatedInput
             )
-            || (
-                allowSessionFallback
-                && self.sendPermissionResponseBySession(
-                    sessionId: sessionId,
-                    decision: decision,
-                    reason: reason,
-                    updatedInput: updatedInput
-                )
-            )
             DispatchQueue.main.async { completion(sent) }
-        }
-    }
-
-    /// Respond to permission by sessionId (finds the most recent pending for that session)
-    func respondToPermissionBySession(sessionId: String, decision: String, reason: String? = nil) {
-        queue.async { [weak self] in
-            _ = self?.sendPermissionResponseBySession(
-                sessionId: sessionId,
-                decision: decision,
-                reason: reason,
-                updatedInput: nil
-            )
         }
     }
 
@@ -491,6 +570,7 @@ class HookSocketServer {
                 cwd: event.cwd,
                 event: event.event,
                 status: event.status,
+                observedAt: event.observedAt,
                 source: event.source,
                 pid: event.pid,
                 tty: event.tty,
@@ -535,16 +615,23 @@ class HookSocketServer {
     @discardableResult
     private func sendPermissionResponse(
         toolUseId: String,
+        sessionId: String,
         decision: String,
         reason: String?,
         updatedInput: [String: AnyCodable]? = nil
     ) -> Bool {
         permissionsLock.lock()
-        guard let pending = pendingPermissions.removeValue(forKey: toolUseId) else {
+        guard let pending = pendingPermissions[toolUseId] else {
             permissionsLock.unlock()
             logger.debug("No pending permission for toolUseId: \(toolUseId.prefix(12), privacy: .public)")
             return false
         }
+        guard pending.sessionId == sessionId else {
+            permissionsLock.unlock()
+            logger.error("Rejected cross-session permission response for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+            return false
+        }
+        pendingPermissions.removeValue(forKey: toolUseId)
         permissionsLock.unlock()
 
         let response = HookResponse(
@@ -583,52 +670,6 @@ class HookSocketServer {
         close(pending.clientSocket)
         logger.info("Expired unanswered permission for \(pending.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
         permissionFailureHandler?(pending.sessionId, toolUseId)
-    }
-
-    @discardableResult
-    private func sendPermissionResponseBySession(
-        sessionId: String,
-        decision: String,
-        reason: String?,
-        updatedInput: [String: AnyCodable]?
-    ) -> Bool {
-        permissionsLock.lock()
-        let matchingPending = pendingPermissions.values
-            .filter { $0.sessionId == sessionId }
-            .sorted { $0.receivedAt > $1.receivedAt }
-            .first
-
-        guard let pending = matchingPending else {
-            permissionsLock.unlock()
-            logger.debug("No pending permission for session: \(sessionId.prefix(8), privacy: .public)")
-            return false
-        }
-
-        pendingPermissions.removeValue(forKey: pending.toolUseId)
-        permissionsLock.unlock()
-
-        let response = HookResponse(
-            decision: decision,
-            reason: reason,
-            updatedInput: updatedInput
-        )
-        guard let data = try? JSONEncoder().encode(response) else {
-            close(pending.clientSocket)
-            permissionFailureHandler?(sessionId, pending.toolUseId)
-            return false
-        }
-
-        let age = Date().timeIntervalSince(pending.receivedAt)
-        logger.info("Sending response: \(decision, privacy: .public) for \(sessionId.prefix(8), privacy: .public) tool:\(pending.toolUseId.prefix(12), privacy: .public) (age: \(String(format: "%.1f", age), privacy: .public)s)")
-
-        let writeSuccess = writePermissionResponse(data, to: pending.clientSocket)
-
-        close(pending.clientSocket)
-
-        if !writeSuccess {
-            permissionFailureHandler?(sessionId, pending.toolUseId)
-        }
-        return writeSuccess
     }
 
     /// Permission clients wait in recv(), so switch their accepted socket back

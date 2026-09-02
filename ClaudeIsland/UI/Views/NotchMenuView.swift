@@ -18,106 +18,118 @@ struct NotchMenuView: View {
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var preferences = NotchPreferences.shared
     @State private var hooksInstalled: Bool = false
+    @State private var hooksNeedRepair: Bool = false
     @State private var launchAtLogin: Bool = false
 
     var body: some View {
         VStack(spacing: 12) {
             compactHeader
 
-            HStack(spacing: 10) {
-                PresenceModeButton(
-                    title: t("Stay Ready", "常驻显示"),
-                    icon: "sparkles",
-                    isSelected: preferences.idleBehavior == .alwaysVisible
-                ) {
-                    preferences.idleBehavior = .alwaysVisible
-                }
+            // The opened notch reserves part of its 390 pt height for the
+            // global header. Keep variable controls scrollable and pin the two
+            // critical actions below it; the old all-in-one VStack rendered
+            // the bottom buttons beyond SwiftUI's hit-test frame.
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        PresenceModeButton(
+                            title: t("Stay Ready", "常驻显示"),
+                            icon: "sparkles",
+                            isSelected: preferences.idleBehavior == .alwaysVisible
+                        ) {
+                            preferences.idleBehavior = .alwaysVisible
+                        }
 
-                PresenceModeButton(
-                    title: t("Smart Hide", "智能隐藏"),
-                    icon: "eye.slash",
-                    isSelected: preferences.idleBehavior == .smartHide
-                ) {
-                    preferences.idleBehavior = .smartHide
+                        PresenceModeButton(
+                            title: t("Smart Hide", "智能隐藏"),
+                            icon: "eye.slash",
+                            isSelected: preferences.idleBehavior == .smartHide
+                        ) {
+                            preferences.idleBehavior = .smartHide
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        Text(t("Small notch", "小刘海"))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.42))
+
+                        Spacer()
+
+                        compactStyleButton(.simple, title: t("Simple", "简略"))
+                        compactStyleButton(.detailed, title: t("Detailed", "详细"))
+                    }
+                    .padding(.horizontal, 3)
+
+                    HStack(spacing: 8) {
+                        Text(t("Default approvals", "默认审批"))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.42))
+
+                        Spacer()
+
+                        approvalModeButton(.ask, title: t("Once", "单次"))
+                        approvalModeButton(.auto, title: t("Auto", "自动"))
+                        approvalModeButton(.trusted, title: t("Fully trusted", "完全信任"))
+                    }
+                    .padding(.horizontal, 3)
+
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 10),
+                            GridItem(.flexible(), spacing: 10)
+                        ],
+                        spacing: 10
+                    ) {
+                        CompactControlTile(
+                            title: t("Hover", "悬停展开"),
+                            subtitle: preferences.expandOnHover
+                                ? String(format: "%.2fs", preferences.hoverDelay)
+                                : t("Off", "关闭"),
+                            icon: "cursorarrow.motionlines",
+                            isOn: preferences.expandOnHover
+                        ) {
+                            preferences.expandOnHover.toggle()
+                        }
+
+                        CompactControlTile(
+                            title: t("Usage", "用量"),
+                            subtitle: preferences.showUsageLimits
+                                ? t("Visible", "显示")
+                                : t("Hidden", "隐藏"),
+                            icon: "chart.bar.fill",
+                            isOn: preferences.showUsageLimits
+                        ) {
+                            preferences.showUsageLimits.toggle()
+                        }
+
+                        CompactControlTile(
+                            title: t("At Login", "登录启动"),
+                            subtitle: launchAtLogin
+                                ? t("Enabled", "已开启")
+                                : t("Disabled", "已关闭"),
+                            icon: "power",
+                            isOn: launchAtLogin
+                        ) {
+                            toggleLaunchAtLogin()
+                        }
+
+                        CompactControlTile(
+                            title: t("Agent Bridge", "智能体桥接"),
+                            subtitle: hooksNeedRepair
+                                ? t("Needs repair", "需要修复")
+                                : hooksInstalled
+                                    ? t("Connected", "已连接")
+                                    : t("Needs setup", "需要设置"),
+                            icon: "point.3.connected.trianglepath.dotted",
+                            isOn: hooksInstalled
+                        ) {
+                            toggleHooks()
+                        }
+                    }
                 }
             }
-
-            HStack(spacing: 8) {
-                Text(t("Small notch", "小刘海"))
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.42))
-
-                Spacer()
-
-                compactStyleButton(.simple, title: t("Simple", "简略"))
-                compactStyleButton(.detailed, title: t("Detailed", "详细"))
-            }
-            .padding(.horizontal, 3)
-
-            HStack(spacing: 8) {
-                Text(t("Default approvals", "默认审批"))
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.42))
-
-                Spacer()
-
-                approvalModeButton(.ask, title: t("Once", "单次"))
-                approvalModeButton(.auto, title: t("Auto", "自动"))
-                approvalModeButton(.trusted, title: t("Fully trusted", "完全信任"))
-            }
-            .padding(.horizontal, 3)
-
-            LazyVGrid(
-                columns: [
-                    GridItem(.flexible(), spacing: 10),
-                    GridItem(.flexible(), spacing: 10)
-                ],
-                spacing: 10
-            ) {
-                CompactControlTile(
-                    title: t("Hover", "悬停展开"),
-                    subtitle: preferences.expandOnHover
-                        ? String(format: "%.2fs", preferences.hoverDelay)
-                        : t("Off", "关闭"),
-                    icon: "cursorarrow.motionlines",
-                    isOn: preferences.expandOnHover
-                ) {
-                    preferences.expandOnHover.toggle()
-                }
-
-                CompactControlTile(
-                    title: t("Usage", "用量"),
-                    subtitle: preferences.showUsageLimits
-                        ? t("Visible", "显示")
-                        : t("Hidden", "隐藏"),
-                    icon: "chart.bar.fill",
-                    isOn: preferences.showUsageLimits
-                ) {
-                    preferences.showUsageLimits.toggle()
-                }
-
-                CompactControlTile(
-                    title: t("At Login", "登录启动"),
-                    subtitle: launchAtLogin
-                        ? t("Enabled", "已开启")
-                        : t("Disabled", "已关闭"),
-                    icon: "power",
-                    isOn: launchAtLogin
-                ) {
-                    toggleLaunchAtLogin()
-                }
-
-                CompactControlTile(
-                    title: t("Agent Bridge", "智能体桥接"),
-                    subtitle: hooksInstalled
-                        ? t("Connected", "已连接")
-                        : t("Needs setup", "需要设置"),
-                    icon: "point.3.connected.trianglepath.dotted",
-                    isOn: hooksInstalled
-                ) {
-                    toggleHooks()
-                }
-            }
+            .frame(maxHeight: .infinity)
 
             HStack(spacing: 10) {
                 Button {
@@ -178,7 +190,7 @@ struct NotchMenuView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    NSApplication.shared.terminate(nil)
+                    AppDelegate.shared?.quitCompletely()
                 } label: {
                     VStack(spacing: 4) {
                         Image(systemName: "power")
@@ -216,7 +228,8 @@ struct NotchMenuView: View {
     }
 
     private func refreshStates() {
-        hooksInstalled = HookInstaller.isInstalled()
+        hooksInstalled = HookInstaller.integrationsOptedIn
+        hooksNeedRepair = HookInstaller.integrationsNeedRepair
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
@@ -347,12 +360,23 @@ struct NotchMenuView: View {
     }
 
     private func toggleHooks() {
-        if hooksInstalled {
-            HookInstaller.uninstall()
-            hooksInstalled = false
-        } else {
-            HookInstaller.installIfNeeded()
-            hooksInstalled = true
+        let shouldEnable = !HookInstaller.integrationsOptedIn
+        HookInstaller.setIntegrationsOptIn(shouldEnable)
+        hooksInstalled = shouldEnable
+        hooksNeedRepair = shouldEnable
+        Task {
+            let succeeded = await Task.detached(priority: .userInitiated) {
+                if shouldEnable {
+                    return HookInstaller.installIfNeeded()
+                } else {
+                    return HookInstaller.uninstall()
+                }
+            }.value
+            if !shouldEnable, !succeeded {
+                HookInstaller.setIntegrationsOptIn(true)
+            }
+            hooksInstalled = HookInstaller.integrationsOptedIn
+            hooksNeedRepair = HookInstaller.integrationsNeedRepair
         }
     }
 }

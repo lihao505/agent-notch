@@ -9,9 +9,167 @@
 import Combine
 import SwiftUI
 
+private let maximumDisplayedCLICharacters = 200_000
+
+/// Pipe reads can split a multi-byte scalar at any byte boundary. Keep only an
+/// incomplete UTF-8 suffix between reads so Chinese and emoji are never turned
+/// into replacement characters in a partial/cancelled CLI response.
+private struct CLIIncrementalUTF8Decoder {
+    private var pending: [UInt8] = []
+
+    mutating func append(_ data: Data) -> String {
+        guard !data.isEmpty else { return "" }
+        var bytes = pending
+        bytes.append(contentsOf: data)
+        let completeCount = Self.completePrefixLength(bytes)
+        pending = Array(bytes.dropFirst(completeCount))
+        return String(decoding: bytes.prefix(completeCount), as: UTF8.self)
+    }
+
+    mutating func finish() -> String {
+        defer { pending.removeAll(keepingCapacity: false) }
+        return String(decoding: pending, as: UTF8.self)
+    }
+
+    private static func completePrefixLength(_ bytes: [UInt8]) -> Int {
+        var index = 0
+        while index < bytes.count {
+            let first = bytes[index]
+            let width: Int
+            switch first {
+            case 0x00...0x7F:
+                width = 1
+            case 0xC2...0xDF:
+                width = 2
+            case 0xE0...0xEF:
+                width = 3
+            case 0xF0...0xF4:
+                width = 4
+            default:
+                // Consume malformed standalone bytes now. String(decoding:)
+                // will represent them consistently as U+FFFD.
+                index += 1
+                continue
+            }
+
+            let available = min(width, bytes.count - index)
+            var existingContinuationBytesAreValid = true
+            if available > 1 {
+                for offset in 1..<available
+                where (bytes[index + offset] & 0xC0) != 0x80 {
+                    existingContinuationBytesAreValid = false
+                    break
+                }
+            }
+            if !existingContinuationBytesAreValid {
+                index += 1
+                continue
+            }
+            guard available == width else { break }
+            index += width
+        }
+        return index
+    }
+}
+
+/// Coalesces pipe callbacks into a bounded, already-cleaned text snapshot.
+/// The pipe reader can therefore keep draining without queueing one unbounded
+/// MainActor job per chunk, while UTF-8 and split ANSI sequences remain intact.
+private final class CLIStreamTextAccumulator: @unchecked Sendable {
+    private enum ANSIState {
+        case text
+        case escape
+        case controlSequence
+    }
+
+    private let lock = NSLock()
+    private var decoder = CLIIncrementalUTF8Decoder()
+    private var ansiState = ANSIState.text
+    private var output = ""
+    private var outputCharacterCount = 0
+    private var wasTruncated = false
+    private var isFinished = false
+
+    func append(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished else { return }
+        appendDecoded(decoder.append(data))
+    }
+
+    @discardableResult
+    func finish() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        if !isFinished {
+            appendDecoded(decoder.finish())
+            isFinished = true
+        }
+        return snapshotLocked()
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return snapshotLocked()
+    }
+
+    private func appendDecoded(_ text: String) {
+        guard !text.isEmpty else { return }
+        var visible = ""
+        visible.reserveCapacity(text.utf8.count)
+
+        for scalar in text.unicodeScalars {
+            switch ansiState {
+            case .text:
+                if scalar.value == 0x1B {
+                    ansiState = .escape
+                } else {
+                    visible.unicodeScalars.append(scalar)
+                }
+            case .escape:
+                if scalar.value == 0x5B { // "[" begins an ANSI CSI sequence.
+                    ansiState = .controlSequence
+                } else {
+                    // Match the previous regex behavior: only CSI escapes are
+                    // display formatting. Preserve any other escaped text.
+                    visible.unicodeScalars.append(UnicodeScalar(0x1B)!)
+                    visible.unicodeScalars.append(scalar)
+                    ansiState = .text
+                }
+            case .controlSequence:
+                if scalar.value == 0x1B {
+                    ansiState = .escape
+                } else if (0x40...0x7E).contains(scalar.value) {
+                    ansiState = .text
+                }
+            }
+        }
+
+        guard !visible.isEmpty else { return }
+        output.append(visible)
+        outputCharacterCount += visible.count
+        guard outputCharacterCount > maximumDisplayedCLICharacters else {
+            return
+        }
+
+        // Trim in a sizeable batch so a long-running verbose CLI remains O(n)
+        // instead of moving the retained String for every subsequent chunk.
+        let retainedCharacters = maximumDisplayedCLICharacters * 3 / 4
+        output = String(output.suffix(retainedCharacters))
+        outputCharacterCount = output.count
+        wasTruncated = true
+    }
+
+    private func snapshotLocked() -> String {
+        wasTruncated ? "…\n" + output : output
+    }
+}
+
 struct ChatView: View {
     private enum ChatSendResult {
         case success(output: String)
+        case cancelled
         case failure(String)
     }
 
@@ -32,6 +190,8 @@ struct ChatView: View {
     @State private var previousHistoryCount: Int = 0
     @State private var isBottomVisible: Bool = true
     @State private var isSendingMessage: Bool = false
+    @State private var sendTask: Task<Void, Never>?
+    @State private var activeSendGeneration: UUID?
     @State private var sendErrorMessage: String?
     @FocusState private var isInputFocused: Bool
 
@@ -87,7 +247,7 @@ struct ChatView: View {
                 // Messages
                 if isLoading {
                     loadingState
-                } else if history.isEmpty {
+                } else if displayedHistory.isEmpty {
                     emptyState
                 } else {
                     messageList
@@ -145,9 +305,9 @@ struct ChatView: View {
                 // flight. Preserve optimistic CLI rows until an equivalent
                 // native row lands instead of making the user's message blink
                 // out of the notch.
-                let mergedHistory = mergeHistory(
-                    newHistory,
-                    preservingCLIItemsFrom: history
+                let mergedHistory = ChatHistoryManager.shared.reconcile(
+                    nativeHistory: newHistory,
+                    optimisticHistory: history
                 )
                 let countChanged = mergedHistory.count != history.count
                 let lastItemChanged = mergedHistory.last?.id != history.last?.id
@@ -449,7 +609,7 @@ struct ChatView: View {
                             ))
                     }
 
-                    ForEach(history.reversed()) { item in
+                    ForEach(displayedHistory.reversed()) { item in
                         MessageItemView(
                             item: item,
                             sessionId: sessionId,
@@ -466,7 +626,7 @@ struct ChatView: View {
                 .padding(.top, 20)
                 .padding(.bottom, 20)
                 .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isProcessing)
-                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: history.count)
+                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: displayedHistory.count)
             }
             .scaleEffect(x: 1, y: -1)
             .onScrollGeometryChange(for: Bool.self) { geometry in
@@ -515,16 +675,32 @@ struct ChatView: View {
 
     // MARK: - Input Bar
 
+    /// Keep the notch conversation focused on actual user/assistant messages.
+    /// Routine tool telemetry (especially repeated Bash rows) remains in the
+    /// native transcript, while a tool that currently needs approval stays
+    /// visible so the user can still inspect why approval is required.
+    private var displayedHistory: [ChatHistoryItem] {
+        history.filter { item in
+            switch item.type {
+            case .user, .assistant, .image, .interrupted:
+                return true
+            case .toolCall(let tool):
+                return tool.status == .waitingForApproval
+            case .thinking:
+                return false
+            }
+        }
+    }
+
     /// Claude/CLI agents receive keystrokes through tmux. Desktop-backed
     /// sessions are resumed non-interactively through their local CLIs.
     private var canSendMessages: Bool {
         guard !isSendingMessage else { return false }
 
         if session.source == .codex || session.source == .codebuddy {
-            let executable = session.source == .codex
-                ? codexExecutablePath
-                : codeBuddyExecutablePath
-            guard executable != nil else { return false }
+            guard AgentTransportRouter.isAvailable(for: session.source) else {
+                return false
+            }
             switch session.phase {
             // Codex/CodeBuddy sessions remain resumable after the desktop
             // process reports `ended`; the CLI resume command is precisely
@@ -547,12 +723,12 @@ struct ChatView: View {
             return "Sending to \(session.source.displayName)..."
         }
         if session.source == .codex {
-            return codexExecutablePath == nil
+            return !AgentTransportRouter.isAvailable(for: .codex)
                 ? "Install Codex CLI to enable messaging"
                 : "Wait for Codex to finish"
         }
         if session.source == .codebuddy {
-            return codeBuddyExecutablePath == nil
+            return !AgentTransportRouter.isAvailable(for: .codebuddy)
                 ? "Install CodeBuddy CLI to enable messaging"
                 : "Wait for CodeBuddy to finish"
         }
@@ -588,13 +764,16 @@ struct ChatView: View {
                 }
 
                 Button {
-                    sendMessage()
+                    if isSendingMessage {
+                        sendTask?.cancel()
+                    } else {
+                        sendMessage()
+                    }
                 } label: {
                     if isSendingMessage {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(session.source.accentColor)
-                            .frame(width: 28, height: 28)
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(session.source.accentColor)
                     } else {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.system(size: 28))
@@ -606,7 +785,16 @@ struct ChatView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(!canSendMessages || inputText.isEmpty)
+                .disabled(
+                    isSendingMessage
+                        ? false
+                        : (!canSendMessages || inputText.isEmpty)
+                )
+                .help(
+                    isSendingMessage
+                        ? t("Stop this reply", "停止本次回复")
+                        : t("Send", "发送")
+                )
             }
 
             if let sendErrorMessage {
@@ -657,11 +845,15 @@ struct ChatView: View {
                 onSubmitAnswers: { answers in
                     sessionMonitor.answerQuestions(
                         sessionId: sessionId,
+                        expectedToolUseId: permission.toolUseId,
                         answers: answers
                     )
                 },
                 onApprovePlan: {
-                    sessionMonitor.approvePlan(sessionId: sessionId)
+                    sessionMonitor.approvePlan(
+                        sessionId: sessionId,
+                        expectedToolUseId: permission.toolUseId
+                    )
                 },
                 onDeny: { denyPermission() },
                 onGoToTerminal: { focusTerminal() }
@@ -727,6 +919,7 @@ struct ChatView: View {
         shouldScrollToBottom = true
         isSendingMessage = true
         sendErrorMessage = nil
+        inputText = ""
 
         // Add the exact text sent to the CLI immediately. The response is
         // appended from CLI stdout below; no desktop transcript round-trip is
@@ -738,24 +931,72 @@ struct ChatView: View {
             timestamp: Date()
         ))
 
-        Task {
-            switch await sendToSession(text) {
-            case .failure(let errorMessage):
-                history.removeAll { $0.id == optimisticUserId }
-                sendErrorMessage = errorMessage
-            case .success(let output):
-                inputText = ""
+        let assistantId = "cli-assistant-\(UUID().uuidString)"
+        let generation = UUID()
+        activeSendGeneration = generation
+        let stdoutAccumulator = CLIStreamTextAccumulator()
+        let (stdoutSignals, stdoutContinuation) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let task = Task { @MainActor in
+            // The accumulator owns every byte; AsyncStream only coalesces wakeup
+            // signals. Dropping an intermediate signal therefore never drops
+            // CLI text or splits a UTF-8 scalar.
+            let streamConsumer = Task { @MainActor in
+                await consumeCLIStdout(
+                    stdoutSignals,
+                    accumulator: stdoutAccumulator,
+                    assistantId: assistantId,
+                    generation: generation
+                )
+            }
 
+            defer {
+                if activeSendGeneration == generation {
+                    activeSendGeneration = nil
+                    isSendingMessage = false
+                    sendTask = nil
+                }
+            }
+
+            let result = await sendToSession(text, onStdoutChunk: { data in
+                stdoutAccumulator.append(data)
+                stdoutContinuation.yield(())
+            })
+            stdoutAccumulator.finish()
+            stdoutContinuation.finish()
+            let streamedOutput = await streamConsumer.value
+
+            // A future send must never receive a late callback from this one.
+            guard activeSendGeneration == generation else { return }
+
+            switch result {
+            case .failure(let errorMessage):
+                if cleanedCLIOutput(streamedOutput).isEmpty {
+                    history.removeAll { $0.id == optimisticUserId }
+                    inputText = text
+                }
+                sendErrorMessage = errorMessage
+            case .cancelled:
+                history.append(ChatHistoryItem(
+                    id: "cli-interrupted-\(UUID().uuidString)",
+                    type: .interrupted,
+                    timestamp: Date()
+                ))
+                sendErrorMessage = t(
+                    "Reply stopped. The CLI session remains available.",
+                    "已停止本次回复，CLI 会话仍可继续。"
+                )
+            case .success(let output):
                 // This is intentionally a CLI-only chat path. Render the
                 // actual CLI response directly instead of depending on a
                 // desktop app's native transcript watcher.
                 let assistantText = cleanedCLIOutput(output)
                 if !assistantText.isEmpty {
-                    history.append(ChatHistoryItem(
-                        id: "cli-assistant-\(UUID().uuidString)",
-                        type: .assistant(assistantText),
-                        timestamp: Date()
-                    ))
+                    upsertCLIAssistant(
+                        id: assistantId,
+                        text: assistantText
+                    )
                     shouldScrollToBottom = true
                 }
 
@@ -773,213 +1014,207 @@ struct ChatView: View {
                     }
                 }
             }
-            isSendingMessage = false
         }
+        sendTask = task
     }
 
-    private func sendToSession(_ text: String) async -> ChatSendResult {
-        if session.source == .codex {
-            guard let executable = codexExecutablePath else {
-                return .failure("Codex CLI was not found.")
-            }
-            do {
-                let output = try await ProcessExecutor.shared.runCapturingOutput(
-                    executable,
-                    arguments: [
-                        "exec", "resume",
-                        "--all",
-                        "--skip-git-repo-check",
-                        sessionId,
-                        "-"
-                    ],
-                    standardInput: text + "\n",
-                    currentDirectoryPath: session.cwd,
-                    timeoutSeconds: 600
+    private func sendToSession(
+        _ text: String,
+        onStdoutChunk: @escaping @Sendable (Data) -> Void
+    ) async -> ChatSendResult {
+        do {
+            let output = try await AgentTransportRouter.send(
+                text,
+                to: session,
+                onStdoutChunk: onStdoutChunk
+            )
+            return .success(output: output)
+        } catch ProcessExecutorError.cancelled(_) {
+            return .cancelled
+        } catch let transportError as AgentTransportError {
+            return .failure(transportError.localizedDescription)
+        } catch {
+            return .failure(
+                cliFailureMessage(
+                    agentName: session.source.displayName,
+                    error: error
                 )
-                return .success(output: output)
-            } catch {
-                return .failure("Could not send to Codex: \(error.localizedDescription)")
-            }
+            )
         }
+    }
 
-        if session.source == .codebuddy {
-            guard let executable = codeBuddyExecutablePath else {
-                return .failure("CodeBuddy CLI was not found.")
-            }
-            do {
-                let output = try await ProcessExecutor.shared.runCapturingOutput(
-                    executable,
-                    arguments: [
-                        "--resume", sessionId,
-                        "--print"
-                    ],
-                    standardInput: text + "\n",
-                    currentDirectoryPath: session.cwd,
-                    timeoutSeconds: 600
+    /// Present the actionable end of a CLI failure instead of its complete
+    /// diagnostic stream. Codex can emit benign cache warnings before the real
+    /// terminal error; showing the entire stderr both hides that error in the
+    /// two-line notch UI and can expose unrelated command diagnostics.
+    private func cliFailureMessage(agentName: String, error: Error) -> String {
+        let detail: String
+        switch error {
+        case ProcessExecutorError.executionFailed(_, let exitCode, let stderr):
+            detail = actionableCLIStderr(stderr)
+                ?? t(
+                    "The CLI exited with code \(exitCode).",
+                    "CLI 已退出（代码 \(exitCode)）。"
                 )
-                return .success(output: output)
-            } catch {
-                return .failure("Could not send to CodeBuddy: \(error.localizedDescription)")
-            }
-        }
-
-        guard session.isInTmux else {
-            return .failure("This agent is not connected through tmux.")
-        }
-
-        if let target = await findTmuxTarget(for: session) {
-            let sent = await ToolApprovalHandler.shared.sendMessage(text, to: target)
-            return sent ? .success(output: "") : .failure("Could not send the message to tmux.")
-        }
-        return .failure("Could not find the agent's tmux pane.")
-    }
-
-    private func mergeHistory(
-        _ nativeHistory: [ChatHistoryItem],
-        preservingCLIItemsFrom currentHistory: [ChatHistoryItem]
-    ) -> [ChatHistoryItem] {
-        var merged = nativeHistory
-        let nativeMessageItems = nativeHistory.filter { messageTextAndRole(for: $0) != nil }
-
-        for item in currentHistory where item.id.hasPrefix("cli-") {
-            guard let (role, text) = messageTextAndRole(for: item) else { continue }
-            let hasNativeEquivalent = nativeMessageItems.contains { nativeItem in
-                guard let (nativeRole, nativeText) = messageTextAndRole(for: nativeItem) else {
-                    return false
-                }
-                return nativeRole == role
-                    && nativeText == text
-                    && abs(nativeItem.timestamp.timeIntervalSince(item.timestamp)) < 300
-            }
-            if !hasNativeEquivalent {
-                merged.append(item)
-            }
-        }
-
-        return merged.sorted { $0.timestamp < $1.timestamp }
-    }
-
-    private func messageTextAndRole(for item: ChatHistoryItem) -> (String, String)? {
-        let role: String
-        let rawText: String
-        switch item.type {
-        case .user(let text):
-            role = "user"
-            rawText = text
-        case .assistant(let text):
-            role = "assistant"
-            rawText = text
+        case ProcessExecutorError.commandNotFound:
+            detail = t("The CLI was not found.", "未找到 CLI。")
+        case ProcessExecutorError.timedOut(_, let seconds):
+            detail = t(
+                "The reply timed out after \(seconds) seconds.",
+                "回复在 \(seconds) 秒后超时。"
+            )
+        case ProcessExecutorError.launchFailed(_, let underlying):
+            detail = t(
+                "The CLI could not start: \(conciseErrorLine(underlying.localizedDescription))",
+                "CLI 无法启动：\(conciseErrorLine(underlying.localizedDescription))"
+            )
+        case ProcessExecutorError.standardInputFailed(_, let reason):
+            detail = t(
+                "The CLI stopped accepting input: \(conciseErrorLine(reason))",
+                "CLI 未能接收输入：\(conciseErrorLine(reason))"
+            )
+        case ProcessExecutorError.invalidOutput:
+            detail = t("The CLI returned invalid output.", "CLI 返回了无效输出。")
+        case ProcessExecutorError.cancelled:
+            detail = t("The reply was stopped.", "回复已停止。")
         default:
-            return nil
+            detail = conciseErrorLine(error.localizedDescription)
         }
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : (role, text)
+
+        return t(
+            "Could not send to \(agentName): \(detail)",
+            "无法发送到 \(agentName)：\(detail)"
+        )
+    }
+
+    private func actionableCLIStderr(_ stderr: String?) -> String? {
+        guard let stderr else { return nil }
+        let lines = cleanedCLIOutput(stderr)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+
+        // Quota exhaustion is common and fully actionable. Prefer it over
+        // preceding WARN lines such as a stale model-cache diagnostic.
+        if let quotaLine = lines.last(where: { line in
+            let lowercased = line.lowercased()
+            return lowercased.contains("usage limit")
+                || lowercased.contains("quota exceeded")
+        }) {
+            let normalized = stripErrorPrefix(quotaLine)
+            if let resetRange = normalized.range(
+                of: "try again at ",
+                options: [.caseInsensitive]
+            ) {
+                let resetTime = normalized[resetRange.upperBound...]
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+                if !resetTime.isEmpty {
+                    return t(
+                        "Usage limit reached. Try again at \(resetTime).",
+                        "用量已耗尽，请在 \(resetTime) 后重试。"
+                    )
+                }
+            }
+            return t("Usage limit reached.", "用量已耗尽，请稍后重试。")
+        }
+
+        let actionable = lines.last(where: { line in
+            let lowercased = line.lowercased()
+            return lowercased.hasPrefix("error:")
+                || lowercased.hasPrefix("fatal:")
+                || lowercased.contains("permission denied")
+                || lowercased.contains("rate limit")
+        }) ?? lines.last!
+        return conciseErrorLine(stripErrorPrefix(actionable))
+    }
+
+    private func stripErrorPrefix(_ line: String) -> String {
+        let prefixes = ["ERROR:", "Error:", "error:", "FATAL:", "Fatal:", "fatal:"]
+        for prefix in prefixes where line.hasPrefix(prefix) {
+            return line.dropFirst(prefix.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return line
+    }
+
+    private func conciseErrorLine(_ text: String) -> String {
+        let singleLine = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let maximumCharacters = 360
+        guard singleLine.count > maximumCharacters else { return singleLine }
+        return String(singleLine.prefix(maximumCharacters - 1)) + "…"
+    }
+
+    private func consumeCLIStdout(
+        _ stream: AsyncStream<Void>,
+        accumulator: CLIStreamTextAccumulator,
+        assistantId: String,
+        generation: UUID
+    ) async -> String {
+        for await _ in stream {
+            guard activeSendGeneration == generation else { continue }
+            let visibleText = accumulator.snapshot().trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard !visibleText.isEmpty else { continue }
+            upsertCLIAssistant(id: assistantId, text: visibleText)
+            shouldScrollToBottom = true
+
+            // SwiftUI only needs a human-visible refresh cadence. While this
+            // task is suspended, bufferingNewest(1) coalesces any number of
+            // pipe reads into one follow-up snapshot.
+            try? await Task.sleep(nanoseconds: 75_000_000)
+        }
+
+        let output = accumulator.finish().trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if activeSendGeneration == generation {
+            if !output.isEmpty {
+                upsertCLIAssistant(id: assistantId, text: output)
+                shouldScrollToBottom = true
+            }
+        }
+        return output
+    }
+
+    @MainActor
+    private func upsertCLIAssistant(id: String, text: String) {
+        let timestamp: Date
+        if let index = history.firstIndex(where: { $0.id == id }) {
+            timestamp = history[index].timestamp
+            history[index] = ChatHistoryItem(
+                id: id,
+                type: .assistant(text),
+                timestamp: timestamp
+            )
+        } else {
+            history.append(ChatHistoryItem(
+                id: id,
+                type: .assistant(text),
+                timestamp: Date()
+            ))
+        }
     }
 
     private func cleanedCLIOutput(_ output: String) -> String {
-        output
+        let cleaned = output
             .replacingOccurrences(
                 of: "\u{001B}\\[[0-?]*[ -/]*[@-~]",
                 with: "",
                 options: .regularExpression
             )
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.count > maximumDisplayedCLICharacters else {
+            return cleaned
+        }
+        return "…\n" + String(
+            cleaned.suffix(maximumDisplayedCLICharacters)
+        )
     }
 
-    private var codexExecutablePath: String? {
-        let fileManager = FileManager.default
-        let home = fileManager.homeDirectoryForCurrentUser.path
-        var candidates = [
-            "/opt/homebrew/bin/codex",
-            "/usr/local/bin/codex",
-            "\(home)/.local/bin/codex"
-        ]
-
-        if let path = Foundation.ProcessInfo.processInfo.environment["PATH"] {
-            candidates.append(contentsOf: path
-                .split(separator: ":")
-                .map { "\($0)/codex" })
-        }
-
-        return candidates.first {
-            fileManager.isExecutableFile(atPath: $0)
-        }
-    }
-
-    private var codeBuddyExecutablePath: String? {
-        let fileManager = FileManager.default
-        let home = fileManager.homeDirectoryForCurrentUser.path
-        var candidates = [
-            "/opt/homebrew/bin/codebuddy",
-            "/usr/local/bin/codebuddy",
-            "\(home)/.local/bin/codebuddy"
-        ]
-
-        if let path = Foundation.ProcessInfo.processInfo.environment["PATH"] {
-            candidates.append(contentsOf: path
-                .split(separator: ":")
-                .map { "\($0)/codebuddy" })
-        }
-
-        return candidates.first {
-            fileManager.isExecutableFile(atPath: $0)
-        }
-    }
-
-    private func findTmuxTarget(for session: SessionState) async -> TmuxTarget? {
-        // Hook TTYs can change when a terminal is reattached. Prefer the
-        // exact TTY, then fall back to the tracked process and cwd so a stale
-        // hook value cannot make the chat input appear broken.
-        if let tty = session.tty,
-           let target = await findTmuxTarget(tty: tty) {
-            return target
-        }
-
-        if let pid = session.pid,
-           let target = await TmuxController.shared.findTmuxTarget(
-               forClaudePid: pid
-           ) {
-            return target
-        }
-
-        if !session.cwd.isEmpty {
-            return await TmuxController.shared.findTmuxTarget(
-                forWorkingDirectory: session.cwd
-            )
-        }
-
-        return nil
-    }
-
-    private func findTmuxTarget(tty: String) async -> TmuxTarget? {
-        guard let tmuxPath = await TmuxPathFinder.shared.getTmuxPath() else {
-            return nil
-        }
-
-        do {
-            let output = try await ProcessExecutor.shared.run(
-                tmuxPath,
-                arguments: ["list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index} #{pane_tty}"]
-            )
-
-            let lines = output.components(separatedBy: "\n")
-            for line in lines {
-                let parts = line.components(separatedBy: " ")
-                guard parts.count >= 2 else { continue }
-
-                let target = parts[0]
-                let paneTty = parts[1].replacingOccurrences(of: "/dev/", with: "")
-
-                if paneTty == tty {
-                    return TmuxTarget(from: target)
-                }
-            }
-        } catch {
-            return nil
-        }
-
-        return nil
-    }
 }
 
 // MARK: - Message Item View
