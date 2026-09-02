@@ -2,7 +2,7 @@ import XCTest
 @testable import Agent_Notch
 
 final class ConversationReconciliationTests: XCTestCase {
-    func testNativeMessageReplacesEquivalentOptimisticMessage() {
+    func testNativeMessageReplacesEquivalentOptimisticMessage() async {
         let timestamp = Date()
         let optimistic = ChatHistoryItem(
             id: "cli-user-test",
@@ -15,25 +15,29 @@ final class ConversationReconciliationTests: XCTestCase {
             timestamp: timestamp.addingTimeInterval(1)
         )
 
-        let result = ChatHistoryManager.shared.reconcile(
-            nativeHistory: [native],
-            optimisticHistory: [optimistic]
-        )
+        let result = await MainActor.run {
+            ChatHistoryManager.shared.reconcile(
+                nativeHistory: [native],
+                optimisticHistory: [optimistic]
+            )
+        }
 
         XCTAssertEqual(result.map(\.id), ["native-user-test"])
     }
 
-    func testUnmatchedOptimisticMessageSurvivesReconciliation() {
+    func testUnmatchedOptimisticMessageSurvivesReconciliation() async {
         let optimistic = ChatHistoryItem(
             id: "cli-assistant-test",
             type: .assistant("streamed reply"),
             timestamp: Date()
         )
 
-        let result = ChatHistoryManager.shared.reconcile(
-            nativeHistory: [],
-            optimisticHistory: [optimistic]
-        )
+        let result = await MainActor.run {
+            ChatHistoryManager.shared.reconcile(
+                nativeHistory: [],
+                optimisticHistory: [optimistic]
+            )
+        }
 
         XCTAssertEqual(result.map(\.id), ["cli-assistant-test"])
     }
