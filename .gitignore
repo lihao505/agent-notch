@@ -13,6 +13,8 @@ xcuserdata/
 Packages/
 Package.resolved
 *.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+!ClaudeIsland.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+!ClaudeIsland.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # CocoaPods
 Pods/
