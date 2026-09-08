@@ -8,7 +8,8 @@ final class SessionStoreLifecycleTests: XCTestCase {
         status: String,
         observedAt: Date,
         tool: String? = nil,
-        toolUseId: String? = nil
+        toolUseId: String? = nil,
+        notificationType: String? = nil
     ) -> HookEvent {
         HookEvent(
             sessionId: sessionId,
@@ -22,7 +23,7 @@ final class SessionStoreLifecycleTests: XCTestCase {
             tool: tool,
             toolInput: nil,
             toolUseId: toolUseId,
-            notificationType: nil,
+            notificationType: notificationType,
             message: nil
         )
     }
@@ -137,6 +138,50 @@ final class SessionStoreLifecycleTests: XCTestCase {
         XCTAssertEqual(
             try XCTUnwrap(session.completedAt).timeIntervalSince1970,
             observedAt.timeIntervalSince1970,
+            accuracy: 0.001
+        )
+    }
+
+    func testInformationalNotificationDoesNotSuppressCompletion() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "neutral-notification-\(UUID().uuidString)"
+        let now = Date()
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now.addingTimeInterval(-3)
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "Notification",
+            status: "notification",
+            observedAt: now.addingTimeInterval(-1),
+            notificationType: "auth_success"
+        )))
+
+        var storedSession = await store.session(for: sessionId)
+        var session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+
+        let completionAt = now.addingTimeInterval(-2)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "Stop",
+            status: "waiting_for_input",
+            observedAt: completionAt
+        )))
+
+        storedSession = await store.session(for: sessionId)
+        session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .waitingForInput)
+        XCTAssertEqual(
+            try XCTUnwrap(session.completedAt).timeIntervalSince1970,
+            completionAt.timeIntervalSince1970,
             accuracy: 0.001
         )
     }

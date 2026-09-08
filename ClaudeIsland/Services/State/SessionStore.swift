@@ -218,11 +218,13 @@ actor SessionStore {
             from: event,
             observedAt: observedAt
         )
-        let shouldApplyLifecycle = session.lastHookEventAt.map {
+        let newPhase = event.determinePhase()
+        let isCurrentObservation = session.lastHookEventAt.map {
             observedAt >= $0
         } ?? true
+        let shouldApplyLifecycle = isCurrentObservation && newPhase != nil
 
-        if shouldApplyLifecycle {
+        if isCurrentObservation {
             let normalizedTTY = event.tty?.replacingOccurrences(
                 of: "/dev/",
                 with: ""
@@ -249,8 +251,10 @@ actor SessionStore {
             if let normalizedTTY {
                 session.tty = normalizedTTY
             }
-            session.lastHookEventAt = observedAt
             session.lastActivity = max(session.lastActivity, observedAt)
+            if newPhase != nil {
+                session.lastHookEventAt = observedAt
+            }
         } else {
             Self.logger.info(
                 "Ignoring stale phase event \(event.event, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
@@ -274,14 +278,12 @@ actor SessionStore {
             return
         }
 
-        let newPhase = event.determinePhase()
-
         // Any fresh active signal can recover a resumed conversation when
         // UserPromptSubmit was dropped. SessionStart alone is intentionally
         // excluded because opening a dormant session is not a new turn.
         let startsNewTurn = shouldApplyLifecycle && (
-            newPhase.isActive ||
-            newPhase.isWaitingForApproval
+            newPhase?.isActive == true ||
+            newPhase?.isWaitingForApproval == true
         )
         if startsNewTurn &&
            (session.phase == .ended || session.completedAt != nil) {
@@ -306,9 +308,10 @@ actor SessionStore {
             Self.logger.debug(
                 "Keeping interactive approval state for duplicate PreToolUse observation"
             )
-        } else if session.phase.canTransition(to: newPhase) {
+        } else if let newPhase,
+                  session.phase.canTransition(to: newPhase) {
             session.phase = newPhase
-        } else {
+        } else if let newPhase {
             Self.logger.debug("Invalid transition: \(String(describing: session.phase), privacy: .public) -> \(String(describing: newPhase), privacy: .public), ignoring")
         }
 
@@ -325,8 +328,8 @@ actor SessionStore {
             session.phase = .waitingForInput
             session.completedAt = observedAt
         } else if shouldApplyLifecycle && (
-                    newPhase.isActive ||
-                    newPhase.isWaitingForApproval
+                    newPhase?.isActive == true ||
+                    newPhase?.isWaitingForApproval == true
                   ) {
             session.completedAt = nil
         }
@@ -396,7 +399,7 @@ actor SessionStore {
             ),
             lastActivity: observedAt,
             createdAt: observedAt,
-            lastHookEventAt: observedAt
+            lastHookEventAt: event.determinePhase() == nil ? nil : observedAt
         )
     }
 
