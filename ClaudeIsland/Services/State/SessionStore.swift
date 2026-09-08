@@ -341,13 +341,22 @@ actor SessionStore {
             )
         }
 
-        if event.event == "PermissionRequest", let toolUseId = event.toolUseId {
+        if shouldApplyLifecycle,
+           event.event == "PermissionRequest",
+           let toolUseId = event.toolUseId {
             Self.logger.debug("Setting tool \(toolUseId.prefix(12), privacy: .public) status to waitingForApproval")
             updateToolStatus(in: &session, toolId: toolUseId, status: .waitingForApproval)
         }
 
-        processToolTracking(event: event, session: &session)
-        processSubagentTracking(event: event, session: &session)
+        // Older completion rows may still finish a known placeholder, but an
+        // older PreToolUse must never create fresh running work after a newer
+        // Stop. Transcript reconciliation can recover its historical row
+        // without making the completed card look active again.
+        let mayStartTrackedWork = shouldApplyLifecycle || event.event != "PreToolUse"
+        if mayStartTrackedWork {
+            processToolTracking(event: event, session: &session)
+            processSubagentTracking(event: event, session: &session)
+        }
 
         if shouldApplyLifecycle && isCompletionSignal {
             finalizeDanglingTools(in: &session)

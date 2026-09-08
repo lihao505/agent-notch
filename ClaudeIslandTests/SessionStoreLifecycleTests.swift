@@ -98,6 +98,8 @@ final class SessionStoreLifecycleTests: XCTestCase {
             completionAt.timeIntervalSince1970,
             accuracy: 0.001
         )
+        XCTAssertFalse(session.toolTracker.hasSeen("stale-tool"))
+        XCTAssertFalse(session.chatItems.contains { $0.id == "stale-tool" })
 
         // A genuinely newer prompt starts a new lifecycle generation.
         await store.process(.hookReceived(hook(
