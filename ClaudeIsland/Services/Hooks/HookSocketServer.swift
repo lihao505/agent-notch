@@ -119,6 +119,13 @@ struct PendingPermission: Sendable {
     let expiresAt: Date
 }
 
+/// Permission routing is a security boundary, so storage must use the complete
+/// identity instead of assuming tool-use ids are globally unique forever.
+private struct PendingPermissionKey: Hashable, Sendable {
+    let sessionId: String
+    let toolUseId: String
+}
+
 /// Callback for hook events
 typealias HookEventHandler = @Sendable (HookEvent) -> Void
 
@@ -146,8 +153,8 @@ class HookSocketServer {
     private var permissionFailureHandler: PermissionFailureHandler?
     private let queue = DispatchQueue(label: "com.agentnotch.socket", qos: .userInitiated)
 
-    /// Pending permission requests indexed by toolUseId
-    private var pendingPermissions: [String: PendingPermission] = [:]
+    /// Pending permission requests indexed by exact session + tool identity.
+    private var pendingPermissions: [PendingPermissionKey: PendingPermission] = [:]
     private let permissionsLock = NSLock()
 
     /// Cache tool_use_id from PreToolUse to correlate with PermissionRequest
@@ -379,16 +386,23 @@ class HookSocketServer {
         return (pending.event.tool, pending.toolUseId, pending.event.toolInput)
     }
 
-    /// Cancel a specific pending permission by toolUseId (when tool completes via terminal approval)
-    func cancelPendingPermission(toolUseId: String) {
+    /// Cancel one exact pending permission when its tool completes elsewhere.
+    func cancelPendingPermission(sessionId: String, toolUseId: String) {
         queue.async { [weak self] in
-            self?.cleanupSpecificPermission(toolUseId: toolUseId)
+            self?.cleanupSpecificPermission(
+                sessionId: sessionId,
+                toolUseId: toolUseId
+            )
         }
     }
 
-    private func cleanupSpecificPermission(toolUseId: String) {
+    private func cleanupSpecificPermission(sessionId: String, toolUseId: String) {
+        let key = PendingPermissionKey(
+            sessionId: sessionId,
+            toolUseId: toolUseId
+        )
         permissionsLock.lock()
-        guard let pending = pendingPermissions.removeValue(forKey: toolUseId) else {
+        guard let pending = pendingPermissions.removeValue(forKey: key) else {
             permissionsLock.unlock()
             return
         }
@@ -400,11 +414,11 @@ class HookSocketServer {
 
     private func cleanupPendingPermissions(sessionId: String) {
         permissionsLock.lock()
-        let matching = pendingPermissions.filter { $0.value.sessionId == sessionId }
-        for (toolUseId, pending) in matching {
-            logger.debug("Cleaning up stale permission for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+        let matching = pendingPermissions.filter { $0.key.sessionId == sessionId }
+        for (key, pending) in matching {
+            logger.debug("Cleaning up stale permission for \(sessionId.prefix(8), privacy: .public) tool:\(key.toolUseId.prefix(12), privacy: .public)")
             close(pending.clientSocket)
-            pendingPermissions.removeValue(forKey: toolUseId)
+            pendingPermissions.removeValue(forKey: key)
         }
         permissionsLock.unlock()
     }
@@ -592,13 +606,21 @@ class HookSocketServer {
                 receivedAt: receivedAt,
                 expiresAt: receivedAt.addingTimeInterval(responseTimeout + 2)
             )
+            let key = PendingPermissionKey(
+                sessionId: event.sessionId,
+                toolUseId: toolUseId
+            )
             permissionsLock.lock()
-            pendingPermissions[toolUseId] = pending
+            let replaced = pendingPermissions.updateValue(pending, forKey: key)
             permissionsLock.unlock()
+            if let replaced {
+                close(replaced.clientSocket)
+                logger.warning("Replaced duplicate permission socket for \(event.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+            }
 
             queue.asyncAfter(deadline: .now() + responseTimeout + 2) { [weak self] in
                 self?.expirePendingPermission(
-                    toolUseId: toolUseId,
+                    key: key,
                     receivedAt: receivedAt
                 )
             }
@@ -620,18 +642,24 @@ class HookSocketServer {
         reason: String?,
         updatedInput: [String: AnyCodable]? = nil
     ) -> Bool {
+        let key = PendingPermissionKey(
+            sessionId: sessionId,
+            toolUseId: toolUseId
+        )
         permissionsLock.lock()
-        guard let pending = pendingPermissions[toolUseId] else {
+        guard let pending = pendingPermissions[key] else {
+            let belongsToAnotherSession = pendingPermissions.keys.contains {
+                $0.toolUseId == toolUseId && $0.sessionId != sessionId
+            }
             permissionsLock.unlock()
-            logger.debug("No pending permission for toolUseId: \(toolUseId.prefix(12), privacy: .public)")
+            if belongsToAnotherSession {
+                logger.error("Rejected cross-session permission response for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+            } else {
+                logger.debug("No pending permission for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+            }
             return false
         }
-        guard pending.sessionId == sessionId else {
-            permissionsLock.unlock()
-            logger.error("Rejected cross-session permission response for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
-            return false
-        }
-        pendingPermissions.removeValue(forKey: toolUseId)
+        pendingPermissions.removeValue(forKey: key)
         permissionsLock.unlock()
 
         let response = HookResponse(
@@ -656,20 +684,23 @@ class HookSocketServer {
     /// The bridge exits without a decision on timeout so Codex can show its
     /// native prompt. Remove the matching socket shortly afterward; otherwise
     /// the notch can keep displaying an approval whose client no longer exists.
-    private func expirePendingPermission(toolUseId: String, receivedAt: Date) {
+    private func expirePendingPermission(
+        key: PendingPermissionKey,
+        receivedAt: Date
+    ) {
         permissionsLock.lock()
-        guard let pending = pendingPermissions[toolUseId],
+        guard let pending = pendingPermissions[key],
               pending.receivedAt == receivedAt,
               pending.expiresAt <= Date() else {
             permissionsLock.unlock()
             return
         }
-        pendingPermissions.removeValue(forKey: toolUseId)
+        pendingPermissions.removeValue(forKey: key)
         permissionsLock.unlock()
 
         close(pending.clientSocket)
-        logger.info("Expired unanswered permission for \(pending.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
-        permissionFailureHandler?(pending.sessionId, toolUseId)
+        logger.info("Expired unanswered permission for \(pending.sessionId.prefix(8), privacy: .public) tool:\(key.toolUseId.prefix(12), privacy: .public)")
+        permissionFailureHandler?(pending.sessionId, key.toolUseId)
     }
 
     /// Permission clients wait in recv(), so switch their accepted socket back

@@ -124,14 +124,16 @@ final class PermissionRoutingTests: XCTestCase {
             close(clientB1)
         }
 
-        try sendPermission(client: clientA1, sessionId: "session-A", toolUseId: "tool-A1")
+        // Reuse one tool id across sessions to prove that storage and delivery
+        // use the complete (session, tool) identity.
+        try sendPermission(client: clientA1, sessionId: "session-A", toolUseId: "shared-tool")
         try sendPermission(client: clientA2, sessionId: "session-A", toolUseId: "tool-A2")
-        try sendPermission(client: clientB1, sessionId: "session-B", toolUseId: "tool-B1")
+        try sendPermission(client: clientB1, sessionId: "session-B", toolUseId: "shared-tool")
         wait(for: [received], timeout: 3)
 
         let rejected = expectation(description: "cross-session response rejected")
         server.respondToPermission(
-            toolUseId: "tool-A1",
+            toolUseId: "tool-A2",
             sessionId: "session-B",
             decision: "allow"
         ) { delivered in
@@ -145,9 +147,9 @@ final class PermissionRoutingTests: XCTestCase {
         let delivered = expectation(description: "exact responses delivered")
         delivered.expectedFulfillmentCount = 3
         for request in [
-            ("tool-B1", "session-B", "allow"),
+            ("shared-tool", "session-B", "allow"),
             ("tool-A2", "session-A", "deny"),
-            ("tool-A1", "session-A", "allow")
+            ("shared-tool", "session-A", "allow")
         ] {
             server.respondToPermission(
                 toolUseId: request.0,
