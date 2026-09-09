@@ -60,7 +60,8 @@ final class SessionStoreLifecycleTests: XCTestCase {
 
         await store.process(.permissionApproved(
             sessionId: sessionId,
-            toolUseId: "tool-1"
+            toolUseId: "tool-1",
+            resolvedAt: now.addingTimeInterval(-3.5)
         ))
         storedSession = await store.session(for: sessionId)
         session = try XCTUnwrap(storedSession)
@@ -184,5 +185,69 @@ final class SessionStoreLifecycleTests: XCTestCase {
             completionAt.timeIntervalSince1970,
             accuracy: 0.001
         )
+    }
+
+    func testDeliveredApprovalRejectsOlderCompletion() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "approval-boundary-\(UUID().uuidString)"
+        let now = Date()
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: now.addingTimeInterval(-3),
+            tool: "Bash",
+            toolUseId: "approval-tool"
+        )))
+        await store.process(.permissionApproved(
+            sessionId: sessionId,
+            toolUseId: "approval-tool",
+            resolvedAt: now
+        ))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "Stop",
+            status: "waiting_for_input",
+            observedAt: now.addingTimeInterval(-1)
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertNil(session.completedAt)
+    }
+
+    func testAnsweredQuestionCannotBeResurrectedByOlderRequest() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "question-boundary-\(UUID().uuidString)"
+        let now = Date()
+        let question = hook(
+            sessionId: sessionId,
+            event: "PreToolUse",
+            status: "waiting_for_approval",
+            observedAt: now.addingTimeInterval(-2),
+            tool: "AskUserQuestion",
+            toolUseId: "question-tool"
+        )
+
+        await store.process(.hookReceived(question))
+        await store.process(.permissionApproved(
+            sessionId: sessionId,
+            toolUseId: "question-tool",
+            resolvedAt: now.addingTimeInterval(-1)
+        ))
+        await store.process(.hookReceived(question))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertNil(session.activePermission)
     }
 }

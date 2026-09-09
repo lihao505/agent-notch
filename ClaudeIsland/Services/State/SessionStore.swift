@@ -132,14 +132,27 @@ actor SessionStore {
         case .hookReceived(let hookEvent):
             await processHookEvent(hookEvent)
 
-        case .permissionApproved(let sessionId, let toolUseId):
-            await processPermissionApproved(sessionId: sessionId, toolUseId: toolUseId)
+        case .permissionApproved(let sessionId, let toolUseId, let resolvedAt):
+            await processPermissionApproved(
+                sessionId: sessionId,
+                toolUseId: toolUseId,
+                resolvedAt: resolvedAt
+            )
 
-        case .permissionDenied(let sessionId, let toolUseId, let reason):
-            await processPermissionDenied(sessionId: sessionId, toolUseId: toolUseId, reason: reason)
+        case .permissionDenied(let sessionId, let toolUseId, let reason, let resolvedAt):
+            await processPermissionDenied(
+                sessionId: sessionId,
+                toolUseId: toolUseId,
+                reason: reason,
+                resolvedAt: resolvedAt
+            )
 
-        case .permissionSocketFailed(let sessionId, let toolUseId):
-            await processSocketFailure(sessionId: sessionId, toolUseId: toolUseId)
+        case .permissionSocketFailed(let sessionId, let toolUseId, let resolvedAt):
+            await processSocketFailure(
+                sessionId: sessionId,
+                toolUseId: toolUseId,
+                resolvedAt: resolvedAt
+            )
 
         case .fileUpdated(let payload):
             await processFileUpdate(payload)
@@ -599,7 +612,11 @@ actor SessionStore {
 
     // MARK: - Permission Processing
 
-    private func processPermissionApproved(sessionId: String, toolUseId: String) async {
+    private func processPermissionApproved(
+        sessionId: String,
+        toolUseId: String,
+        resolvedAt: Date
+    ) async {
         guard var session = sessions[sessionId] else { return }
 
         // Update tool status in chat history first
@@ -632,6 +649,11 @@ actor SessionStore {
                 }
             }
         }
+
+        recordLocalInteractionBoundary(
+            in: &session,
+            resolvedAt: resolvedAt
+        )
 
         sessions[sessionId] = session
     }
@@ -701,7 +723,12 @@ actor SessionStore {
         return nil
     }
 
-    private func processPermissionDenied(sessionId: String, toolUseId: String, reason: String?) async {
+    private func processPermissionDenied(
+        sessionId: String,
+        toolUseId: String,
+        reason: String?,
+        resolvedAt: Date
+    ) async {
         guard var session = sessions[sessionId] else { return }
 
         // Update tool status in chat history first
@@ -734,10 +761,19 @@ actor SessionStore {
             }
         }
 
+        recordLocalInteractionBoundary(
+            in: &session,
+            resolvedAt: resolvedAt
+        )
+
         sessions[sessionId] = session
     }
 
-    private func processSocketFailure(sessionId: String, toolUseId: String) async {
+    private func processSocketFailure(
+        sessionId: String,
+        toolUseId: String,
+        resolvedAt: Date
+    ) async {
         guard var session = sessions[sessionId] else { return }
 
         // Mark the failed tool's status as error
@@ -766,7 +802,28 @@ actor SessionStore {
             }
         }
 
+        recordLocalInteractionBoundary(
+            in: &session,
+            resolvedAt: resolvedAt
+        )
+
         sessions[sessionId] = session
+    }
+
+    /// Delivering or expiring a held interaction is itself an authoritative
+    /// local lifecycle boundary. A Stop or duplicate PermissionRequest that
+    /// was observed before this response must not arrive late and overwrite
+    /// the resumed state or resurrect a dismissed question card.
+    private func recordLocalInteractionBoundary(
+        in session: inout SessionState,
+        resolvedAt: Date
+    ) {
+        session.lastActivity = max(session.lastActivity, resolvedAt)
+        session.lastHookEventAt = max(
+            session.lastHookEventAt ?? .distantPast,
+            resolvedAt
+        )
+        session.completedAt = nil
     }
 
     // MARK: - File Update Processing

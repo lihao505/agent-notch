@@ -90,7 +90,8 @@ class ClaudeSessionMonitor: ObservableObject {
             onPermissionFailure: { sessionId, toolUseId in
                 continuation.yield(.permissionSocketFailed(
                     sessionId: sessionId,
-                    toolUseId: toolUseId
+                    toolUseId: toolUseId,
+                    resolvedAt: Date()
                 ))
             }
         )
@@ -119,6 +120,7 @@ class ClaudeSessionMonitor: ObservableObject {
         sessionId: String,
         expectedToolUseId: String
     ) {
+        let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission else {
@@ -137,8 +139,16 @@ class ClaudeSessionMonitor: ObservableObject {
                 Task {
                     await SessionStore.shared.process(
                         delivered
-                            ? .permissionApproved(sessionId: sessionId, toolUseId: toolUseId)
-                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                            ? .permissionApproved(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
+                            : .permissionSocketFailed(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
                     )
                 }
             }
@@ -150,6 +160,7 @@ class ClaudeSessionMonitor: ObservableObject {
         expectedToolUseId: String,
         reason: String?
     ) {
+        let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission else {
@@ -169,8 +180,17 @@ class ClaudeSessionMonitor: ObservableObject {
                 Task {
                     await SessionStore.shared.process(
                         delivered
-                            ? .permissionDenied(sessionId: sessionId, toolUseId: toolUseId, reason: reason)
-                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                            ? .permissionDenied(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                reason: reason,
+                                resolvedAt: resolvedAt
+                            )
+                            : .permissionSocketFailed(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
                     )
                 }
             }
@@ -185,6 +205,7 @@ class ClaudeSessionMonitor: ObservableObject {
         expectedToolUseId: String,
         answers: [String: String]
     ) {
+        let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
@@ -205,8 +226,16 @@ class ClaudeSessionMonitor: ObservableObject {
                 Task {
                     await SessionStore.shared.process(
                         delivered
-                            ? .permissionApproved(sessionId: sessionId, toolUseId: toolUseId)
-                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                            ? .permissionApproved(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
+                            : .permissionSocketFailed(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
                     )
                 }
             }
@@ -216,6 +245,7 @@ class ClaudeSessionMonitor: ObservableObject {
     /// ExitPlanMode also requires an echoed updatedInput when it is handled
     /// through a PreToolUse integration.
     func approvePlan(sessionId: String, expectedToolUseId: String) {
+        let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
@@ -234,8 +264,16 @@ class ClaudeSessionMonitor: ObservableObject {
                 Task {
                     await SessionStore.shared.process(
                         delivered
-                            ? .permissionApproved(sessionId: sessionId, toolUseId: toolUseId)
-                            : .permissionSocketFailed(sessionId: sessionId, toolUseId: toolUseId)
+                            ? .permissionApproved(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
+                            : .permissionSocketFailed(
+                                sessionId: sessionId,
+                                toolUseId: toolUseId,
+                                resolvedAt: resolvedAt
+                            )
                     )
                 }
             }

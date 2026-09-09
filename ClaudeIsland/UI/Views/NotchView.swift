@@ -30,6 +30,52 @@ private struct NotchLayoutAnimationState: Equatable {
     let compactWidth: Double
 }
 
+/// A completion is an event generation, not merely a session that currently
+/// happens to be idle. Keeping the authoritative completion boundary in the
+/// identity prevents PID/title refreshes from replaying the same alert and
+/// still lets a very fast next turn surface even if SwiftUI coalesces the
+/// intermediate processing snapshot.
+struct NotchCompletionToken: Hashable, Sendable {
+    let sessionId: String
+    let completedAt: Date
+}
+
+enum NotchAttentionPolicy {
+    static func completionToken(
+        for session: SessionState
+    ) -> NotchCompletionToken? {
+        guard session.phase == .waitingForInput,
+              let completedAt = session.completedAt else {
+            return nil
+        }
+        return NotchCompletionToken(
+            sessionId: session.sessionId,
+            completedAt: completedAt
+        )
+    }
+
+    static func shouldPresent(
+        _ token: NotchCompletionToken,
+        presentationStartedAt: Date,
+        duration: TimeInterval,
+        now: Date = Date()
+    ) -> Bool {
+        let age = now.timeIntervalSince(token.completedAt)
+        return token.completedAt >= presentationStartedAt &&
+            age >= -5 &&
+            age < duration
+    }
+
+    static func isStillCurrent(
+        _ token: NotchCompletionToken,
+        in sessions: [SessionState]
+    ) -> Bool {
+        sessions.contains {
+            completionToken(for: $0) == token
+        }
+    }
+}
+
 /// Task handles are deliberately kept outside SwiftUI's visible state. Making
 /// these `@State` values would invalidate the entire notch hierarchy whenever
 /// a timer is replaced, even though no rendered value changed.
@@ -38,6 +84,7 @@ private final class NotchDelayedUIWork: ObservableObject {
     let objectWillChange = ObservableObjectPublisher()
     var visibilityTask: Task<Void, Never>?
     var bounceTask: Task<Void, Never>?
+    var completionSoundTask: Task<Void, Never>?
     var completionReminderTasks: [String: Task<Void, Never>] = [:]
 
     func cancelAll() {
@@ -45,6 +92,8 @@ private final class NotchDelayedUIWork: ObservableObject {
         visibilityTask = nil
         bounceTask?.cancel()
         bounceTask = nil
+        completionSoundTask?.cancel()
+        completionSoundTask = nil
         completionReminderTasks.values.forEach { $0.cancel() }
         completionReminderTasks.removeAll()
     }
@@ -59,8 +108,9 @@ struct NotchView: View {
     @StateObject private var preferences = NotchPreferences.shared
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var previousPendingIds: Set<String> = []
-    @State private var previousWaitingForInputIds: Set<String> = []
+    @State private var previousCompletionTokens: Set<NotchCompletionToken> = []
     @State private var waitingForInputTimestamps: [String: Date] = [:]  // sessionId -> when it entered waitingForInput
+    @State private var attentionTrackingStartedAt = Date()
     @State private var isVisible: Bool = false
     @State private var isHovering: Bool = false
     @State private var isBouncing: Bool = false
@@ -85,7 +135,7 @@ struct NotchView: View {
         return sessionMonitor.instances.contains { session in
             guard session.phase == .waitingForInput else { return false }
             // Only show while the compact completion reminder is active.
-            if let enteredAt = waitingForInputTimestamps[session.stableId] {
+            if let enteredAt = waitingForInputTimestamps[session.sessionId] {
                 return now.timeIntervalSince(enteredAt) <
                     preferences.completionCompactDuration
             }
@@ -855,18 +905,41 @@ struct NotchView: View {
     }
 
     private func handleWaitingForInputChange(_ instances: [SessionState]) {
-        // Get sessions that are now waiting for input
-        let waitingForInputSessions = instances.filter { $0.phase == .waitingForInput }
-        let currentIds = Set(waitingForInputSessions.map { $0.stableId })
-        let newWaitingIds = currentIds.subtracting(previousWaitingForInputIds)
-
-        // Track timestamps for newly waiting sessions
+        let waitingForInputSessions = instances.filter {
+            $0.phase == .waitingForInput
+        }
+        let tokenBySession = Dictionary(
+            uniqueKeysWithValues: waitingForInputSessions.compactMap {
+                session -> (String, NotchCompletionToken)? in
+                guard let token = NotchAttentionPolicy.completionToken(
+                    for: session
+                ) else {
+                    return nil
+                }
+                return (session.sessionId, token)
+            }
+        )
+        let currentTokens = Set(tokenBySession.values)
+        let newTokens = currentTokens.subtracting(previousCompletionTokens)
         let now = Date()
-        for session in waitingForInputSessions where newWaitingIds.contains(session.stableId) {
-            waitingForInputTimestamps[session.stableId] = now
+        let presentableTokens = newTokens.filter {
+            NotchAttentionPolicy.shouldPresent(
+                $0,
+                presentationStartedAt: attentionTrackingStartedAt,
+                duration: preferences.completionCompactDuration,
+                now: now
+            )
+        }
+        let presentableIds = Set(presentableTokens.map(\.sessionId))
+        let currentIds = Set(tokenBySession.keys)
+
+        // The reminder lifetime starts at the real completion boundary, not
+        // when a delayed parser/UI update happened to arrive.
+        for token in presentableTokens {
+            waitingForInputTimestamps[token.sessionId] = token.completedAt
             scheduleCompletionReminderExpiry(
-                sessionId: session.stableId,
-                enteredAt: now
+                sessionId: token.sessionId,
+                enteredAt: token.completedAt
             )
         }
 
@@ -879,7 +952,7 @@ struct NotchView: View {
         }
 
         // Bounce the notch when a session newly enters waitingForInput state
-        if !newWaitingIds.isEmpty {
+        if !presentableTokens.isEmpty {
             // A completed task gets a compact, visible reminder. If an older
             // notification auto-opened the panel, collapse it; never override
             // a panel the user deliberately opened by click or hover.
@@ -890,18 +963,32 @@ struct NotchView: View {
             }
 
             // Get the sessions that just entered waitingForInput
-            let newlyWaitingSessions = waitingForInputSessions.filter { newWaitingIds.contains($0.stableId) }
+            let newlyWaitingSessions = waitingForInputSessions.filter {
+                presentableIds.contains($0.sessionId)
+            }
+            let completionTargets = newlyWaitingSessions.compactMap {
+                session -> (SessionState, NotchCompletionToken)? in
+                guard let token = tokenBySession[session.sessionId] else {
+                    return nil
+                }
+                return (session, token)
+            }
 
             // Play notification sound if the session is not actively focused
             if let soundName = AppSettings.notificationSound.soundName {
-                // Check if we should play sound (async check for tmux pane focus)
-                Task {
-                    let shouldPlaySound = await shouldPlayNotificationSound(for: newlyWaitingSessions)
+                // Focus detection may yield while another turn begins. Keep
+                // one cancellable task and revalidate the exact completion
+                // generation before emitting a now-stale sound.
+                delayedUIWork.completionSoundTask?.cancel()
+                delayedUIWork.completionSoundTask = Task { @MainActor in
+                    let shouldPlaySound = await shouldPlayNotificationSound(
+                        for: completionTargets
+                    )
+                    guard !Task.isCancelled else { return }
                     if shouldPlaySound {
-                        _ = await MainActor.run {
-                            NSSound(named: soundName)?.play()
-                        }
+                        NSSound(named: soundName)?.play()
                     }
+                    delayedUIWork.completionSoundTask = nil
                 }
             }
 
@@ -919,10 +1006,16 @@ struct NotchView: View {
             } else {
                 isBouncing = false
             }
-
+        } else if currentTokens.isEmpty {
+            // A new turn supersedes any completion flourish immediately.
+            delayedUIWork.completionSoundTask?.cancel()
+            delayedUIWork.completionSoundTask = nil
+            delayedUIWork.bounceTask?.cancel()
+            delayedUIWork.bounceTask = nil
+            isBouncing = false
         }
 
-        previousWaitingForInputIds = currentIds
+        previousCompletionTokens = currentTokens
     }
 
     private func scheduleCompletionReminderExpiry(
@@ -982,14 +1075,30 @@ struct NotchView: View {
 
     /// Determine if notification sound should play for the given sessions
     /// Returns true if ANY session is not actively focused
-    private func shouldPlayNotificationSound(for sessions: [SessionState]) async -> Bool {
-        for session in sessions {
+    private func shouldPlayNotificationSound(
+        for targets: [(SessionState, NotchCompletionToken)]
+    ) async -> Bool {
+        for (session, token) in targets {
             guard let pid = session.pid else {
-                // No PID means we can't check focus, assume not focused
-                return true
+                // No PID means we can't check focus. It is still safe to alert
+                // only if this exact completion remains current.
+                if NotchAttentionPolicy.isStillCurrent(
+                    token,
+                    in: sessionMonitor.instances
+                ) {
+                    return true
+                }
+                continue
             }
 
             let isFocused = await TerminalVisibilityDetector.isSessionFocused(sessionPid: pid)
+            guard !Task.isCancelled,
+                  NotchAttentionPolicy.isStillCurrent(
+                    token,
+                    in: sessionMonitor.instances
+                  ) else {
+                continue
+            }
             if !isFocused {
                 return true
             }

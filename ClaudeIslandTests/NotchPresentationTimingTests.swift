@@ -106,4 +106,111 @@ final class NotchPresentationTimingTests: XCTestCase {
             )
         )
     }
+
+    func testCompletionIdentityIgnoresMutableProcessMetadata() async {
+        let completedAt = Date()
+        let first = SessionState(
+            sessionId: "completion-generation",
+            cwd: "/tmp/project",
+            pid: 111,
+            phase: .waitingForInput,
+            completedAt: completedAt
+        )
+        let refreshed = SessionState(
+            sessionId: "completion-generation",
+            cwd: "/tmp/project",
+            pid: 222,
+            phase: .waitingForInput,
+            completedAt: completedAt
+        )
+
+        XCTAssertEqual(
+            NotchAttentionPolicy.completionToken(for: first),
+            NotchAttentionPolicy.completionToken(for: refreshed)
+        )
+    }
+
+    func testNewCompletionBoundaryCreatesNewAttentionGeneration() async throws {
+        let first = SessionState(
+            sessionId: "rapid-next-turn",
+            cwd: "/tmp/project",
+            phase: .waitingForInput,
+            completedAt: Date(timeIntervalSince1970: 100)
+        )
+        let second = SessionState(
+            sessionId: "rapid-next-turn",
+            cwd: "/tmp/project",
+            phase: .waitingForInput,
+            completedAt: Date(timeIntervalSince1970: 101)
+        )
+
+        XCTAssertNotEqual(
+            try XCTUnwrap(NotchAttentionPolicy.completionToken(for: first)),
+            try XCTUnwrap(NotchAttentionPolicy.completionToken(for: second))
+        )
+    }
+
+    func testCompletionPresentationRejectsStartupHistoryAndExpiredEvents() async {
+        let presentationStartedAt = Date(timeIntervalSince1970: 100)
+        let oldToken = NotchCompletionToken(
+            sessionId: "old",
+            completedAt: Date(timeIntervalSince1970: 99)
+        )
+        let expiredToken = NotchCompletionToken(
+            sessionId: "expired",
+            completedAt: Date(timeIntervalSince1970: 101)
+        )
+        let freshToken = NotchCompletionToken(
+            sessionId: "fresh",
+            completedAt: Date(timeIntervalSince1970: 109)
+        )
+
+        XCTAssertFalse(NotchAttentionPolicy.shouldPresent(
+            oldToken,
+            presentationStartedAt: presentationStartedAt,
+            duration: 8,
+            now: Date(timeIntervalSince1970: 102)
+        ))
+        XCTAssertFalse(NotchAttentionPolicy.shouldPresent(
+            expiredToken,
+            presentationStartedAt: presentationStartedAt,
+            duration: 8,
+            now: Date(timeIntervalSince1970: 110)
+        ))
+        XCTAssertTrue(NotchAttentionPolicy.shouldPresent(
+            freshToken,
+            presentationStartedAt: presentationStartedAt,
+            duration: 8,
+            now: Date(timeIntervalSince1970: 110)
+        ))
+    }
+
+    func testSoundRevalidationRejectsSupersededCompletion() async throws {
+        let completedAt = Date()
+        let token = NotchCompletionToken(
+            sessionId: "sound-race",
+            completedAt: completedAt
+        )
+        let completed = SessionState(
+            sessionId: token.sessionId,
+            cwd: "/tmp/project",
+            phase: .waitingForInput,
+            completedAt: completedAt
+        )
+        let resumed = SessionState(
+            sessionId: token.sessionId,
+            cwd: "/tmp/project",
+            phase: .processing,
+            completedAt: nil
+        )
+
+        XCTAssertTrue(NotchAttentionPolicy.isStillCurrent(
+            token,
+            in: [completed]
+        ))
+        XCTAssertFalse(NotchAttentionPolicy.isStillCurrent(
+            token,
+            in: [resumed]
+        ))
+    }
 }

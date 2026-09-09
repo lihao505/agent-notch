@@ -20,13 +20,26 @@ enum SessionEvent: Sendable {
     // MARK: - Permission Events (user actions)
 
     /// User approved a permission request
-    case permissionApproved(sessionId: String, toolUseId: String)
+    case permissionApproved(
+        sessionId: String,
+        toolUseId: String,
+        resolvedAt: Date
+    )
 
     /// User denied a permission request
-    case permissionDenied(sessionId: String, toolUseId: String, reason: String?)
+    case permissionDenied(
+        sessionId: String,
+        toolUseId: String,
+        reason: String?,
+        resolvedAt: Date
+    )
 
     /// Permission socket failed (connection died before response)
-    case permissionSocketFailed(sessionId: String, toolUseId: String)
+    case permissionSocketFailed(
+        sessionId: String,
+        toolUseId: String,
+        resolvedAt: Date
+    )
 
     // MARK: - File Events (from ConversationParser)
 
@@ -206,11 +219,11 @@ extension SessionEvent: CustomStringConvertible {
         switch self {
         case .hookReceived(let event):
             return "hookReceived(\(event.event), session: \(event.sessionId.prefix(8)))"
-        case .permissionApproved(let sessionId, let toolUseId):
+        case .permissionApproved(let sessionId, let toolUseId, _):
             return "permissionApproved(session: \(sessionId.prefix(8)), tool: \(toolUseId.prefix(12)))"
-        case .permissionDenied(let sessionId, let toolUseId, _):
+        case .permissionDenied(let sessionId, let toolUseId, _, _):
             return "permissionDenied(session: \(sessionId.prefix(8)), tool: \(toolUseId.prefix(12)))"
-        case .permissionSocketFailed(let sessionId, let toolUseId):
+        case .permissionSocketFailed(let sessionId, let toolUseId, _):
             return "permissionSocketFailed(session: \(sessionId.prefix(8)), tool: \(toolUseId.prefix(12)))"
         case .fileUpdated(let payload):
             return "fileUpdated(session: \(payload.sessionId.prefix(8)), messages: \(payload.messages.count))"
