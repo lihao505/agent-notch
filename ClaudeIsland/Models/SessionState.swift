@@ -30,6 +30,11 @@ struct SessionState: Equatable, Identifiable, Sendable {
     /// Current phase in the session lifecycle
     var phase: SessionPhase
 
+    /// Every live approval/question/plan request for this session, in arrival
+    /// order. `phase` presents the queue head; the queue prevents parallel
+    /// requests from overwriting or hiding one another.
+    var pendingInteractions: PendingInteractionQueue
+
     // MARK: - Chat History
 
     /// All chat items for this session (replaces ChatHistoryManager.histories)
@@ -86,6 +91,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         tty: String? = nil,
         isInTmux: Bool = false,
         phase: SessionPhase = .idle,
+        pendingInteractions: PendingInteractionQueue = PendingInteractionQueue(),
         chatItems: [ChatHistoryItem] = [],
         toolTracker: ToolTracker = ToolTracker(),
         subagentState: SubagentState = SubagentState(),
@@ -108,6 +114,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.tty = tty
         self.isInTmux = isInTmux
         self.phase = phase
+        self.pendingInteractions = pendingInteractions
         self.chatItems = chatItems
         self.toolTracker = toolTracker
         self.subagentState = subagentState

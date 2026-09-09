@@ -162,7 +162,9 @@ extension HookEvent {
     /// Determine the target session phase based on this hook event. Informational
     /// events return nil so they cannot fabricate an idle transition or advance
     /// the lifecycle ordering boundary.
-    nonisolated func determinePhase() -> SessionPhase? {
+    nonisolated func determinePhase(
+        observedAt: Date = Date()
+    ) -> SessionPhase? {
         // PreCompact takes priority
         if event == "PreCompact" {
             return .compacting
@@ -174,7 +176,7 @@ extension HookEvent {
                 toolUseId: toolUseId ?? "",
                 toolName: tool,
                 toolInput: toolInput,
-                receivedAt: Date()
+                receivedAt: observedAt
             ))
         }
 

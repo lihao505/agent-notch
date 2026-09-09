@@ -19,6 +19,7 @@ required_files=(
     ThirdPartyLicenses/swift-cmark-0.8.0-COPYING.txt
     AgentBridge/README.md AgentBridge/install.sh AgentBridge/uninstall.sh
     AgentBridge/bin/notch-bridge.py AgentBridge/bin/codex-relay.py
+    ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIslandTests/ProcessExecutorTests.swift
     ClaudeIslandTests/AgentTransportTests.swift

@@ -3,7 +3,7 @@
 ## 每次提交
 
 - [ ] `./scripts/verify-release.sh`
-- [ ] Swift XCTest 通过（进程双管道/超时、状态乱序/重复、双会话审批、rollout 增量索引）
+- [ ] Swift XCTest 通过（进程双管道/超时、状态乱序/重复、同会话审批 FIFO、跨会话精确路由、rollout 增量索引）
 - [ ] Debug 无签名构建通过
 - [ ] Release 无签名构建通过
 - [ ] Python Agent Bridge 测试通过
@@ -46,7 +46,8 @@ xcodebuild -project ClaudeIsland.xcodeproj -scheme ClaudeIsland \
   CODE_SIGNING_ALLOWED=NO test
 ```
 
-自动化测试已经覆盖 `sessionId + toolUseId` 交叉串会话拒绝；上面的人工项仍保留，
+自动化测试已经覆盖 `sessionId + toolUseId` 交叉串会话拒绝、同一会话多个交互按
+FIFO 逐个呈现，以及旧批准回调不会擦除较新的完成状态；上面的人工项仍保留，
 用于确认真实 Claude Code/CLI 与已安装 App 的完整 wire path。
 
 ## 可选：签名二进制发行

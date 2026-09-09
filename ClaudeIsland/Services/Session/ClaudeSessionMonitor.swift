@@ -76,11 +76,14 @@ class ClaudeSessionMonitor: ObservableObject {
                     }
                 }
 
-                if event.event == "Stop" {
+                if event.event == "Stop" ||
+                    event.event == "StopFailure" ||
+                    event.status == "ended" {
                     HookSocketServer.shared.cancelPendingPermissions(sessionId: event.sessionId)
-                }
-
-                if event.event == "PostToolUse", let toolUseId = event.toolUseId {
+                } else if (event.event == "PostToolUse" ||
+                            event.event == "PostToolUseFailure" ||
+                            event.event == "PermissionDenied"),
+                           let toolUseId = event.toolUseId {
                     HookSocketServer.shared.cancelPendingPermission(
                         sessionId: event.sessionId,
                         toolUseId: toolUseId
