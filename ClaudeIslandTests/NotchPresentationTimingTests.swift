@@ -8,6 +8,7 @@ import CoreGraphics
 import XCTest
 @testable import Agent_Notch
 
+@MainActor
 final class NotchPresentationTimingTests: XCTestCase {
     private func makeViewModel() -> NotchViewModel {
         NotchViewModel(
@@ -18,7 +19,7 @@ final class NotchPresentationTimingTests: XCTestCase {
         )
     }
 
-    func testDeferredHoverCannotReplaceAlreadyOpenedClickPresentation() {
+    func testDeferredHoverCannotReplaceAlreadyOpenedClickPresentation() async {
         XCTAssertFalse(
             NotchViewModel.shouldPerformDeferredHoverOpen(
                 isHovering: true,
@@ -28,7 +29,7 @@ final class NotchPresentationTimingTests: XCTestCase {
         )
     }
 
-    func testDeferredHoverRequiresPointerAndPreference() {
+    func testDeferredHoverRequiresPointerAndPreference() async {
         XCTAssertFalse(
             NotchViewModel.shouldPerformDeferredHoverOpen(
                 isHovering: false,
@@ -52,7 +53,7 @@ final class NotchPresentationTimingTests: XCTestCase {
         )
     }
 
-    func testMouseLeaveOnlyCollapsesHoverOwnedPresentation() {
+    func testMouseLeaveOnlyCollapsesHoverOwnedPresentation() async {
         XCTAssertTrue(
             NotchViewModel.shouldAutoCollapseOnPointerExit(
                 isHovering: false,
@@ -87,7 +88,7 @@ final class NotchPresentationTimingTests: XCTestCase {
         )
     }
 
-    func testInteractionClaimsAnAlreadyHoverOpenedPanel() {
+    func testInteractionClaimsAnAlreadyHoverOpenedPanel() async {
         let viewModel = makeViewModel()
         viewModel.status = .opened
         viewModel.openReason = .hover
