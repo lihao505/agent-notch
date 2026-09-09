@@ -40,7 +40,58 @@ struct NotchCompletionToken: Hashable, Sendable {
     let completedAt: Date
 }
 
+/// Presentation deduplication uses the same complete identity as permission
+/// routing. Tool-use ids are scoped to a session and cannot safely suppress an
+/// interaction arriving from a different concurrent agent.
+struct NotchInteractionToken: Hashable, Sendable {
+    let sessionId: String
+    let toolUseId: String
+}
+
 enum NotchAttentionPolicy {
+    static func interactionToken(
+        for session: SessionState
+    ) -> NotchInteractionToken? {
+        guard let toolUseId = session.pendingToolId else { return nil }
+        return NotchInteractionToken(
+            sessionId: session.sessionId,
+            toolUseId: toolUseId
+        )
+    }
+
+    /// Compact-question mode suppresses only automatic panel expansion. The
+    /// session remains pending and visible in the compact notch/list, while
+    /// risk-bearing approvals and plan reviews keep their urgent behavior.
+    static func shouldAutoExpandInteraction(
+        _ context: PermissionContext,
+        expandQuestionsAutomatically: Bool
+    ) -> Bool {
+        context.toolName != "AskUserQuestion" ||
+            expandQuestionsAutomatically
+    }
+
+    /// Select after applying compact-question policy so a newer quiet question
+    /// cannot mask an older risk-bearing approval that arrived in the same
+    /// published update.
+    static func newestSessionToAutoExpand(
+        from sessions: [SessionState],
+        excluding previousTokens: Set<NotchInteractionToken>,
+        expandQuestionsAutomatically: Bool
+    ) -> SessionState? {
+        sessions.filter { session in
+            guard let token = interactionToken(for: session),
+                  !previousTokens.contains(token),
+                  let interaction = session.activePermission else {
+                return false
+            }
+            return shouldAutoExpandInteraction(
+                interaction,
+                expandQuestionsAutomatically: expandQuestionsAutomatically
+            )
+        }
+        .max(by: { $0.lastActivity < $1.lastActivity })
+    }
+
     static func completionToken(
         for session: SessionState
     ) -> NotchCompletionToken? {
@@ -107,7 +158,8 @@ struct NotchView: View {
     @StateObject private var usageMonitor = UsageLimitMonitor.shared
     @StateObject private var preferences = NotchPreferences.shared
     @ObservedObject private var updateManager = UpdateManager.shared
-    @State private var previousPendingIds: Set<String> = []
+    @State private var previousInteractionTokens:
+        Set<NotchInteractionToken> = []
     @State private var previousCompletionTokens: Set<NotchCompletionToken> = []
     @State private var waitingForInputTimestamps: [String: Date] = [:]  // sessionId -> when it entered waitingForInput
     @State private var attentionTrackingStartedAt = Date()
@@ -881,19 +933,19 @@ struct NotchView: View {
     }
 
     private func handlePendingSessionsChange(_ sessions: [SessionState]) {
-        // Completion (`waitingForInput`) should stay compact. Only an actual
-        // permission decision is urgent enough to open the full panel.
-        let currentIds = Set(sessions.compactMap(\.pendingToolId))
-        let newPendingIds = currentIds.subtracting(previousPendingIds)
-
-        let newlyPendingSessions = sessions.filter { session in
-                guard let toolUseId = session.pendingToolId else {
-                    return false
-                }
-                return newPendingIds.contains(toolUseId)
+        // Completion (`waitingForInput`) stays compact. New interactions open
+        // their exact conversation unless compact-question mode deliberately
+        // defers AskUserQuestion until the user opens the notch.
+        let currentTokens = Set(
+            sessions.compactMap { session in
+                NotchAttentionPolicy.interactionToken(for: session)
             }
-        if let pendingSession = newlyPendingSessions.max(
-            by: { $0.lastActivity < $1.lastActivity }
+        )
+        if let pendingSession = NotchAttentionPolicy.newestSessionToAutoExpand(
+            from: sessions,
+            excluding: previousInteractionTokens,
+            expandQuestionsAutomatically:
+                preferences.expandQuestionsAutomatically
         ) {
             // An approval is actionable only with its context visible. Open
             // the exact conversation even when a second request arrives for
@@ -901,7 +953,7 @@ struct NotchView: View {
             viewModel.showApproval(for: pendingSession)
         }
 
-        previousPendingIds = currentIds
+        previousInteractionTokens = currentTokens
     }
 
     private func handleWaitingForInputChange(_ instances: [SessionState]) {

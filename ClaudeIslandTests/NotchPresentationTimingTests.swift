@@ -213,4 +213,135 @@ final class NotchPresentationTimingTests: XCTestCase {
             in: [resumed]
         ))
     }
+
+    func testInteractionIdentityIncludesSession() async throws {
+        let context = PermissionContext(
+            toolUseId: "shared-tool-id",
+            toolName: "Bash",
+            toolInput: nil,
+            receivedAt: Date()
+        )
+        let first = SessionState(
+            sessionId: "session-a",
+            cwd: "/tmp/a",
+            phase: .waitingForApproval(context)
+        )
+        let second = SessionState(
+            sessionId: "session-b",
+            cwd: "/tmp/b",
+            phase: .waitingForApproval(context)
+        )
+
+        XCTAssertNotEqual(
+            try XCTUnwrap(NotchAttentionPolicy.interactionToken(for: first)),
+            try XCTUnwrap(NotchAttentionPolicy.interactionToken(for: second))
+        )
+    }
+
+    func testCompactQuestionModeDoesNotSuppressApprovalsOrPlans() async {
+        func context(_ toolName: String) -> PermissionContext {
+            PermissionContext(
+                toolUseId: toolName,
+                toolName: toolName,
+                toolInput: nil,
+                receivedAt: Date()
+            )
+        }
+
+        XCTAssertFalse(NotchAttentionPolicy.shouldAutoExpandInteraction(
+            context("AskUserQuestion"),
+            expandQuestionsAutomatically: false
+        ))
+        XCTAssertTrue(NotchAttentionPolicy.shouldAutoExpandInteraction(
+            context("AskUserQuestion"),
+            expandQuestionsAutomatically: true
+        ))
+        XCTAssertTrue(NotchAttentionPolicy.shouldAutoExpandInteraction(
+            context("Bash"),
+            expandQuestionsAutomatically: false
+        ))
+        XCTAssertTrue(NotchAttentionPolicy.shouldAutoExpandInteraction(
+            context("ExitPlanMode"),
+            expandQuestionsAutomatically: false
+        ))
+    }
+
+    func testCompactQuestionCannotMaskApprovalInSameUpdate() async throws {
+        func session(
+            id: String,
+            toolUseId: String,
+            toolName: String,
+            lastActivity: Date
+        ) -> SessionState {
+            SessionState(
+                sessionId: id,
+                cwd: "/tmp/\(id)",
+                phase: .waitingForApproval(PermissionContext(
+                    toolUseId: toolUseId,
+                    toolName: toolName,
+                    toolInput: nil,
+                    receivedAt: lastActivity
+                )),
+                lastActivity: lastActivity
+            )
+        }
+
+        let approval = session(
+            id: "approval-session",
+            toolUseId: "approval",
+            toolName: "Bash",
+            lastActivity: Date(timeIntervalSince1970: 100)
+        )
+        let newerQuestion = session(
+            id: "question-session",
+            toolUseId: "question",
+            toolName: "AskUserQuestion",
+            lastActivity: Date(timeIntervalSince1970: 101)
+        )
+
+        let selected = NotchAttentionPolicy.newestSessionToAutoExpand(
+            from: [approval, newerQuestion],
+            excluding: [],
+            expandQuestionsAutomatically: false
+        )
+        XCTAssertEqual(try XCTUnwrap(selected).sessionId, approval.sessionId)
+
+        XCTAssertNil(NotchAttentionPolicy.newestSessionToAutoExpand(
+            from: [newerQuestion],
+            excluding: [],
+            expandQuestionsAutomatically: false
+        ))
+    }
+
+    func testPresentationDeduplicationIsScopedToSession() async throws {
+        let observedAt = Date()
+        let sharedContext = PermissionContext(
+            toolUseId: "shared-tool-id",
+            toolName: "Bash",
+            toolInput: nil,
+            receivedAt: observedAt
+        )
+        let first = SessionState(
+            sessionId: "session-a",
+            cwd: "/tmp/a",
+            phase: .waitingForApproval(sharedContext),
+            lastActivity: observedAt
+        )
+        let second = SessionState(
+            sessionId: "session-b",
+            cwd: "/tmp/b",
+            phase: .waitingForApproval(sharedContext),
+            lastActivity: observedAt.addingTimeInterval(1)
+        )
+        let firstToken = try XCTUnwrap(
+            NotchAttentionPolicy.interactionToken(for: first)
+        )
+
+        let selected = NotchAttentionPolicy.newestSessionToAutoExpand(
+            from: [first, second],
+            excluding: [firstToken],
+            expandQuestionsAutomatically: true
+        )
+        XCTAssertEqual(try XCTUnwrap(selected).sessionId, second.sessionId)
+    }
 }

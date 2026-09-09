@@ -37,6 +37,7 @@
 - [x] 使用已安装 bridge + 实际刘海按钮完成 allow/deny 端到端回写验收
 - [ ] 在真实 Claude Code/CLI `PermissionRequest` 回合完成端到端 allow/deny 点击验收
 - [ ] 人工确认同一会话的审批不会发送给另一会话
+- [ ] 关闭“问题自动展开”后，`AskUserQuestion` 只显示小刘海待处理状态；普通审批与计划审查仍自动展开
 
 Swift 核心测试命令：
 

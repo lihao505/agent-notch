@@ -211,6 +211,8 @@ final class NotchPreferences: ObservableObject {
         static let hoverDelay = "notchHoverDelay"
         static let collapseOnMouseLeave = "notchCollapseOnMouseLeave"
         static let collapseDelay = "notchCollapseDelay"
+        static let expandQuestionsAutomatically =
+            "notchExpandQuestionsAutomatically"
         static let completionCompactDuration = "notchCompletionCompactDuration"
         static let panelWidth = "notchPanelWidth"
         static let panelHeight = "notchPanelHeight"
@@ -246,6 +248,18 @@ final class NotchPreferences: ObservableObject {
     /// controls in Notch Studio.
     @Published var collapseDelay: Double {
         didSet { defaults.set(collapseDelay, forKey: Keys.collapseDelay) }
+    }
+
+    /// Questions can remain visible as a compact attention signal instead of
+    /// taking over the full panel. Tool approvals and plan reviews are always
+    /// expanded because their risk or context should be visible immediately.
+    @Published var expandQuestionsAutomatically: Bool {
+        didSet {
+            defaults.set(
+                expandQuestionsAutomatically,
+                forKey: Keys.expandQuestionsAutomatically
+            )
+        }
     }
 
     @Published var completionCompactDuration: Double {
@@ -327,6 +341,9 @@ final class NotchPreferences: ObservableObject {
         collapseOnMouseLeave =
             defaults.object(forKey: Keys.collapseOnMouseLeave) as? Bool ?? true
         collapseDelay = defaults.object(forKey: Keys.collapseDelay) as? Double ?? 0.85
+        expandQuestionsAutomatically =
+            defaults.object(forKey: Keys.expandQuestionsAutomatically) as? Bool
+            ?? true
         completionCompactDuration =
             defaults.object(forKey: Keys.completionCompactDuration) as? Double ?? 8
         panelWidth = defaults.object(forKey: Keys.panelWidth) as? Double ?? 640

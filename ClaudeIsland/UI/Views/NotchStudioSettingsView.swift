@@ -750,6 +750,16 @@ struct NotchStudioSettingsView: View {
                 }
 
                 Divider()
+                settingToggle(
+                    t("Auto-open questions", "问题自动展开"),
+                    detail: t(
+                        "Turn this off to keep new questions in the compact notch until you open them.",
+                        "关闭后，新问题会先停留在小刘海，直到你主动打开。"
+                    ),
+                    isOn: $preferences.expandQuestionsAutomatically
+                )
+
+                Divider()
                 sliderRow(
                     title: t("Completion dwell", "完成后停留"),
                     value: $preferences.completionCompactDuration,
