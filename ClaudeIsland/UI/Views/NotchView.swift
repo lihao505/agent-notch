@@ -7,6 +7,7 @@
 //
 
 import AppKit
+import Combine
 import CoreGraphics
 import SwiftUI
 
@@ -29,7 +30,28 @@ private struct NotchLayoutAnimationState: Equatable {
     let compactWidth: Double
 }
 
+/// Task handles are deliberately kept outside SwiftUI's visible state. Making
+/// these `@State` values would invalidate the entire notch hierarchy whenever
+/// a timer is replaced, even though no rendered value changed.
+@MainActor
+private final class NotchDelayedUIWork: ObservableObject {
+    let objectWillChange = ObservableObjectPublisher()
+    var visibilityTask: Task<Void, Never>?
+    var bounceTask: Task<Void, Never>?
+    var completionReminderTasks: [String: Task<Void, Never>] = [:]
+
+    func cancelAll() {
+        visibilityTask?.cancel()
+        visibilityTask = nil
+        bounceTask?.cancel()
+        bounceTask = nil
+        completionReminderTasks.values.forEach { $0.cancel() }
+        completionReminderTasks.removeAll()
+    }
+}
+
 struct NotchView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var sessionMonitor = ClaudeSessionMonitor()
     @StateObject private var activityCoordinator = NotchActivityCoordinator.shared
@@ -42,6 +64,7 @@ struct NotchView: View {
     @State private var isVisible: Bool = false
     @State private var isHovering: Bool = false
     @State private var isBouncing: Bool = false
+    @StateObject private var delayedUIWork = NotchDelayedUIWork()
 
     @Namespace private var activityNamespace
 
@@ -192,8 +215,26 @@ struct NotchView: View {
     }
 
     // Animation springs
-    private let openAnimation = Animation.spring(response: 0.42, dampingFraction: 0.8, blendDuration: 0)
-    private let closeAnimation = Animation.spring(response: 0.45, dampingFraction: 1.0, blendDuration: 0)
+    private var openAnimation: Animation {
+        reduceMotion
+            ? .easeOut(duration: 0.12)
+            : .spring(response: 0.42, dampingFraction: 0.8, blendDuration: 0)
+    }
+
+    private var closeAnimation: Animation {
+        reduceMotion
+            ? .easeOut(duration: 0.1)
+            : .spring(response: 0.45, dampingFraction: 1.0, blendDuration: 0)
+    }
+
+    private var contentTransition: AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .scale(scale: 0.96, anchor: .top)
+                .combined(with: .opacity),
+            removal: .opacity
+        )
+    }
 
     // MARK: - Body
 
@@ -250,10 +291,19 @@ struct NotchView: View {
                             : closeAnimation,
                         value: layoutAnimationState
                     )
-                    .animation(.spring(response: 0.3, dampingFraction: 0.5), value: isBouncing)
+                    .animation(
+                        reduceMotion
+                            ? nil
+                            : .spring(response: 0.3, dampingFraction: 0.5),
+                        value: isBouncing
+                    )
                     .contentShape(Rectangle())
                     .onHover { hovering in
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.8)) {
+                        withAnimation(
+                            reduceMotion
+                                ? .easeOut(duration: 0.1)
+                                : .spring(response: 0.38, dampingFraction: 0.8)
+                        ) {
                             isHovering = hovering
                         }
                     }
@@ -285,6 +335,12 @@ struct NotchView: View {
         }
         .onChange(of: preferences.idleBehavior) { _, _ in
             updateIdleVisibility()
+        }
+        .onChange(of: preferences.completionCompactDuration) { _, _ in
+            rescheduleCompletionReminderExpiries()
+        }
+        .onDisappear {
+            cancelDelayedUIWork()
         }
     }
 
@@ -323,16 +379,7 @@ struct NotchView: View {
                 if viewModel.status == .opened {
                     contentView
                         .frame(width: notchSize.width - 24)
-                        .transition(
-                            .asymmetric(
-                                insertion: .scale(
-                                    scale: 0.8,
-                                    anchor: .top
-                                )
-                                .combined(with: .opacity),
-                                removal: .opacity
-                            )
-                        )
+                        .transition(contentTransition)
                 }
             }
 
@@ -723,6 +770,8 @@ struct NotchView: View {
     private func updateIdleVisibility() {
         if !viewModel.hasPhysicalNotch ||
            preferences.idleBehavior == .alwaysVisible {
+            delayedUIWork.visibilityTask?.cancel()
+            delayedUIWork.visibilityTask = nil
             isVisible = true
         } else if !isAnyProcessing &&
                   !hasPendingPermission &&
@@ -734,10 +783,14 @@ struct NotchView: View {
 
     private func handleProcessingChange() {
         if isAnyProcessing || hasPendingPermission {
+            delayedUIWork.visibilityTask?.cancel()
+            delayedUIWork.visibilityTask = nil
             // Show claude activity when processing or waiting for permission
             activityCoordinator.showActivity(type: .claude)
             isVisible = true
         } else if hasWaitingForInput {
+            delayedUIWork.visibilityTask?.cancel()
+            delayedUIWork.visibilityTask = nil
             // Keep visible for waiting-for-input but hide the processing spinner
             activityCoordinator.hideActivity()
             isVisible = true
@@ -750,11 +803,7 @@ struct NotchView: View {
             if viewModel.status == .closed &&
                viewModel.hasPhysicalNotch &&
                preferences.idleBehavior == .smartHide {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    if !isAnyProcessing && !hasPendingPermission && !hasWaitingForInput && viewModel.status == .closed {
-                        isVisible = false
-                    }
-                }
+                scheduleIdleVisibilityUpdate(after: 0.5)
             }
         }
     }
@@ -762,6 +811,8 @@ struct NotchView: View {
     private func handleStatusChange(from oldStatus: NotchStatus, to newStatus: NotchStatus) {
         switch newStatus {
         case .opened, .popping:
+            delayedUIWork.visibilityTask?.cancel()
+            delayedUIWork.visibilityTask = nil
             isVisible = true
             // A deliberate click acknowledges completion. Merely hovering must
             // not consume the compact reminder and make the notch disappear.
@@ -775,14 +826,7 @@ struct NotchView: View {
                 isVisible = true
                 return
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                if viewModel.status == .closed &&
-                   !isAnyProcessing &&
-                   !hasPendingPermission &&
-                   !hasWaitingForInput {
-                    isVisible = false
-                }
-            }
+            scheduleIdleVisibilityUpdate(after: 0.35)
         }
     }
 
@@ -829,6 +873,8 @@ struct NotchView: View {
         // Clean up timestamps for sessions no longer waiting
         let staleIds = Set(waitingForInputTimestamps.keys).subtracting(currentIds)
         for staleId in staleIds {
+            delayedUIWork.completionReminderTasks[staleId]?.cancel()
+            delayedUIWork.completionReminderTasks.removeValue(forKey: staleId)
             waitingForInputTimestamps.removeValue(forKey: staleId)
         }
 
@@ -860,12 +906,18 @@ struct NotchView: View {
             }
 
             // Trigger bounce animation to get user's attention
-            DispatchQueue.main.async {
+            delayedUIWork.bounceTask?.cancel()
+            delayedUIWork.bounceTask = nil
+            if !reduceMotion {
                 isBouncing = true
-                // Bounce back after a short delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                delayedUIWork.bounceTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(150))
+                    guard !Task.isCancelled else { return }
                     isBouncing = false
+                    delayedUIWork.bounceTask = nil
                 }
+            } else {
+                isBouncing = false
             }
 
         }
@@ -877,9 +929,16 @@ struct NotchView: View {
         sessionId: String,
         enteredAt: Date
     ) {
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + preferences.completionCompactDuration
-        ) {
+        delayedUIWork.completionReminderTasks[sessionId]?.cancel()
+        let remaining = max(
+            0,
+            enteredAt.addingTimeInterval(
+                preferences.completionCompactDuration
+            ).timeIntervalSinceNow
+        )
+        delayedUIWork.completionReminderTasks[sessionId] = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(remaining))
+            guard !Task.isCancelled else { return }
             guard waitingForInputTimestamps[sessionId] == enteredAt else {
                 return
             }
@@ -887,9 +946,38 @@ struct NotchView: View {
             // comparing Date() in `hasWaitingForInput` does not schedule a
             // refresh when the reminder duration elapses.
             waitingForInputTimestamps.removeValue(forKey: sessionId)
+            delayedUIWork.completionReminderTasks.removeValue(forKey: sessionId)
             handleProcessingChange()
             updateIdleVisibility()
         }
+    }
+
+    private func rescheduleCompletionReminderExpiries() {
+        for (sessionId, enteredAt) in waitingForInputTimestamps {
+            scheduleCompletionReminderExpiry(
+                sessionId: sessionId,
+                enteredAt: enteredAt
+            )
+        }
+    }
+
+    private func scheduleIdleVisibilityUpdate(after delay: TimeInterval) {
+        delayedUIWork.visibilityTask?.cancel()
+        delayedUIWork.visibilityTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(max(0, delay)))
+            guard !Task.isCancelled else { return }
+            delayedUIWork.visibilityTask = nil
+            if viewModel.status == .closed &&
+               !isAnyProcessing &&
+               !hasPendingPermission &&
+               !hasWaitingForInput {
+                isVisible = false
+            }
+        }
+    }
+
+    private func cancelDelayedUIWork() {
+        delayedUIWork.cancelAll()
     }
 
     /// Determine if notification sound should play for the given sessions

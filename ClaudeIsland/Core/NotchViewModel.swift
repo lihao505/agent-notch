@@ -16,7 +16,7 @@ enum NotchStatus: Equatable {
     case popping
 }
 
-enum NotchOpenReason {
+enum NotchOpenReason: Equatable {
     case click
     case hover
     case notification
@@ -236,11 +236,20 @@ class NotchViewModel: ObservableObject {
         hoverTimer?.cancel()
         hoverTimer = nil
 
-        if isHovering,
-           preferences.expandOnHover,
-           (status == .closed || status == .popping) {
+        if Self.shouldPerformDeferredHoverOpen(
+            isHovering: isHovering,
+            status: status,
+            expandOnHover: preferences.expandOnHover
+        ) {
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self, self.isHovering else { return }
+                guard let self,
+                      Self.shouldPerformDeferredHoverOpen(
+                        isHovering: self.isHovering,
+                        status: self.status,
+                        expandOnHover: self.preferences.expandOnHover
+                      ) else {
+                    return
+                }
                 self.notchOpen(reason: .hover)
             }
             hoverTimer = workItem
@@ -248,15 +257,26 @@ class NotchViewModel: ObservableObject {
                 deadline: .now() + max(0, preferences.hoverDelay),
                 execute: workItem
             )
-        } else if !isHovering,
-                  preferences.collapseOnMouseLeave,
-                  status == .opened {
+        } else if Self.shouldAutoCollapseOnPointerExit(
+            isHovering: isHovering,
+            status: status,
+            openReason: openReason,
+            collapseOnMouseLeave: preferences.collapseOnMouseLeave
+        ) {
             // Wait until the pointer has stayed fully outside the expanded
             // boundary. This avoids collapsing while crossing rounded edges
             // or moving toward nearby menu-bar controls.
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self, !self.isHovering,
-                      self.status == .opened else { return }
+                guard let self,
+                      Self.shouldAutoCollapseOnPointerExit(
+                        isHovering: self.isHovering,
+                        status: self.status,
+                        openReason: self.openReason,
+                        collapseOnMouseLeave:
+                            self.preferences.collapseOnMouseLeave
+                      ) else {
+                    return
+                }
                 self.notchClose()
             }
             hoverTimer = workItem
@@ -271,6 +291,35 @@ class NotchViewModel: ObservableObject {
         schedulePointerTransition()
     }
 
+    /// Deferred hover work must still match the live pointer and presentation
+    /// state when it fires. A click can open the notch while the dwell timer is
+    /// pending; allowing that stale timer to run would downgrade the panel to a
+    /// hover-owned presentation and make it collapse under active interaction.
+    static func shouldPerformDeferredHoverOpen(
+        isHovering: Bool,
+        status: NotchStatus,
+        expandOnHover: Bool
+    ) -> Bool {
+        isHovering &&
+            expandOnHover &&
+            (status == .closed || status == .popping)
+    }
+
+    /// Mouse-leave is ownership-aware. Only a lightweight hover preview is
+    /// auto-collapsible; a panel the user opened or navigated deliberately must
+    /// remain available until an explicit outside click or close action.
+    static func shouldAutoCollapseOnPointerExit(
+        isHovering: Bool,
+        status: NotchStatus,
+        openReason: NotchOpenReason,
+        collapseOnMouseLeave: Bool
+    ) -> Bool {
+        !isHovering &&
+            collapseOnMouseLeave &&
+            status == .opened &&
+            openReason == .hover
+    }
+
     private func handleMouseDown() {
         let location = NSEvent.mouseLocation
 
@@ -280,12 +329,13 @@ class NotchViewModel: ObservableObject {
                 notchClose()
                 // Re-post the click so it reaches the window/app behind us
                 repostClickAt(location)
-            } else if geometry.notchScreenRect.contains(location) {
-                // Header controls (including Quick Controls) live beside the
-                // physical notch. Do not let the global mouse monitor close
-                // the panel before their SwiftUI button actions are delivered.
-                // Users can still close via outside click or mouse-leave.
-                return
+            } else {
+                // A hover preview becomes an intentional presentation as
+                // soon as the user interacts anywhere inside it. Without
+                // this ownership handoff, clicking a panel that happened to
+                // finish its hover expansion first would still let the
+                // pending mouse-leave policy collapse it under the user.
+                claimOpenedPanelInteraction()
             }
         case .closed, .popping:
             if isPointInCompactNotch(location) {
@@ -328,6 +378,8 @@ class NotchViewModel: ObservableObject {
     // MARK: - Actions
 
     func notchOpen(reason: NotchOpenReason = .unknown) {
+        hoverTimer?.cancel()
+        hoverTimer = nil
         openReason = reason
         status = .opened
 
@@ -348,6 +400,8 @@ class NotchViewModel: ObservableObject {
     }
 
     func notchClose() {
+        hoverTimer?.cancel()
+        hoverTimer = nil
         // Save chat session before closing if in chat mode
         if case .chat(let session) = contentType {
             currentChatSession = session
@@ -355,6 +409,16 @@ class NotchViewModel: ObservableObject {
         status = .closed
         contentType = .instances
         compactApprovalSessionId = nil
+    }
+
+    /// Transfers an automatically opened panel to direct user ownership.
+    /// This is intentionally separate from individual SwiftUI controls so the
+    /// first mouse-down protects every current and future control uniformly.
+    func claimOpenedPanelInteraction() {
+        guard status == .opened else { return }
+        hoverTimer?.cancel()
+        hoverTimer = nil
+        openReason = .click
     }
 
     func notchPop() {
@@ -368,6 +432,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func toggleMenu() {
+        claimOpenedPanelInteraction()
         compactApprovalSessionId = nil
         contentType = contentType == .menu ? .instances : .menu
     }
@@ -377,6 +442,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func showChat(for session: SessionState) {
+        claimOpenedPanelInteraction()
         compactApprovalSessionId = nil
         // Avoid unnecessary updates if already showing this chat
         if case .chat(let current) = contentType, current.sessionId == session.sessionId {
@@ -388,7 +454,14 @@ class NotchViewModel: ObservableObject {
     /// Open a permission request in a smaller, scrollable conversation panel.
     /// The normal chat size remains available when the user opens it manually.
     func showApproval(for session: SessionState) {
-        openReason = .notification
+        hoverTimer?.cancel()
+        hoverTimer = nil
+        // Do not downgrade a panel already owned by direct user interaction.
+        // The actionable conversation may change, but its close policy should
+        // not suddenly become automatic while the user is inside it.
+        if status != .opened || openReason != .click {
+            openReason = .notification
+        }
         currentChatSession = nil
         compactApprovalSessionId = session.sessionId
         contentType = .chat(session)
@@ -397,6 +470,7 @@ class NotchViewModel: ObservableObject {
 
     /// Go back to instances list and clear saved chat state
     func exitChat() {
+        claimOpenedPanelInteraction()
         currentChatSession = nil
         compactApprovalSessionId = nil
         contentType = .instances

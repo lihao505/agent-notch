@@ -732,8 +732,8 @@ struct NotchStudioSettingsView: View {
                 settingToggle(
                     t("Collapse on mouse leave", "鼠标移开后收起"),
                     detail: t(
-                        "Return to the compact notch automatically.",
-                        "自动返回小刘海状态。"
+                        "Return hover previews to the compact notch automatically.",
+                        "悬停预览在鼠标离开后自动返回小刘海。"
                     ),
                     isOn: $preferences.collapseOnMouseLeave
                 )

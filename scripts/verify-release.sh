@@ -25,6 +25,7 @@ required_files=(
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
     ClaudeIslandTests/PermissionRoutingTests.swift
     ClaudeIslandTests/ConversationParserIndexTests.swift
+    ClaudeIslandTests/NotchPresentationTimingTests.swift
 )
 for file in "${required_files[@]}"; do
     [ -s "$file" ] || fail "required release file is missing or empty: $file"

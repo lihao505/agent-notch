@@ -1345,12 +1345,11 @@ struct AssistantMessageView: View {
 // MARK: - Processing Indicator
 
 struct ProcessingIndicatorView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private let baseTexts = ["Processing", "Working"]
     private let color: Color
     private let baseText: String
-
-    @State private var dotCount: Int = 1
-    private let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+    private let dotInterval: TimeInterval = 0.4
 
     /// Use a turnId to select text consistently per user turn
     init(
@@ -1363,24 +1362,31 @@ struct ProcessingIndicatorView: View {
         baseText = baseTexts[index]
     }
 
-    private var dots: String {
-        String(repeating: ".", count: dotCount)
-    }
-
     var body: some View {
         HStack(alignment: .center, spacing: 6) {
             ProcessingSpinner(color: color)
                 .frame(width: 6)
 
-            Text(baseText + dots)
-                .font(.system(size: 13))
-                .foregroundColor(color)
+            if reduceMotion {
+                processingLabel(dotCount: 3)
+            } else {
+                TimelineView(.periodic(from: .now, by: dotInterval)) { context in
+                    processingLabel(dotCount: dotCount(at: context.date))
+                }
+            }
 
             Spacer()
         }
-        .onReceive(timer) { _ in
-            dotCount = (dotCount % 3) + 1
-        }
+    }
+
+    private func processingLabel(dotCount: Int) -> some View {
+        Text(baseText + String(repeating: ".", count: dotCount))
+            .font(.system(size: 13))
+            .foregroundColor(color)
+    }
+
+    private func dotCount(at date: Date) -> Int {
+        Int(date.timeIntervalSinceReferenceDate / dotInterval) % 3 + 1
     }
 }
 
@@ -1819,6 +1825,7 @@ struct ChatInteractivePromptBar: View {
 
 /// Approval bar for the chat view with animated buttons
 struct ChatApprovalBar: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let tool: String
     let toolInput: String?
     let onApproveOnce: () -> Void
@@ -1878,30 +1885,39 @@ struct ChatApprovalBar: View {
                     icon: "xmark",
                     foreground: .white.opacity(0.72),
                     background: .white.opacity(0.09),
+                    shortcut: KeyboardShortcut("n", modifiers: .command),
+                    shortcutHint: "⌘N",
                     action: onDeny
                 )
                 .opacity(showDenyButton ? 1 : 0)
-                .scaleEffect(showDenyButton ? 1 : 0.8)
+                .scaleEffect(showDenyButton ? 1 : 0.96)
 
                 approvalButton(
                     t("Allow once", "允许一次"),
                     icon: "checkmark",
                     foreground: .black,
                     background: .white.opacity(0.94),
+                    shortcut: KeyboardShortcut("y", modifiers: .command),
+                    shortcutHint: "⌘Y",
                     action: onApproveOnce
                 )
                 .opacity(showAllowButton ? 1 : 0)
-                .scaleEffect(showAllowButton ? 1 : 0.8)
+                .scaleEffect(showAllowButton ? 1 : 0.96)
 
                 approvalButton(
                     t("Auto approve", "自动审批"),
                     icon: "bolt.fill",
                     foreground: .black,
                     background: TerminalColors.green,
+                    shortcut: KeyboardShortcut(
+                        "y",
+                        modifiers: [.command, .option]
+                    ),
+                    shortcutHint: "⌥⌘Y",
                     action: onAutoApprove
                 )
                 .opacity(showAllowButton ? 1 : 0)
-                .scaleEffect(showAllowButton ? 1 : 0.8)
+                .scaleEffect(showAllowButton ? 1 : 0.96)
             }
         }
         .frame(minHeight: 82)
@@ -1909,6 +1925,12 @@ struct ChatApprovalBar: View {
         .padding(.vertical, 12)
         .background(Color.black.opacity(0.2))
         .onAppear {
+            guard !reduceMotion else {
+                showContent = true
+                showDenyButton = true
+                showAllowButton = true
+                return
+            }
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.05)) {
                 showContent = true
             }
@@ -1926,6 +1948,8 @@ struct ChatApprovalBar: View {
         icon: String,
         foreground: Color,
         background: Color,
+        shortcut: KeyboardShortcut,
+        shortcutHint: String,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -1938,6 +1962,8 @@ struct ChatApprovalBar: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+        .keyboardShortcut(shortcut)
+        .help("\(title) (\(shortcutHint))")
     }
 
     private func t(_ english: String, _ chinese: String) -> String {
