@@ -6,6 +6,7 @@
 //  Redesigned chat interface with clean visual hierarchy
 //
 
+import AppKit
 import Combine
 import SwiftUI
 
@@ -193,6 +194,8 @@ struct ChatView: View {
     @State private var sendTask: Task<Void, Never>?
     @State private var activeSendGeneration: UUID?
     @State private var sendErrorMessage: String?
+    @State private var terminalFocusErrorMessage: String?
+    @State private var terminalFocusTask: Task<Void, Never>?
     @FocusState private var isInputFocused: Bool
 
     init(sessionId: String, initialSession: SessionState, sessionMonitor: ClaudeSessionMonitor, viewModel: NotchViewModel) {
@@ -350,7 +353,11 @@ struct ChatView: View {
                updated != session {
                 // Check if permission was just accepted (transition from waitingForApproval to processing)
                 let wasWaiting = isWaitingForApproval
+                let previousInteractionId = session.pendingToolId
                 session = updated
+                if previousInteractionId != updated.pendingToolId {
+                    terminalFocusErrorMessage = nil
+                }
                 let isNowProcessing = updated.phase == .processing
                 let isNowWaiting = updated.phase.isWaitingForApproval
 
@@ -394,6 +401,9 @@ struct ChatView: View {
                     isInputFocused = true
                 }
             }
+        }
+        .onDisappear {
+            terminalFocusTask?.cancel()
         }
     }
 
@@ -842,6 +852,7 @@ struct ChatView: View {
             StructuredInteractivePromptBar(
                 context: permission,
                 isInTmux: session.isInTmux,
+                focusErrorMessage: terminalFocusErrorMessage,
                 onSubmitAnswers: { answers in
                     sessionMonitor.answerQuestions(
                         sessionId: sessionId,
@@ -879,11 +890,19 @@ struct ChatView: View {
     // MARK: - Actions
 
     private func focusTerminal() {
-        Task {
-            if let pid = session.pid {
-                _ = await YabaiController.shared.focusWindow(forClaudePid: pid)
-            } else {
-                _ = await YabaiController.shared.focusWindow(forWorkingDirectory: session.cwd)
+        terminalFocusTask?.cancel()
+        terminalFocusErrorMessage = nil
+        let sessionSnapshot = session
+
+        terminalFocusTask = Task { @MainActor in
+            let focused = await TerminalFocusCoordinator.shared.focus(sessionSnapshot)
+            guard !Task.isCancelled else { return }
+            if !focused {
+                terminalFocusErrorMessage = t(
+                    "Could not confirm the correct terminal window. Try again or switch manually.",
+                    "未能确认已切到正确的终端窗口，请重试或手动切换。"
+                )
+                NSSound.beep()
             }
         }
     }

@@ -12,6 +12,8 @@ import SwiftUI
 struct ClaudeInstancesView: View {
     @ObservedObject var sessionMonitor: ClaudeSessionMonitor
     @ObservedObject var viewModel: NotchViewModel
+    @State private var focusFailureSessionId: String?
+    @State private var focusTask: Task<Void, Never>?
 
     var body: some View {
         if sessionMonitor.instances.isEmpty {
@@ -72,6 +74,7 @@ struct ClaudeInstancesView: View {
                 ForEach(sortedInstances) { session in
                     InstanceRow(
                         session: session,
+                        focusFailed: focusFailureSessionId == session.sessionId,
                         onFocus: { focusSession(session) },
                         onChat: { openChat(session) },
                         onArchive: { archiveSession(session) },
@@ -89,6 +92,9 @@ struct ClaudeInstancesView: View {
     // MARK: - Actions
 
     private func focusSession(_ session: SessionState) {
+        focusTask?.cancel()
+        focusFailureSessionId = nil
+
         // Codex Desktop uses the hook session_id as its thread id. Opening this
         // native deep link selects the exact task instead of merely activating
         // the last Codex window.
@@ -128,38 +134,22 @@ struct ClaudeInstancesView: View {
             return
         }
 
-        Task {
-            // Preserve precise tmux pane switching when yabai is available.
-            if session.isInTmux {
-                let focused: Bool
-                if let pid = session.pid {
-                    focused = await YabaiController.shared.focusWindow(
-                        forClaudePid: pid
-                    )
-                } else {
-                    focused = await YabaiController.shared.focusWindow(
-                        forWorkingDirectory: session.cwd
-                    )
-                }
-                if focused {
-                    return
-                }
+        focusTask = Task { @MainActor in
+            let focused = await TerminalFocusCoordinator.shared.focus(session)
+            guard !Task.isCancelled else { return }
+
+            guard !focused else {
+                focusFailureSessionId = nil
+                return
             }
 
-            // Plain Terminal/iTerm/Warp sessions do not need yabai. Walk up to
-            // their owning terminal app and activate it.
-            guard let pid = session.pid else { return }
-            let tree = ProcessTreeBuilder.shared.buildTree()
-            guard let terminalPid = ProcessTreeBuilder.shared.findTerminalPid(
-                forProcess: pid,
-                tree: tree
-            ) else { return }
-            _ = await MainActor.run {
-                NSRunningApplication(processIdentifier: pid_t(terminalPid))?
-                    .activate(options: [
-                        .activateAllWindows,
-                    ])
-            }
+            focusFailureSessionId = session.sessionId
+            NSSound.beep()
+
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled,
+                  focusFailureSessionId == session.sessionId else { return }
+            focusFailureSessionId = nil
         }
     }
 
@@ -193,6 +183,7 @@ struct ClaudeInstancesView: View {
 
 struct InstanceRow: View {
     let session: SessionState
+    let focusFailed: Bool
     let onFocus: () -> Void
     let onChat: () -> Void
     let onArchive: () -> Void
@@ -255,8 +246,13 @@ struct InstanceRow: View {
                     }
                 }
 
-                // Show tool call when waiting for approval, otherwise last activity
-                if isWaitingForApproval, let toolName = session.pendingToolName {
+                // A failed jump is more actionable than stale activity text.
+                if focusFailed {
+                    Label("Could not confirm terminal focus", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.red.opacity(0.85))
+                        .lineLimit(1)
+                } else if isWaitingForApproval, let toolName = session.pendingToolName {
                     // Show tool name in amber + input on same line
                     HStack(spacing: 4) {
                         Text(MCPToolFormatter.formatToolName(toolName))
@@ -401,19 +397,25 @@ struct InstanceRow: View {
 
     @ViewBuilder
     private var stateIndicator: some View {
-        switch session.phase {
-        case .processing, .compacting:
-            ProcessingSpinner(color: session.source.accentColor)
-        case .waitingForApproval:
-            ProcessingSpinner(color: TerminalColors.amber)
-        case .waitingForInput:
-            Circle()
-                .fill(TerminalColors.green)
-                .frame(width: 6, height: 6)
-        case .idle, .ended:
-            Circle()
-                .fill(Color.white.opacity(0.2))
-                .frame(width: 6, height: 6)
+        if focusFailed {
+            Image(systemName: "exclamationmark")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.red.opacity(0.85))
+        } else {
+            switch session.phase {
+            case .processing, .compacting:
+                ProcessingSpinner(color: session.source.accentColor)
+            case .waitingForApproval:
+                ProcessingSpinner(color: TerminalColors.amber)
+            case .waitingForInput:
+                Circle()
+                    .fill(TerminalColors.green)
+                    .frame(width: 6, height: 6)
+            case .idle, .ended:
+                Circle()
+                    .fill(Color.white.opacity(0.2))
+                    .frame(width: 6, height: 6)
+            }
         }
     }
 

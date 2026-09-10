@@ -10,6 +10,7 @@ import SwiftUI
 struct StructuredInteractivePromptBar: View {
     let context: PermissionContext
     let isInTmux: Bool
+    let focusErrorMessage: String?
     let onSubmitAnswers: ([String: String]) -> Void
     let onApprovePlan: () -> Void
     let onDeny: () -> Void
@@ -24,13 +25,22 @@ struct StructuredInteractivePromptBar: View {
     }
 
     var body: some View {
-        Group {
-            if context.toolName == "AskUserQuestion", !questions.isEmpty {
-                questionContent
-            } else if context.toolName == "ExitPlanMode" {
-                planContent
-            } else {
-                terminalFallback
+        VStack(alignment: .leading, spacing: 8) {
+            Group {
+                if context.toolName == "AskUserQuestion", !questions.isEmpty {
+                    questionContent
+                } else if context.toolName == "ExitPlanMode" {
+                    planContent
+                } else {
+                    terminalFallback
+                }
+            }
+
+            if let focusErrorMessage {
+                Label(focusErrorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.red.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.horizontal, 16)

@@ -51,7 +51,27 @@ actor TmuxController {
                 "select-pane", "-t", target.targetString
             ])
 
-            return true
+            let outcome = await FocusVerificationPolicy.evaluate {
+                await self.isTargetActive(target, tmuxPath: tmuxPath)
+            }
+            return outcome == .success
+        } catch {
+            return false
+        }
+    }
+
+    /// `select-window` and `select-pane` can exit successfully before an
+    /// attached client reflects the new target. Verify both dimensions so an
+    /// inactive pane in the right session is not treated as a successful jump.
+    private func isTargetActive(_ target: TmuxTarget, tmuxPath: String) async -> Bool {
+        do {
+            let output = try await ProcessExecutor.shared.run(tmuxPath, arguments: [
+                "display-message",
+                "-p",
+                "-t", target.targetString,
+                "#{window_active}:#{pane_active}",
+            ])
+            return output.trimmingCharacters(in: .whitespacesAndNewlines) == "1:1"
         } catch {
             return false
         }

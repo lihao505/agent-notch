@@ -76,6 +76,32 @@ actor WindowFinder {
         }
     }
 
+    /// Verify the exact yabai window currently owns focus.
+    func isWindowFocused(id: Int) async -> Bool {
+        guard isYabaiAvailable(), let path = yabaiPath else { return false }
+
+        do {
+            let output = try await ProcessExecutor.shared.run(path, arguments: [
+                "-m", "query", "--windows", "--window", String(id),
+            ])
+            return Self.isFocusedWindow(id: id, yabaiOutput: output)
+        } catch {
+            return false
+        }
+    }
+
+    nonisolated static func isFocusedWindow(
+        id: Int,
+        yabaiOutput: String
+    ) -> Bool {
+        guard let data = yabaiOutput.data(using: .utf8),
+              let dictionary = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let window = YabaiWindow(from: dictionary) else {
+            return false
+        }
+        return window.id == id && window.hasFocus
+    }
+
     /// Get the current space number
     nonisolated func getCurrentSpace(windows: [YabaiWindow]) -> Int? {
         windows.first(where: { $0.hasFocus })?.space

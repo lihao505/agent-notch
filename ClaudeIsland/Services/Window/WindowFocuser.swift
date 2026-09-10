@@ -21,7 +21,11 @@ actor WindowFocuser {
             _ = try await ProcessExecutor.shared.run(yabaiPath, arguments: [
                 "-m", "window", "--focus", String(id)
             ])
-            return true
+
+            let outcome = await FocusVerificationPolicy.evaluate {
+                await WindowFinder.shared.isWindowFocused(id: id)
+            }
+            return outcome == .success
         } catch {
             return false
         }

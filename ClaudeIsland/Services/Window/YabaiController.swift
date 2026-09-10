@@ -42,8 +42,10 @@ actor YabaiController {
             return false
         }
 
-        // Switch to the correct pane
-        _ = await TmuxController.shared.switchToPane(target: target)
+        // Both the tmux pane and the owning macOS window must confirm focus.
+        guard await TmuxController.shared.switchToPane(target: target) else {
+            return false
+        }
 
         // Find terminal for this specific tmux session
         if let terminalPid = await findTmuxClientTerminal(forSession: target.session, tree: tree, windows: windows) {
@@ -128,14 +130,16 @@ actor YabaiController {
 
                     // Found matching pane - switch to it
                     if let target = TmuxTarget(from: targetString) {
-                        _ = await TmuxController.shared.switchToPane(target: target)
+                        guard await TmuxController.shared.switchToPane(target: target) else {
+                            return false
+                        }
 
                         // Focus the terminal window for this session
                         if let terminalPid = await findTmuxClientTerminal(forSession: target.session, tree: tree, windows: windows) {
                             return await WindowFocuser.shared.focusTmuxWindow(terminalPid: terminalPid, windows: windows)
                         }
                     }
-                    return true
+                    return false
                 }
             }
         } catch {

@@ -17,7 +17,7 @@
 | Claude + Codex 统一会话 | 已实现 | 两类任务同时显示且来源清晰 |
 | 真实标题 | 已实现 | Codex 显示 Desktop 任务标题，不回退为目录名 |
 | 刘海内聊天 | 原生构建与入口验收通过 | 回复进入原任务，不创建新任务 |
-| 点击精确跳转 | Codex 原生点击已验收 | Codex 打开对应 thread；终端会话进入对应 pane/tab |
+| 点击精确跳转 | Codex 原生点击已验收；tmux 已加入结果复核 | Codex 打开对应 thread；终端会话进入对应 pane/tab；无法确认目标窗口时不误报成功并保留失败提示 |
 | 普通 allow/deny | 已实现，待真实协议验收 | 唯一决策桥，断连/超时回退原生提示 |
 | AskUserQuestion | 已通过原生构建，待真实 Claude 回合 | 1–4 题、单选、多选、自定义答案、分页 |
 | Markdown 计划审查 | 已通过原生构建，待真实 Claude 回合 | 查看、批准、退回，不改变非预期权限模式 |
@@ -33,7 +33,7 @@
 | 静默场景与过滤 | 待实现 | 专注/锁屏/录屏、cwd/prompt/launcher 规则 |
 | 声音系统 | 待实现 | 分事件声音、系统声音、自定义文件、总静音 |
 | 全局快捷键 | 待实现 | 展开、收起、会话切换、批准/拒绝/问题选择 |
-| 精确跳转矩阵 | 部分实现 | Terminal、iTerm2、Ghostty、Warp、WezTerm、Kitty、IDE、tmux |
+| 精确跳转矩阵 | 部分实现；yabai + tmux 可验证，其他终端待扩展 | Terminal、iTerm2、Ghostty、Warp、WezTerm、Kitty、IDE、tmux |
 | 更多 CLI | 待实现 | 按优先级接入 Gemini、Cursor、OpenCode，再扩展其他 Agent |
 | SSH Remote | 待实现 | 部署、信任、隧道、自动重连、手动 SSO 模式 |
 | 资源目标 | 待持续验收 | 空闲近零 CPU、常驻内存低于 100 MB |
