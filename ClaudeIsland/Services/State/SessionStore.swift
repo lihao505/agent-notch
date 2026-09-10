@@ -279,7 +279,8 @@ actor SessionStore {
                 sessions[sessionId] = session
                 return
             }
-            if event.event == "SessionExpired" {
+            if event.event == "SessionExpired" ||
+                event.event == "SessionEnd" {
                 sessions.removeValue(forKey: sessionId)
             } else {
                 session.phase = .ended

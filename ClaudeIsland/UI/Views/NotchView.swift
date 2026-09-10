@@ -9,7 +9,13 @@
 import AppKit
 import Combine
 import CoreGraphics
+import os.log
 import SwiftUI
+
+private let attentionLogger = Logger(
+    subsystem: "com.agentnotch",
+    category: "Attention"
+)
 
 // Corner radius constants
 private let cornerRadiusInsets = (
@@ -30,103 +36,6 @@ private struct NotchLayoutAnimationState: Equatable {
     let compactWidth: Double
 }
 
-/// A completion is an event generation, not merely a session that currently
-/// happens to be idle. Keeping the authoritative completion boundary in the
-/// identity prevents PID/title refreshes from replaying the same alert and
-/// still lets a very fast next turn surface even if SwiftUI coalesces the
-/// intermediate processing snapshot.
-struct NotchCompletionToken: Hashable, Sendable {
-    let sessionId: String
-    let completedAt: Date
-}
-
-/// Presentation deduplication uses the same complete identity as permission
-/// routing. Tool-use ids are scoped to a session and cannot safely suppress an
-/// interaction arriving from a different concurrent agent.
-struct NotchInteractionToken: Hashable, Sendable {
-    let sessionId: String
-    let toolUseId: String
-}
-
-enum NotchAttentionPolicy {
-    static func interactionToken(
-        for session: SessionState
-    ) -> NotchInteractionToken? {
-        guard let toolUseId = session.pendingToolId else { return nil }
-        return NotchInteractionToken(
-            sessionId: session.sessionId,
-            toolUseId: toolUseId
-        )
-    }
-
-    /// Compact-question mode suppresses only automatic panel expansion. The
-    /// session remains pending and visible in the compact notch/list, while
-    /// risk-bearing approvals and plan reviews keep their urgent behavior.
-    static func shouldAutoExpandInteraction(
-        _ context: PermissionContext,
-        expandQuestionsAutomatically: Bool
-    ) -> Bool {
-        context.toolName != "AskUserQuestion" ||
-            expandQuestionsAutomatically
-    }
-
-    /// Select after applying compact-question policy so a newer quiet question
-    /// cannot mask an older risk-bearing approval that arrived in the same
-    /// published update.
-    static func newestSessionToAutoExpand(
-        from sessions: [SessionState],
-        excluding previousTokens: Set<NotchInteractionToken>,
-        expandQuestionsAutomatically: Bool
-    ) -> SessionState? {
-        sessions.filter { session in
-            guard let token = interactionToken(for: session),
-                  !previousTokens.contains(token),
-                  let interaction = session.activePermission else {
-                return false
-            }
-            return shouldAutoExpandInteraction(
-                interaction,
-                expandQuestionsAutomatically: expandQuestionsAutomatically
-            )
-        }
-        .max(by: { $0.lastActivity < $1.lastActivity })
-    }
-
-    static func completionToken(
-        for session: SessionState
-    ) -> NotchCompletionToken? {
-        guard session.phase == .waitingForInput,
-              let completedAt = session.completedAt else {
-            return nil
-        }
-        return NotchCompletionToken(
-            sessionId: session.sessionId,
-            completedAt: completedAt
-        )
-    }
-
-    static func shouldPresent(
-        _ token: NotchCompletionToken,
-        presentationStartedAt: Date,
-        duration: TimeInterval,
-        now: Date = Date()
-    ) -> Bool {
-        let age = now.timeIntervalSince(token.completedAt)
-        return token.completedAt >= presentationStartedAt &&
-            age >= -5 &&
-            age < duration
-    }
-
-    static func isStillCurrent(
-        _ token: NotchCompletionToken,
-        in sessions: [SessionState]
-    ) -> Bool {
-        sessions.contains {
-            completionToken(for: $0) == token
-        }
-    }
-}
-
 /// Task handles are deliberately kept outside SwiftUI's visible state. Making
 /// these `@State` values would invalidate the entire notch hierarchy whenever
 /// a timer is replaced, even though no rendered value changed.
@@ -136,7 +45,8 @@ private final class NotchDelayedUIWork: ObservableObject {
     var visibilityTask: Task<Void, Never>?
     var bounceTask: Task<Void, Never>?
     var completionSoundTask: Task<Void, Never>?
-    var completionReminderTasks: [String: Task<Void, Never>] = [:]
+    var followUpDeliveryTask: Task<Void, Never>?
+    var completionVisibilityTasks: [String: Task<Void, Never>] = [:]
 
     func cancelAll() {
         visibilityTask?.cancel()
@@ -145,8 +55,10 @@ private final class NotchDelayedUIWork: ObservableObject {
         bounceTask = nil
         completionSoundTask?.cancel()
         completionSoundTask = nil
-        completionReminderTasks.values.forEach { $0.cancel() }
-        completionReminderTasks.removeAll()
+        followUpDeliveryTask?.cancel()
+        followUpDeliveryTask = nil
+        completionVisibilityTasks.values.forEach { $0.cancel() }
+        completionVisibilityTasks.removeAll()
     }
 }
 
@@ -161,12 +73,14 @@ struct NotchView: View {
     @State private var previousInteractionTokens:
         Set<NotchInteractionToken> = []
     @State private var previousCompletionTokens: Set<NotchCompletionToken> = []
-    @State private var waitingForInputTimestamps: [String: Date] = [:]  // sessionId -> when it entered waitingForInput
+    @State private var completionVisibilityStartedAt: [String: Date] = [:]
     @State private var attentionTrackingStartedAt = Date()
     @State private var isVisible: Bool = false
     @State private var isHovering: Bool = false
     @State private var isBouncing: Bool = false
     @StateObject private var delayedUIWork = NotchDelayedUIWork()
+    @StateObject private var followUpReminderCoordinator =
+        NotchFollowUpReminderCoordinator()
 
     @Namespace private var activityNamespace
 
@@ -187,8 +101,9 @@ struct NotchView: View {
         return sessionMonitor.instances.contains { session in
             guard session.phase == .waitingForInput else { return false }
             // Only show while the compact completion reminder is active.
-            if let enteredAt = waitingForInputTimestamps[session.sessionId] {
-                return now.timeIntervalSince(enteredAt) <
+            if let displayStartedAt =
+                completionVisibilityStartedAt[session.sessionId] {
+                return now.timeIntervalSince(displayStartedAt) <
                     preferences.completionCompactDuration
             }
             return false
@@ -423,6 +338,7 @@ struct NotchView: View {
             sessionMonitor.startMonitoring()
             viewModel.updateVisibleSessionCount(sessionMonitor.instances.count)
             updateIdleVisibility()
+            reconcileFollowUpReminders(sessionMonitor.instances)
         }
         .onChange(of: viewModel.status) { oldStatus, newStatus in
             handleStatusChange(from: oldStatus, to: newStatus)
@@ -434,15 +350,27 @@ struct NotchView: View {
             viewModel.updateVisibleSessionCount(instances.count)
             handleProcessingChange()
             handleWaitingForInputChange(instances)
+            reconcileFollowUpReminders(instances)
         }
         .onChange(of: preferences.idleBehavior) { _, _ in
             updateIdleVisibility()
         }
         .onChange(of: preferences.completionCompactDuration) { _, _ in
-            rescheduleCompletionReminderExpiries()
+            rescheduleCompletionVisibilityExpiries()
+        }
+        .onChange(of: preferences.followUpRemindersEnabled) { _, _ in
+            reconcileFollowUpReminders(sessionMonitor.instances)
+        }
+        .onChange(of: preferences.followUpReminderDelay) { _, _ in
+            reconcileFollowUpReminders(sessionMonitor.instances)
+        }
+        .onChange(of: followUpReminderCoordinator.pendingTargets) {
+            _, targets in
+            deliverFollowUpReminders(targets)
         }
         .onDisappear {
             cancelDelayedUIWork()
+            followUpReminderCoordinator.cancelAll()
         }
     }
 
@@ -919,7 +847,8 @@ struct NotchView: View {
             // A deliberate click acknowledges completion. Merely hovering must
             // not consume the compact reminder and make the notch disappear.
             if viewModel.openReason == .click {
-                waitingForInputTimestamps.removeAll()
+                acknowledgeCurrentCompletions()
+                completionVisibilityStartedAt.removeAll()
             }
         case .closed:
             // Don't hide on non-notched devices - users need a visible target
@@ -985,22 +914,25 @@ struct NotchView: View {
         let presentableIds = Set(presentableTokens.map(\.sessionId))
         let currentIds = Set(tokenBySession.keys)
 
-        // The reminder lifetime starts at the real completion boundary, not
+        // The visibility lifetime starts at the real completion boundary, not
         // when a delayed parser/UI update happened to arrive.
         for token in presentableTokens {
-            waitingForInputTimestamps[token.sessionId] = token.completedAt
-            scheduleCompletionReminderExpiry(
+            completionVisibilityStartedAt[token.sessionId] = token.completedAt
+            scheduleCompletionVisibilityExpiry(
                 sessionId: token.sessionId,
-                enteredAt: token.completedAt
+                displayStartedAt: token.completedAt
             )
         }
 
         // Clean up timestamps for sessions no longer waiting
-        let staleIds = Set(waitingForInputTimestamps.keys).subtracting(currentIds)
+        let staleIds = Set(completionVisibilityStartedAt.keys)
+            .subtracting(currentIds)
         for staleId in staleIds {
-            delayedUIWork.completionReminderTasks[staleId]?.cancel()
-            delayedUIWork.completionReminderTasks.removeValue(forKey: staleId)
-            waitingForInputTimestamps.removeValue(forKey: staleId)
+            delayedUIWork.completionVisibilityTasks[staleId]?.cancel()
+            delayedUIWork.completionVisibilityTasks.removeValue(
+                forKey: staleId
+            )
+            completionVisibilityStartedAt.removeValue(forKey: staleId)
         }
 
         // Bounce the notch when a session newly enters waitingForInput state
@@ -1045,19 +977,7 @@ struct NotchView: View {
             }
 
             // Trigger bounce animation to get user's attention
-            delayedUIWork.bounceTask?.cancel()
-            delayedUIWork.bounceTask = nil
-            if !reduceMotion {
-                isBouncing = true
-                delayedUIWork.bounceTask = Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(150))
-                    guard !Task.isCancelled else { return }
-                    isBouncing = false
-                    delayedUIWork.bounceTask = nil
-                }
-            } else {
-                isBouncing = false
-            }
+            triggerAttentionBounce()
         } else if currentTokens.isEmpty {
             // A new turn supersedes any completion flourish immediately.
             delayedUIWork.completionSoundTask?.cancel()
@@ -1070,39 +990,163 @@ struct NotchView: View {
         previousCompletionTokens = currentTokens
     }
 
-    private func scheduleCompletionReminderExpiry(
+    private func scheduleCompletionVisibilityExpiry(
         sessionId: String,
-        enteredAt: Date
+        displayStartedAt: Date
     ) {
-        delayedUIWork.completionReminderTasks[sessionId]?.cancel()
+        delayedUIWork.completionVisibilityTasks[sessionId]?.cancel()
         let remaining = max(
             0,
-            enteredAt.addingTimeInterval(
+            displayStartedAt.addingTimeInterval(
                 preferences.completionCompactDuration
             ).timeIntervalSinceNow
         )
-        delayedUIWork.completionReminderTasks[sessionId] = Task { @MainActor in
+        delayedUIWork.completionVisibilityTasks[sessionId] = Task { @MainActor in
             try? await Task.sleep(for: .seconds(remaining))
             guard !Task.isCancelled else { return }
-            guard waitingForInputTimestamps[sessionId] == enteredAt else {
+            guard completionVisibilityStartedAt[sessionId] ==
+                    displayStartedAt else {
                 return
             }
             // Mutating the timestamp map invalidates the SwiftUI body. Merely
             // comparing Date() in `hasWaitingForInput` does not schedule a
             // refresh when the reminder duration elapses.
-            waitingForInputTimestamps.removeValue(forKey: sessionId)
-            delayedUIWork.completionReminderTasks.removeValue(forKey: sessionId)
+            completionVisibilityStartedAt.removeValue(forKey: sessionId)
+            delayedUIWork.completionVisibilityTasks.removeValue(
+                forKey: sessionId
+            )
             handleProcessingChange()
             updateIdleVisibility()
         }
     }
 
-    private func rescheduleCompletionReminderExpiries() {
-        for (sessionId, enteredAt) in waitingForInputTimestamps {
-            scheduleCompletionReminderExpiry(
+    private func rescheduleCompletionVisibilityExpiries() {
+        for (sessionId, displayStartedAt) in
+            completionVisibilityStartedAt {
+            scheduleCompletionVisibilityExpiry(
                 sessionId: sessionId,
-                enteredAt: enteredAt
+                displayStartedAt: displayStartedAt
             )
+        }
+    }
+
+    private func reconcileFollowUpReminders(_ sessions: [SessionState]) {
+        followUpReminderCoordinator.reconcile(
+            sessions: sessions,
+            enabled: preferences.followUpRemindersEnabled,
+            delay: preferences.followUpReminderDelay,
+            trackingStartedAt: attentionTrackingStartedAt
+        )
+
+        // Work that completes while a click-owned panel is already open is
+        // already visible to the user and must not produce a delayed ping.
+        if viewModel.status == .opened && viewModel.openReason == .click {
+            acknowledgeCurrentCompletions()
+        }
+    }
+
+    private func acknowledgeCurrentCompletions() {
+        followUpReminderCoordinator.acknowledgeCompletions(
+            sessionMonitor.instances.compactMap {
+                NotchAttentionPolicy.completionToken(for: $0)
+            }
+        )
+    }
+
+    private func deliverFollowUpReminders(
+        _ targets: Set<NotchFollowUpTarget>
+    ) {
+        delayedUIWork.followUpDeliveryTask?.cancel()
+        delayedUIWork.followUpDeliveryTask = nil
+        guard !targets.isEmpty else { return }
+
+        delayedUIWork.followUpDeliveryTask = Task { @MainActor in
+            // A visible panel is already doing the reminder's job. Consuming
+            // these generations also prevents an old ping after it closes.
+            guard viewModel.status != .opened else {
+                attentionLogger.info(
+                    "Suppressed follow-up because the notch is already open"
+                )
+                delayedUIWork.followUpDeliveryTask = nil
+                followUpReminderCoordinator.consume(targets)
+                return
+            }
+
+            var eligibleTargets: Set<NotchFollowUpTarget> = []
+            for target in targets.sorted(by: {
+                $0.sessionId < $1.sessionId
+            }) {
+                guard followUpReminderCoordinator.isCurrent(target),
+                      let session = sessionMonitor.instances.first(where: {
+                          $0.sessionId == target.sessionId
+                      }) else {
+                    continue
+                }
+
+                let isFocused: Bool
+                if let pid = session.pid {
+                    isFocused = await TerminalVisibilityDetector
+                        .isSessionFocused(sessionPid: pid)
+                } else {
+                    isFocused = false
+                }
+
+                guard !Task.isCancelled,
+                      viewModel.status != .opened,
+                      !isFocused,
+                      followUpReminderCoordinator.isCurrent(target) else {
+                    if isFocused {
+                        attentionLogger.info(
+                            "Suppressed focused follow-up for \(target.sessionId.prefix(8), privacy: .public)"
+                        )
+                    }
+                    continue
+                }
+                eligibleTargets.insert(target)
+            }
+
+            guard !Task.isCancelled else { return }
+            let reminderAt = Date()
+            for target in eligibleTargets {
+                guard case .completion = target else { continue }
+                completionVisibilityStartedAt[target.sessionId] = reminderAt
+                scheduleCompletionVisibilityExpiry(
+                    sessionId: target.sessionId,
+                    displayStartedAt: reminderAt
+                )
+            }
+
+            if !eligibleTargets.isEmpty {
+                attentionLogger.info(
+                    "Delivered one follow-up for \(eligibleTargets.count) current target(s)"
+                )
+                isVisible = true
+                handleProcessingChange()
+                triggerAttentionBounce()
+                if let soundName = AppSettings.notificationSound.soundName {
+                    NSSound(named: soundName)?.play()
+                }
+            }
+
+            delayedUIWork.followUpDeliveryTask = nil
+            followUpReminderCoordinator.consume(targets)
+        }
+    }
+
+    private func triggerAttentionBounce() {
+        delayedUIWork.bounceTask?.cancel()
+        delayedUIWork.bounceTask = nil
+        guard !reduceMotion else {
+            isBouncing = false
+            return
+        }
+
+        isBouncing = true
+        delayedUIWork.bounceTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            isBouncing = false
+            delayedUIWork.bounceTask = nil
         }
     }
 

@@ -144,6 +144,61 @@ final class SessionStoreLifecycleTests: XCTestCase {
         )
     }
 
+    func testCurrentSessionEndRemovesSessionWithoutResurrection() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "session-end-\(UUID().uuidString)"
+        let now = Date()
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now.addingTimeInterval(-1)
+        )))
+        let activeSession = await store.session(for: sessionId)
+        XCTAssertNotNil(activeSession)
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "SessionEnd",
+            status: "ended",
+            observedAt: now
+        )))
+
+        let removedSession = await store.session(for: sessionId)
+        XCTAssertNil(removedSession)
+    }
+
+    func testStaleSessionEndCannotRemoveResumedSession() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-session-end-\(UUID().uuidString)"
+        let now = Date()
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "SessionEnd",
+            status: "ended",
+            observedAt: now.addingTimeInterval(-1)
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertNil(session.completedAt)
+    }
+
     func testInformationalNotificationDoesNotSuppressCompletion() async throws {
         let store = SessionStore(
             persistenceEnabled: false,

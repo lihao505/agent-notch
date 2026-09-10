@@ -58,7 +58,11 @@ modified_upstream_sources=(
     ClaudeIsland/Services/Shared/ProcessTreeBuilder.swift
     ClaudeIsland/Services/Shared/TerminalAppRegistry.swift
     ClaudeIsland/Services/State/SessionStore.swift
+    ClaudeIsland/Services/Tmux/TmuxController.swift
     ClaudeIsland/Services/Update/NotchUserDriver.swift
+    ClaudeIsland/Services/Window/WindowFinder.swift
+    ClaudeIsland/Services/Window/WindowFocuser.swift
+    ClaudeIsland/Services/Window/YabaiController.swift
     ClaudeIsland/UI/Components/ClaudeDirPickerRow.swift
     ClaudeIsland/UI/Components/ProcessingSpinner.swift
     ClaudeIsland/UI/Components/TerminalColors.swift

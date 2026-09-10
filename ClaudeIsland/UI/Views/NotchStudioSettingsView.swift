@@ -767,6 +767,30 @@ struct NotchStudioSettingsView: View {
                     step: 1,
                     valueText: "\(Int(preferences.completionCompactDuration))s"
                 )
+
+                Divider()
+                settingToggle(
+                    t("Follow-up reminder", "跟进提醒"),
+                    detail: t(
+                        "Ping once when a request is still waiting or finished work has not been opened.",
+                        "请求仍在等待，或完成结果尚未打开时，仅再次提醒一次。"
+                    ),
+                    isOn: $preferences.followUpRemindersEnabled
+                )
+
+                if preferences.followUpRemindersEnabled {
+                    Divider()
+                    sliderRow(
+                        title: t("Reminder delay", "提醒延迟"),
+                        value: $preferences.followUpReminderDelay,
+                        range: 60...1800,
+                        step: 60,
+                        valueText: t(
+                            "\(Int(preferences.followUpReminderDelay / 60)) min",
+                            "\(Int(preferences.followUpReminderDelay / 60)) 分钟"
+                        )
+                    )
+                }
             }
         }
     }
@@ -1054,10 +1078,10 @@ struct NotchStudioSettingsView: View {
 
                 HStack {
                     settingLabel(
-                        t("Completion sound", "完成提示音"),
+                        t("Attention sound", "提醒音"),
                         detail: t(
-                            "Played when an agent is ready.",
-                            "智能体完成任务时播放。"
+                            "Played for completion and optional follow-up reminders.",
+                            "智能体完成任务及可选跟进提醒时播放。"
                         )
                     )
                     Spacer()

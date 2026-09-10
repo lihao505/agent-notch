@@ -46,7 +46,7 @@ enum AppSettings {
 
     // MARK: - Notification Sound
 
-    /// The sound to play when Claude finishes and is ready for input
+    /// The sound to play for completion and optional follow-up attention.
     static var notificationSound: NotificationSound {
         get {
             guard let rawValue = defaults.string(forKey: Keys.notificationSound),
@@ -214,6 +214,8 @@ final class NotchPreferences: ObservableObject {
         static let expandQuestionsAutomatically =
             "notchExpandQuestionsAutomatically"
         static let completionCompactDuration = "notchCompletionCompactDuration"
+        static let followUpRemindersEnabled = "notchFollowUpRemindersEnabled"
+        static let followUpReminderDelay = "notchFollowUpReminderDelay"
         static let panelWidth = "notchPanelWidth"
         static let panelHeight = "notchPanelHeight"
         static let showUsageLimits = "notchShowUsageLimits"
@@ -267,6 +269,27 @@ final class NotchPreferences: ObservableObject {
             defaults.set(
                 completionCompactDuration,
                 forKey: Keys.completionCompactDuration
+            )
+        }
+    }
+
+    /// Optional second-chance attention for requests that remain unresolved or
+    /// completions the user has not deliberately opened. It is off by default
+    /// so installing Agent Notch never creates a new source of interruption.
+    @Published var followUpRemindersEnabled: Bool {
+        didSet {
+            defaults.set(
+                followUpRemindersEnabled,
+                forKey: Keys.followUpRemindersEnabled
+            )
+        }
+    }
+
+    @Published var followUpReminderDelay: Double {
+        didSet {
+            defaults.set(
+                followUpReminderDelay,
+                forKey: Keys.followUpReminderDelay
             )
         }
     }
@@ -346,6 +369,12 @@ final class NotchPreferences: ObservableObject {
             ?? true
         completionCompactDuration =
             defaults.object(forKey: Keys.completionCompactDuration) as? Double ?? 8
+        followUpRemindersEnabled =
+            defaults.object(forKey: Keys.followUpRemindersEnabled) as? Bool
+            ?? false
+        followUpReminderDelay =
+            defaults.object(forKey: Keys.followUpReminderDelay) as? Double
+            ?? 300
         panelWidth = defaults.object(forKey: Keys.panelWidth) as? Double ?? 640
         panelHeight = defaults.object(forKey: Keys.panelHeight) as? Double ?? 560
         showUsageLimits =
