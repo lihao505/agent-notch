@@ -791,6 +791,29 @@ struct NotchStudioSettingsView: View {
                         )
                     )
                 }
+
+                Divider()
+                settingToggle(
+                    t("Quiet hours", "静默时段"),
+                    detail: t(
+                        "Mute automatic sounds on a daily local-time schedule. Visual states remain visible.",
+                        "按本地时间每天静音自动提醒；视觉状态仍会正常显示。"
+                    ),
+                    isOn: $preferences.quietHoursEnabled
+                )
+
+                if preferences.quietHoursEnabled {
+                    Divider()
+                    quietHoursTimeRow(
+                        title: t("Starts", "开始"),
+                        minute: $preferences.quietHoursStartMinute
+                    )
+                    Divider()
+                    quietHoursTimeRow(
+                        title: t("Ends", "结束"),
+                        minute: $preferences.quietHoursEndMinute
+                    )
+                }
             }
         }
     }
@@ -1233,6 +1256,51 @@ struct NotchStudioSettingsView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private func quietHoursTimeRow(
+        title: String,
+        minute: Binding<Int>
+    ) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 12, weight: .medium))
+            Spacer()
+            DatePicker(
+                "",
+                selection: timeBinding(for: minute),
+                displayedComponents: .hourAndMinute
+            )
+            .labelsHidden()
+            .frame(width: 110)
+        }
+    }
+
+    private func timeBinding(for minute: Binding<Int>) -> Binding<Date> {
+        Binding(
+            get: {
+                let value = NotchQuietHoursPolicy.sanitizedMinute(
+                    minute.wrappedValue
+                )
+                let components = DateComponents(
+                    calendar: .current,
+                    hour: value / 60,
+                    minute: value % 60
+                )
+                return Calendar.current.date(from: components) ?? Date()
+            },
+            set: { date in
+                let components = Calendar.current.dateComponents(
+                    [.hour, .minute],
+                    from: date
+                )
+                guard let hour = components.hour,
+                      let minuteValue = components.minute else {
+                    return
+                }
+                minute.wrappedValue = hour * 60 + minuteValue
+            }
+        )
     }
 
     private func refreshSystemState() {

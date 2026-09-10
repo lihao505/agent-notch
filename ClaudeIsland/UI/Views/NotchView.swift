@@ -970,7 +970,7 @@ struct NotchView: View {
                     )
                     guard !Task.isCancelled else { return }
                     if shouldPlaySound {
-                        NSSound(named: soundName)?.play()
+                        playAttentionSoundIfAllowed(named: soundName)
                     }
                     delayedUIWork.completionSoundTask = nil
                 }
@@ -1124,7 +1124,7 @@ struct NotchView: View {
                 handleProcessingChange()
                 triggerAttentionBounce()
                 if let soundName = AppSettings.notificationSound.soundName {
-                    NSSound(named: soundName)?.play()
+                    playAttentionSoundIfAllowed(named: soundName)
                 }
             }
 
@@ -1148,6 +1148,21 @@ struct NotchView: View {
             isBouncing = false
             delayedUIWork.bounceTask = nil
         }
+    }
+
+    private func playAttentionSoundIfAllowed(named soundName: String) {
+        let isQuiet = NotchQuietHoursPolicy.isQuiet(
+            enabled: preferences.quietHoursEnabled,
+            startMinute: preferences.quietHoursStartMinute,
+            endMinute: preferences.quietHoursEndMinute
+        )
+        guard !isQuiet else {
+            attentionLogger.info(
+                "Suppressed automatic attention sound during quiet hours"
+            )
+            return
+        }
+        NSSound(named: soundName)?.play()
     }
 
     private func scheduleIdleVisibilityUpdate(after delay: TimeInterval) {

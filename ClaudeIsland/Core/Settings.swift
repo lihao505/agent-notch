@@ -216,6 +216,9 @@ final class NotchPreferences: ObservableObject {
         static let completionCompactDuration = "notchCompletionCompactDuration"
         static let followUpRemindersEnabled = "notchFollowUpRemindersEnabled"
         static let followUpReminderDelay = "notchFollowUpReminderDelay"
+        static let quietHoursEnabled = "notchQuietHoursEnabled"
+        static let quietHoursStartMinute = "notchQuietHoursStartMinute"
+        static let quietHoursEndMinute = "notchQuietHoursEndMinute"
         static let panelWidth = "notchPanelWidth"
         static let panelHeight = "notchPanelHeight"
         static let showUsageLimits = "notchShowUsageLimits"
@@ -290,6 +293,46 @@ final class NotchPreferences: ObservableObject {
             defaults.set(
                 followUpReminderDelay,
                 forKey: Keys.followUpReminderDelay
+            )
+        }
+    }
+
+    /// Quiet hours mute automatic completion/follow-up sounds only. Visual
+    /// state and interactive approvals remain available throughout the window.
+    @Published var quietHoursEnabled: Bool {
+        didSet {
+            defaults.set(quietHoursEnabled, forKey: Keys.quietHoursEnabled)
+        }
+    }
+
+    @Published var quietHoursStartMinute: Int {
+        didSet {
+            let sanitized = NotchQuietHoursPolicy.sanitizedMinute(
+                quietHoursStartMinute
+            )
+            if quietHoursStartMinute != sanitized {
+                quietHoursStartMinute = sanitized
+                return
+            }
+            defaults.set(
+                quietHoursStartMinute,
+                forKey: Keys.quietHoursStartMinute
+            )
+        }
+    }
+
+    @Published var quietHoursEndMinute: Int {
+        didSet {
+            let sanitized = NotchQuietHoursPolicy.sanitizedMinute(
+                quietHoursEndMinute
+            )
+            if quietHoursEndMinute != sanitized {
+                quietHoursEndMinute = sanitized
+                return
+            }
+            defaults.set(
+                quietHoursEndMinute,
+                forKey: Keys.quietHoursEndMinute
             )
         }
     }
@@ -375,6 +418,17 @@ final class NotchPreferences: ObservableObject {
         followUpReminderDelay =
             defaults.object(forKey: Keys.followUpReminderDelay) as? Double
             ?? 300
+        quietHoursEnabled =
+            defaults.object(forKey: Keys.quietHoursEnabled) as? Bool
+            ?? false
+        quietHoursStartMinute = NotchQuietHoursPolicy.sanitizedMinute(
+            defaults.object(forKey: Keys.quietHoursStartMinute) as? Int
+                ?? 22 * 60
+        )
+        quietHoursEndMinute = NotchQuietHoursPolicy.sanitizedMinute(
+            defaults.object(forKey: Keys.quietHoursEndMinute) as? Int
+                ?? 8 * 60
+        )
         panelWidth = defaults.object(forKey: Keys.panelWidth) as? Double ?? 640
         panelHeight = defaults.object(forKey: Keys.panelHeight) as? Double ?? 560
         showUsageLimits =
