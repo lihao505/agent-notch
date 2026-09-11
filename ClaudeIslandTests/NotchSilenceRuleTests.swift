@@ -238,4 +238,44 @@ final class NotchSilenceRuleStoreTests: XCTestCase {
         restored.removeRule(id: secondId)
         XCTAssertEqual(restored.rules.map(\.pattern), ["first"])
     }
+
+    func testEditingPreservesIdentityDisabledStateAndPersists() throws {
+        let store = NotchSilenceRuleStore(defaults: defaults, key: "rules")
+        XCTAssertTrue(store.addRule(scope: .project, pattern: "first"))
+        let id = try XCTUnwrap(store.rules.first?.id)
+        store.setEnabled(false, for: id)
+        XCTAssertTrue(store.updateRule(id: id, scope: .tool, pattern: " Bash "))
+        XCTAssertEqual(store.rules[0].id, id)
+        XCTAssertEqual(store.rules[0].scope, .tool)
+        XCTAssertEqual(store.rules[0].pattern, "Bash")
+        XCTAssertFalse(store.rules[0].isEnabled)
+        XCTAssertEqual(
+            NotchSilenceRuleStore(defaults: defaults, key: "rules").rules,
+            store.rules
+        )
+    }
+
+    func testInvalidEditsLeaveOriginalRulesUntouched() throws {
+        let store = NotchSilenceRuleStore(defaults: defaults, key: "rules")
+        XCTAssertTrue(store.addRule(scope: .project, pattern: "first"))
+        XCTAssertTrue(store.addRule(scope: .tool, pattern: "Bash"))
+        let id = try XCTUnwrap(store.rules.first?.id)
+        let original = store.rules
+        XCTAssertFalse(store.updateRule(id: id, scope: .tool, pattern: "bash"))
+        XCTAssertFalse(store.updateRule(id: id, scope: .project, pattern: " "))
+        XCTAssertFalse(store.updateRule(id: UUID(), scope: .project, pattern: "valid"))
+        XCTAssertEqual(store.rules, original)
+        XCTAssertTrue(store.updateRule(id: id, scope: .project, pattern: "first"))
+        XCTAssertEqual(store.rules, original)
+    }
+
+    func testRuleLimitDoesNotPreventEditing() throws {
+        let store = NotchSilenceRuleStore(defaults: defaults, key: "rules")
+        for index in 0..<NotchSilenceRuleStore.maximumRuleCount {
+            XCTAssertTrue(store.addRule(scope: .project, pattern: "project-\(index)"))
+        }
+        let id = try XCTUnwrap(store.rules.first?.id)
+        XCTAssertTrue(store.updateRule(id: id, scope: .project, pattern: "updated"))
+        XCTAssertEqual(store.rules.count, NotchSilenceRuleStore.maximumRuleCount)
+    }
 }

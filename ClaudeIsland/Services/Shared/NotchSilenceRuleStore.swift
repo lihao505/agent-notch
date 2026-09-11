@@ -211,6 +211,26 @@ final class NotchSilenceRuleStore: ObservableObject {
         persist()
     }
 
+    @discardableResult
+    func updateRule(
+        id: UUID,
+        scope: NotchSilenceRuleScope,
+        pattern: String
+    ) -> Bool {
+        guard let index = rules.firstIndex(where: { $0.id == id }),
+              let cleaned = Self.cleanedPattern(pattern),
+              !contains(scope: scope, pattern: cleaned, excluding: id) else {
+            return false
+        }
+        var updated = rules[index]
+        updated.scope = scope
+        updated.pattern = cleaned
+        guard updated != rules[index] else { return true }
+        rules[index] = updated
+        persist()
+        return true
+    }
+
     func removeRule(id: UUID) {
         let oldCount = rules.count
         rules.removeAll { $0.id == id }
@@ -220,11 +240,12 @@ final class NotchSilenceRuleStore: ObservableObject {
 
     func contains(
         scope: NotchSilenceRuleScope,
-        pattern: String
+        pattern: String,
+        excluding id: UUID? = nil
     ) -> Bool {
         guard let cleaned = Self.cleanedPattern(pattern) else { return false }
         return rules.contains {
-            $0.scope == scope &&
+            $0.id != id && $0.scope == scope &&
                 $0.pattern.compare(
                     cleaned,
                     options: [

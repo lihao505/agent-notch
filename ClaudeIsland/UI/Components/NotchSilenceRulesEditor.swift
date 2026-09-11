@@ -31,6 +31,8 @@ struct NotchSilenceRulesEditor: View {
     @StateObject private var previewSource = NotchSilencePreviewSource()
     @State private var draftScope: NotchSilenceRuleScope = .project
     @State private var draftPattern = ""
+    @State private var editingRuleId: UUID?
+    @FocusState private var isPatternFocused: Bool
 
     private let accent = Color(red: 0.95, green: 0.48, blue: 0.27)
 
@@ -47,14 +49,30 @@ struct NotchSilenceRulesEditor: View {
 
                 TextField(patternPlaceholder, text: $draftPattern)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit(addDraftRule)
+                    .focused($isPatternFocused)
+                    .onSubmit(saveDraftRule)
+                    .onExitCommand { cancelEditing() }
 
-                Button(action: addDraftRule) {
-                    Label(t("Add", "添加"), systemImage: "plus")
+                Button(action: saveDraftRule) {
+                    Label(
+                        editingRuleId == nil ? t("Add", "添加") : t("Save", "保存"),
+                        systemImage: editingRuleId == nil ? "plus" : "checkmark"
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(accent)
                 .disabled(!canAddDraftRule)
+            }
+
+            if editingRuleId != nil {
+                HStack {
+                    Text(t("Editing rule · changes apply when saved", "正在编辑规则 · 保存后生效"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button(t("Cancel", "取消"), action: cancelEditing)
+                        .controlSize(.small)
+                }
             }
 
             HStack(spacing: 8) {
@@ -153,7 +171,21 @@ struct NotchSilenceRulesEditor: View {
             Spacer(minLength: 8)
 
             Button {
+                editingRuleId = rule.id
+                draftScope = rule.scope
+                draftPattern = rule.pattern
+                isPatternFocused = true
+            } label: {
+                Image(systemName: "pencil")
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .help(t("Edit rule", "编辑规则"))
+            .accessibilityLabel(t("Edit rule", "编辑规则"))
+
+            Button {
                 store.removeRule(id: rule.id)
+                if editingRuleId == rule.id { cancelEditing() }
             } label: {
                 Image(systemName: "trash")
                     .font(.system(size: 11, weight: .medium))
@@ -174,8 +206,8 @@ struct NotchSilenceRulesEditor: View {
 
     private var canAddDraftRule: Bool {
         guard let pattern = cleanedDraftPattern else { return false }
-        return store.rules.count < NotchSilenceRuleStore.maximumRuleCount &&
-            !store.contains(scope: draftScope, pattern: pattern)
+        return (editingRuleId != nil || store.rules.count < NotchSilenceRuleStore.maximumRuleCount) &&
+            !store.contains(scope: draftScope, pattern: pattern, excluding: editingRuleId)
     }
 
     private var draftMatchCount: Int {
@@ -201,10 +233,10 @@ struct NotchSilenceRulesEditor: View {
                 "输入文本即可实时查看匹配"
             )
         }
-        if store.contains(scope: draftScope, pattern: pattern) {
+        if store.contains(scope: draftScope, pattern: pattern, excluding: editingRuleId) {
             return t("This rule already exists", "这条规则已存在")
         }
-        if store.rules.count >= NotchSilenceRuleStore.maximumRuleCount {
+        if editingRuleId == nil && store.rules.count >= NotchSilenceRuleStore.maximumRuleCount {
             return t("Rule limit reached", "已达到规则数量上限")
         }
         guard !previewSource.contexts.isEmpty else {
@@ -297,10 +329,19 @@ struct NotchSilenceRulesEditor: View {
         value.count > 72 ? String(value.prefix(69)) + "…" : value
     }
 
-    private func addDraftRule() {
-        guard store.addRule(scope: draftScope, pattern: draftPattern) else {
-            return
+    private func saveDraftRule() {
+        let saved: Bool
+        if let id = editingRuleId {
+            saved = store.updateRule(id: id, scope: draftScope, pattern: draftPattern)
+        } else {
+            saved = store.addRule(scope: draftScope, pattern: draftPattern)
         }
+        guard saved else { return }
+        cancelEditing()
+    }
+
+    private func cancelEditing() {
+        editingRuleId = nil
         draftPattern = ""
     }
 
