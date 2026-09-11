@@ -32,7 +32,7 @@
 | Claude/Kimi/GLM/DeepSeek 用量 | 待实现 | 只使用可验证的本地/官方数据，不估算 |
 | 用量按日/月/模型/成本明细 | 待实现 | 输入/输出/cache、模型拆分、日/月视图 |
 | 设置窗口 | 第二阶段原生实机验收通过 | 刘海内 Quick Controls + 独立 Notch Studio；旧设置能力迁入差异化 System 页面 |
-| 静默场景与过滤 | 部分实现 | 已有静默时段；继续补齐专注/锁屏/录屏、cwd/prompt/launcher 规则 |
+| 静默场景与过滤 | 部分实现，原生运行态验收通过 | 已有静默时段；锁屏、显示器/系统休眠、登录会话失活已实现；继续补齐专注/录屏、cwd/prompt/launcher 规则 |
 | 声音系统 | 待实现 | 分事件声音、系统声音、自定义文件、总静音 |
 | 全局快捷键 | 待实现 | 展开、收起、会话切换、批准/拒绝/问题选择 |
 | 精确跳转矩阵 | 部分实现；yabai + tmux 可验证，其他终端待扩展 | Terminal、iTerm2、Ghostty、Warp、WezTerm、Kitty、IDE、tmux |

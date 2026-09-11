@@ -216,6 +216,7 @@ final class NotchPreferences: ObservableObject {
         static let completionCompactDuration = "notchCompletionCompactDuration"
         static let followUpRemindersEnabled = "notchFollowUpRemindersEnabled"
         static let followUpReminderDelay = "notchFollowUpReminderDelay"
+        static let quietScenesEnabled = "notchQuietScenesEnabled"
         static let quietHoursEnabled = "notchQuietHoursEnabled"
         static let quietHoursStartMinute = "notchQuietHoursStartMinute"
         static let quietHoursEndMinute = "notchQuietHoursEndMinute"
@@ -294,6 +295,15 @@ final class NotchPreferences: ObservableObject {
                 followUpReminderDelay,
                 forKey: Keys.followUpReminderDelay
             )
+        }
+    }
+
+    /// Scene-aware muting is enabled by default because it only suppresses
+    /// automatic sound while the user cannot act on it. Visual session state
+    /// and every interactive request continue updating normally.
+    @Published var quietScenesEnabled: Bool {
+        didSet {
+            defaults.set(quietScenesEnabled, forKey: Keys.quietScenesEnabled)
         }
     }
 
@@ -418,6 +428,9 @@ final class NotchPreferences: ObservableObject {
         followUpReminderDelay =
             defaults.object(forKey: Keys.followUpReminderDelay) as? Double
             ?? 300
+        quietScenesEnabled =
+            defaults.object(forKey: Keys.quietScenesEnabled) as? Bool
+            ?? true
         quietHoursEnabled =
             defaults.object(forKey: Keys.quietHoursEnabled) as? Bool
             ?? false

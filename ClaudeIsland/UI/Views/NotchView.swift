@@ -69,6 +69,7 @@ struct NotchView: View {
     @StateObject private var activityCoordinator = NotchActivityCoordinator.shared
     @StateObject private var usageMonitor = UsageLimitMonitor.shared
     @StateObject private var preferences = NotchPreferences.shared
+    @StateObject private var quietSceneMonitor = NotchQuietSceneMonitor.shared
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var previousInteractionTokens:
         Set<NotchInteractionToken> = []
@@ -1151,18 +1152,19 @@ struct NotchView: View {
     }
 
     private func playAttentionSoundIfAllowed(named soundName: String) {
-        let isQuiet = NotchQuietHoursPolicy.isQuiet(
-            enabled: preferences.quietHoursEnabled,
-            startMinute: preferences.quietHoursStartMinute,
-            endMinute: preferences.quietHoursEndMinute
+        let suppressionReason = NotchAttentionSilencePolicy.suppressionReason(
+            quietScenesEnabled: preferences.quietScenesEnabled,
+            sceneState: quietSceneMonitor.state,
+            quietHoursEnabled: preferences.quietHoursEnabled,
+            quietHoursStartMinute: preferences.quietHoursStartMinute,
+            quietHoursEndMinute: preferences.quietHoursEndMinute
         )
-        guard !isQuiet else {
-            attentionLogger.info(
-                "Suppressed automatic attention sound during quiet hours"
-            )
+        guard let suppressionReason else {
+            NSSound(named: soundName)?.play()
             return
         }
-        NSSound(named: soundName)?.play()
+
+        attentionLogger.info("Suppressed automatic attention sound: \(suppressionReason.rawValue, privacy: .public)")
     }
 
     private func scheduleIdleVisibilityUpdate(after delay: TimeInterval) {

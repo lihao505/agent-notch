@@ -794,6 +794,16 @@ struct NotchStudioSettingsView: View {
 
                 Divider()
                 settingToggle(
+                    t("Quiet scenes", "静默场景"),
+                    detail: t(
+                        "Mute automatic sounds while the screen is locked, the display is asleep, or the login session is inactive.",
+                        "锁屏、显示器休眠或登录会话失活时，自动静音提醒。"
+                    ),
+                    isOn: $preferences.quietScenesEnabled
+                )
+
+                Divider()
+                settingToggle(
                     t("Quiet hours", "静默时段"),
                     detail: t(
                         "Mute automatic sounds on a daily local-time schedule. Visual states remain visible.",

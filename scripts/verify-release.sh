@@ -21,6 +21,8 @@ required_files=(
     AgentBridge/bin/notch-bridge.py AgentBridge/bin/codex-relay.py
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
+    ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
+    ClaudeIsland/Services/Shared/NotchQuietSceneMonitor.swift
     ClaudeIslandTests/ProcessExecutorTests.swift
     ClaudeIslandTests/AgentTransportTests.swift
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
@@ -28,6 +30,7 @@ required_files=(
     ClaudeIslandTests/ConversationParserIndexTests.swift
     ClaudeIslandTests/NotchPresentationTimingTests.swift
     ClaudeIslandTests/NotchQuietHoursPolicyTests.swift
+    ClaudeIslandTests/NotchQuietSceneTests.swift
 )
 for file in "${required_files[@]}"; do
     [ -s "$file" ] || fail "required release file is missing or empty: $file"
