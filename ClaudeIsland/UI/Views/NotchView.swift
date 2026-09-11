@@ -70,6 +70,7 @@ struct NotchView: View {
     @StateObject private var usageMonitor = UsageLimitMonitor.shared
     @StateObject private var preferences = NotchPreferences.shared
     @StateObject private var quietSceneMonitor = NotchQuietSceneMonitor.shared
+    @StateObject private var silenceRuleStore = NotchSilenceRuleStore.shared
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var previousInteractionTokens:
         Set<NotchInteractionToken> = []
@@ -364,6 +365,9 @@ struct NotchView: View {
         }
         .onChange(of: preferences.followUpReminderDelay) { _, _ in
             reconcileFollowUpReminders(sessionMonitor.instances)
+        }
+        .onChange(of: silenceRuleStore.rules) { _, _ in
+            handleSilenceRulesChange()
         }
         .onChange(of: followUpReminderCoordinator.pendingTargets) {
             _, targets in
@@ -871,8 +875,11 @@ struct NotchView: View {
                 NotchAttentionPolicy.interactionToken(for: session)
             }
         )
+        let attentionEligibleSessions = sessions.filter {
+            !isSessionSilenced($0)
+        }
         if let pendingSession = NotchAttentionPolicy.newestSessionToAutoExpand(
-            from: sessions,
+            from: attentionEligibleSessions,
             excluding: previousInteractionTokens,
             expandQuestionsAutomatically:
                 preferences.expandQuestionsAutomatically
@@ -904,12 +911,29 @@ struct NotchView: View {
         let currentTokens = Set(tokenBySession.values)
         let newTokens = currentTokens.subtracting(previousCompletionTokens)
         let now = Date()
-        let presentableTokens = newTokens.filter {
+        let freshTokens = newTokens.filter {
             NotchAttentionPolicy.shouldPresent(
                 $0,
                 presentationStartedAt: attentionTrackingStartedAt,
                 duration: preferences.completionCompactDuration,
                 now: now
+            )
+        }
+        let sessionById = Dictionary(
+            uniqueKeysWithValues: waitingForInputSessions.map {
+                ($0.sessionId, $0)
+            }
+        )
+        let presentableTokens = freshTokens.filter { token in
+            guard let session = sessionById[token.sessionId] else {
+                return false
+            }
+            return !isSessionSilenced(session)
+        }
+        let suppressedCount = freshTokens.count - presentableTokens.count
+        if suppressedCount > 0 {
+            attentionLogger.info(
+                "Suppressed automatic completion attention for \(suppressedCount, privacy: .public) silence-rule match(es)"
             )
         }
         let presentableIds = Set(presentableTokens.map(\.sessionId))
@@ -1036,7 +1060,8 @@ struct NotchView: View {
             sessions: sessions,
             enabled: preferences.followUpRemindersEnabled,
             delay: preferences.followUpReminderDelay,
-            trackingStartedAt: attentionTrackingStartedAt
+            trackingStartedAt: attentionTrackingStartedAt,
+            silenceRules: silenceRuleStore.rules
         )
 
         // Work that completes while a click-owned panel is already open is
@@ -1080,7 +1105,8 @@ struct NotchView: View {
                 guard followUpReminderCoordinator.isCurrent(target),
                       let session = sessionMonitor.instances.first(where: {
                           $0.sessionId == target.sessionId
-                      }) else {
+                      }),
+                      !isSessionSilenced(session) else {
                     continue
                 }
 
@@ -1095,7 +1121,11 @@ struct NotchView: View {
                 guard !Task.isCancelled,
                       viewModel.status != .opened,
                       !isFocused,
-                      followUpReminderCoordinator.isCurrent(target) else {
+                      followUpReminderCoordinator.isCurrent(target),
+                      let currentSession = sessionMonitor.instances.first(
+                        where: { $0.sessionId == target.sessionId }
+                      ),
+                      !isSessionSilenced(currentSession) else {
                     if isFocused {
                         attentionLogger.info(
                             "Suppressed focused follow-up for \(target.sessionId.prefix(8), privacy: .public)"
@@ -1107,6 +1137,20 @@ struct NotchView: View {
             }
 
             guard !Task.isCancelled else { return }
+            // Later focus probes can yield after an earlier target qualified.
+            // Recheck the whole batch immediately before any visible effect.
+            eligibleTargets = eligibleTargets.filter { target in
+                followUpReminderCoordinator.isCurrent(target) &&
+                    sessionMonitor.instances.contains { session in
+                        session.sessionId == target.sessionId &&
+                            !isSessionSilenced(session) &&
+                            NotchAttentionPolicy.isStillCurrent(
+                                target,
+                                in: [session],
+                                completionTrackingStartedAt: attentionTrackingStartedAt
+                            )
+                    }
+            }
             let reminderAt = Date()
             for target in eligibleTargets {
                 guard case .completion = target else { continue }
@@ -1167,6 +1211,40 @@ struct NotchView: View {
         attentionLogger.info("Suppressed automatic attention sound: \(suppressionReason.rawValue, privacy: .public)")
     }
 
+    private func isSessionSilenced(_ session: SessionState) -> Bool {
+        NotchSilenceRuleMatcher.isSilenced(
+            by: silenceRuleStore.rules,
+            context: NotchSilenceContext(session: session)
+        )
+    }
+
+    /// A rule edit applies immediately, but changing settings must never revive
+    /// a completion that already happened. Cancel in-flight UI work and let
+    /// the coordinator consume matched generations without forgetting them.
+    private func handleSilenceRulesChange() {
+        delayedUIWork.completionSoundTask?.cancel()
+        delayedUIWork.completionSoundTask = nil
+        delayedUIWork.followUpDeliveryTask?.cancel()
+        delayedUIWork.followUpDeliveryTask = nil
+
+        let silencedIds = Set(
+            sessionMonitor.instances
+                .filter(isSessionSilenced)
+                .map(\.sessionId)
+        )
+        for sessionId in silencedIds {
+            delayedUIWork.completionVisibilityTasks[sessionId]?.cancel()
+            delayedUIWork.completionVisibilityTasks.removeValue(
+                forKey: sessionId
+            )
+            completionVisibilityStartedAt.removeValue(forKey: sessionId)
+        }
+
+        reconcileFollowUpReminders(sessionMonitor.instances)
+        handleProcessingChange()
+        updateIdleVisibility()
+    }
+
     private func scheduleIdleVisibilityUpdate(after delay: TimeInterval) {
         delayedUIWork.visibilityTask?.cancel()
         delayedUIWork.visibilityTask = Task { @MainActor in
@@ -1191,25 +1269,29 @@ struct NotchView: View {
     private func shouldPlayNotificationSound(
         for targets: [(SessionState, NotchCompletionToken)]
     ) async -> Bool {
-        for (session, token) in targets {
-            guard let pid = session.pid else {
+        for (_, token) in targets {
+            guard let currentSession = sessionMonitor.instances.first(
+                where: {
+                    NotchAttentionPolicy.completionToken(for: $0) == token
+                }
+            ), !isSessionSilenced(currentSession) else {
+                continue
+            }
+
+            guard let pid = currentSession.pid else {
                 // No PID means we can't check focus. It is still safe to alert
                 // only if this exact completion remains current.
-                if NotchAttentionPolicy.isStillCurrent(
-                    token,
-                    in: sessionMonitor.instances
-                ) {
-                    return true
-                }
-                continue
+                return true
             }
 
             let isFocused = await TerminalVisibilityDetector.isSessionFocused(sessionPid: pid)
             guard !Task.isCancelled,
-                  NotchAttentionPolicy.isStillCurrent(
-                    token,
-                    in: sessionMonitor.instances
-                  ) else {
+                  let refreshedSession = sessionMonitor.instances.first(
+                    where: {
+                        NotchAttentionPolicy.completionToken(for: $0) == token
+                    }
+                  ),
+                  !isSessionSilenced(refreshedSession) else {
                 continue
             }
             if !isFocused {

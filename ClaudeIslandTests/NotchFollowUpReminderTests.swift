@@ -165,4 +165,33 @@ final class NotchFollowUpReminderTests: XCTestCase {
         XCTAssertTrue(coordinator.pendingTargets.isEmpty)
         coordinator.cancelAll()
     }
+
+    func testSilencingThenUnmutingDoesNotReplayButNextTurnReminds() async throws {
+        let coordinator = NotchFollowUpReminderCoordinator()
+        defer { coordinator.cancelAll() }
+        let now = Date()
+        let muted = completionSession(sessionId: "muted", completedAt: now)
+        let normal = completionSession(sessionId: "normal", completedAt: now)
+        let rule = NotchSilenceRule(scope: .project, pattern: "muted")
+        coordinator.reconcile(
+            sessions: [muted, normal], enabled: true, delay: 0.02,
+            trackingStartedAt: now, silenceRules: [rule], now: now
+        )
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(Set(coordinator.pendingTargets.map(\.sessionId)), ["normal"])
+        coordinator.consume(coordinator.pendingTargets)
+        coordinator.reconcile(
+            sessions: [muted, normal], enabled: true, delay: 0.02,
+            trackingStartedAt: now
+        )
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(coordinator.pendingTargets.isEmpty)
+        let next = completionSession(sessionId: "muted", completedAt: Date())
+        coordinator.reconcile(
+            sessions: [next, normal], enabled: true, delay: 0.02,
+            trackingStartedAt: now
+        )
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(Set(coordinator.pendingTargets.map(\.sessionId)), ["muted"])
+    }
 }

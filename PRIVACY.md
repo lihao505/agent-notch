@@ -24,7 +24,8 @@ Agent Notch 是本地优先的 macOS 应用。
 
 ## 应用写入的数据
 
-- macOS `UserDefaults`：语言、显示方式、尺寸、动画和审批模式等偏好；
+- macOS `UserDefaults`：语言、显示方式、尺寸、动画和审批模式等偏好；用户主动创建
+  的静默规则也存放于此，可能包含项目路径、标题或 prompt 片段，规则仅在本机匹配；
 - `~/Library/Application Support/MultiAgent Notch/active-sessions.json`：活动会话与近期
   完成会话的恢复元数据，包括会话 ID、工作目录、来源、状态和时间；
 - `~/.multiagent-notch/approval-policy.json`：全局与逐会话审批模式，不包含凭据；

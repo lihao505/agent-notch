@@ -36,6 +36,7 @@ final class NotchFollowUpReminderCoordinator: ObservableObject {
         enabled: Bool,
         delay: TimeInterval,
         trackingStartedAt: Date,
+        silenceRules: [NotchSilenceRule] = [],
         now: Date = Date()
     ) {
         var candidates: [
@@ -51,6 +52,20 @@ final class NotchFollowUpReminderCoordinator: ObservableObject {
 
         let currentTargets = Set(candidates.keys)
         removeStaleTargets(notIn: currentTargets)
+
+        // Keep silenced generations in the identity ledger. Removing them
+        // from the input would forget delivery history and replay old alerts
+        // when a rule is disabled or matching metadata changes.
+        for session in sessions where NotchSilenceRuleMatcher.isSilenced(
+            by: silenceRules,
+            context: NotchSilenceContext(session: session)
+        ) {
+            for target in currentTargets where target.sessionId == session.sessionId {
+                deliveredTargets.insert(target)
+                cancelScheduledTask(for: target)
+                pendingTargets.remove(target)
+            }
+        }
 
         guard enabled else {
             isEnabled = false

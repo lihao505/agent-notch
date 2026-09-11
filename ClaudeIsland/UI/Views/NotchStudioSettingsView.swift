@@ -49,6 +49,7 @@ private enum NotchPreviewState: String, CaseIterable, Identifiable {
 
 struct NotchStudioSettingsView: View {
     @StateObject private var preferences = NotchPreferences.shared
+    @StateObject private var silenceRuleStore = NotchSilenceRuleStore.shared
     @ObservedObject private var screenSelector = ScreenSelector.shared
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var selection: NotchStudioSection = .general
@@ -824,6 +825,21 @@ struct NotchStudioSettingsView: View {
                         minute: $preferences.quietHoursEndMinute
                     )
                 }
+            }
+
+            settingsTitle(
+                t("Silence rules", "静默规则"),
+                caption: t(
+                    "Mute automatic attention from matching sessions",
+                    "按会话上下文精准静默自动提醒"
+                )
+            )
+
+            settingsCard {
+                NotchSilenceRulesEditor(
+                    store: silenceRuleStore,
+                    language: preferences.language
+                )
             }
         }
     }

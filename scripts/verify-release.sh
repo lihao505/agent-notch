@@ -22,7 +22,9 @@ required_files=(
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
+    ClaudeIsland/Services/Shared/NotchSilenceRuleStore.swift
     ClaudeIsland/Services/Shared/NotchQuietSceneMonitor.swift
+    ClaudeIsland/UI/Components/NotchSilenceRulesEditor.swift
     ClaudeIslandTests/ProcessExecutorTests.swift
     ClaudeIslandTests/AgentTransportTests.swift
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
@@ -31,6 +33,7 @@ required_files=(
     ClaudeIslandTests/NotchPresentationTimingTests.swift
     ClaudeIslandTests/NotchQuietHoursPolicyTests.swift
     ClaudeIslandTests/NotchQuietSceneTests.swift
+    ClaudeIslandTests/NotchSilenceRuleTests.swift
 )
 for file in "${required_files[@]}"; do
     [ -s "$file" ] || fail "required release file is missing or empty: $file"
