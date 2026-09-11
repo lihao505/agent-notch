@@ -188,7 +188,12 @@ final class NotchSilenceRuleStoreTests: XCTestCase {
     func testPatternLengthAndRuleCountAreBounded() {
         let store = NotchSilenceRuleStore(defaults: defaults, key: "rules")
         let longPattern = String(repeating: "x", count: 400)
-        XCTAssertTrue(store.addRule(scope: .project, pattern: longPattern))
+        XCTAssertFalse(store.addRule(scope: .project, pattern: longPattern))
+        XCTAssertTrue(store.rules.isEmpty)
+        XCTAssertTrue(store.addRule(
+            scope: .project,
+            pattern: String(repeating: "x", count: 256)
+        ))
         XCTAssertEqual(
             store.rules[0].pattern.count,
             NotchSilenceRuleStore.maximumPatternLength
@@ -204,5 +209,33 @@ final class NotchSilenceRuleStoreTests: XCTestCase {
             store.rules.count,
             NotchSilenceRuleStore.maximumRuleCount
         )
+    }
+
+    func testOverlongRuleCannotMatchOnlyItsShortenedPrefix() {
+        let prefix = String(repeating: "x", count: 256)
+        XCTAssertFalse(NotchSilenceRuleMatcher.isSilenced(
+            by: [NotchSilenceRule(scope: .project, pattern: prefix + "specific")],
+            context: NotchSilenceContext(projectName: prefix)
+        ))
+    }
+
+    func testRestoredDuplicateIdsRemainIndependentlyEditable() throws {
+        let id = UUID()
+        let rules = [
+            NotchSilenceRule(id: id, scope: .project, pattern: "first"),
+            NotchSilenceRule(id: id, scope: .project, pattern: "second"),
+        ]
+        defaults.set(try JSONEncoder().encode(rules), forKey: "rules")
+        let store = NotchSilenceRuleStore(defaults: defaults, key: "rules")
+        XCTAssertEqual(store.rules.count, 2)
+        XCTAssertNotEqual(store.rules[0].id, store.rules[1].id)
+        let secondId = store.rules[1].id
+        store.setEnabled(false, for: secondId)
+        XCTAssertTrue(store.rules[0].isEnabled)
+        XCTAssertFalse(store.rules[1].isEnabled)
+        let restored = NotchSilenceRuleStore(defaults: defaults, key: "rules")
+        XCTAssertEqual(restored.rules, store.rules)
+        restored.removeRule(id: secondId)
+        XCTAssertEqual(restored.rules.map(\.pattern), ["first"])
     }
 }

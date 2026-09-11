@@ -240,14 +240,17 @@ final class NotchSilenceRuleStore: ObservableObject {
 
     nonisolated static func cleanedPattern(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return String(trimmed.prefix(maximumPatternLength))
+        guard !trimmed.isEmpty, trimmed.count <= maximumPatternLength else {
+            return nil
+        }
+        return trimmed
     }
 
     nonisolated private static func sanitizedRules(
         _ input: [NotchSilenceRule]
     ) -> [NotchSilenceRule] {
         var seen: Set<String> = []
+        var seenIds: Set<UUID> = []
         var result: [NotchSilenceRule] = []
 
         for rule in input {
@@ -263,9 +266,13 @@ final class NotchSilenceRuleStore: ObservableObject {
             )
             let identity = "\(rule.scope.rawValue):\(folded)"
             guard seen.insert(identity).inserted else { continue }
+            var id = rule.id
+            while !seenIds.insert(id).inserted {
+                id = UUID()
+            }
             result.append(
                 NotchSilenceRule(
-                    id: rule.id,
+                    id: id,
                     scope: rule.scope,
                     pattern: pattern,
                     isEnabled: rule.isEnabled

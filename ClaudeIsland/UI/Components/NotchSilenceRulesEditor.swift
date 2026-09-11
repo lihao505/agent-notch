@@ -188,6 +188,13 @@ struct NotchSilenceRulesEditor: View {
     }
 
     private var previewMessage: String {
+        if draftPattern.trimmingCharacters(in: .whitespacesAndNewlines).count >
+            NotchSilenceRuleStore.maximumPatternLength {
+            return t(
+                "Use up to 256 characters; your rule will not be shortened.",
+                "最多输入 256 个字符；规则不会自动截断。"
+            )
+        }
         guard let pattern = cleanedDraftPattern else {
             return t(
                 "Enter text to see live matches",
