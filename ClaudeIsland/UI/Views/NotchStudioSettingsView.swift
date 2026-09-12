@@ -56,7 +56,6 @@ struct NotchStudioSettingsView: View {
     @State private var launchAtLogin = false
     @State private var hooksInstalled = false
     @State private var hooksNeedRepair = false
-    @State private var notificationSound = AppSettings.notificationSound
     @State private var previewState: NotchPreviewState = .idle
     @Namespace private var sectionSelectionNamespace
 
@@ -1125,29 +1124,7 @@ struct NotchStudioSettingsView: View {
 
                 Divider()
 
-                HStack {
-                    settingLabel(
-                        t("Attention sound", "提醒音"),
-                        detail: t(
-                            "Played for completion and optional follow-up reminders.",
-                            "智能体完成任务及可选跟进提醒时播放。"
-                        )
-                    )
-                    Spacer()
-                    Picker("", selection: $notificationSound) {
-                        ForEach(NotificationSound.allCases, id: \.rawValue) { sound in
-                            Text(sound.rawValue).tag(sound)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 190)
-                    .onChange(of: notificationSound) { _, sound in
-                        AppSettings.notificationSound = sound
-                        if let name = sound.soundName {
-                            NSSound(named: name)?.play()
-                        }
-                    }
-                }
+                NotchSoundSettingsEditor(language: preferences.language)
 
                 Divider()
 
@@ -1333,7 +1310,6 @@ struct NotchStudioSettingsView: View {
         launchAtLogin = SMAppService.mainApp.status == .enabled
         hooksInstalled = HookInstaller.integrationsOptedIn
         hooksNeedRepair = HookInstaller.integrationsNeedRepair
-        notificationSound = AppSettings.notificationSound
         screenSelector.refreshScreens()
     }
 

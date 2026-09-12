@@ -878,6 +878,15 @@ struct NotchView: View {
         let attentionEligibleSessions = sessions.filter {
             !isSessionSilenced($0)
         }
+        // One sound for the newest fresh interaction in this publication.
+        // Sound choice is independent of whether questions auto-expand.
+        if let event = NotchSoundSettings.newestInteractionEvent(
+            in: attentionEligibleSessions,
+            excluding: previousInteractionTokens,
+            trackingStartedAt: attentionTrackingStartedAt
+        ) {
+            playAttentionSoundIfAllowed(for: event)
+        }
         if let pendingSession = NotchAttentionPolicy.newestSessionToAutoExpand(
             from: attentionEligibleSessions,
             excluding: previousInteractionTokens,
@@ -984,18 +993,19 @@ struct NotchView: View {
             }
 
             // Play notification sound if the session is not actively focused
-            if let soundName = AppSettings.notificationSound.soundName {
+            delayedUIWork.completionSoundTask?.cancel()
+            delayedUIWork.completionSoundTask = nil
+            if NotchSoundSettings.automaticSound(for: .completion) != .none {
                 // Focus detection may yield while another turn begins. Keep
                 // one cancellable task and revalidate the exact completion
                 // generation before emitting a now-stale sound.
-                delayedUIWork.completionSoundTask?.cancel()
                 delayedUIWork.completionSoundTask = Task { @MainActor in
                     let shouldPlaySound = await shouldPlayNotificationSound(
                         for: completionTargets
                     )
                     guard !Task.isCancelled else { return }
                     if shouldPlaySound {
-                        playAttentionSoundIfAllowed(named: soundName)
+                        playAttentionSoundIfAllowed(for: .completion)
                     }
                     delayedUIWork.completionSoundTask = nil
                 }
@@ -1168,9 +1178,7 @@ struct NotchView: View {
                 isVisible = true
                 handleProcessingChange()
                 triggerAttentionBounce()
-                if let soundName = AppSettings.notificationSound.soundName {
-                    playAttentionSoundIfAllowed(named: soundName)
-                }
+                playAttentionSoundIfAllowed(for: .followUp)
             }
 
             delayedUIWork.followUpDeliveryTask = nil
@@ -1195,7 +1203,12 @@ struct NotchView: View {
         }
     }
 
-    private func playAttentionSoundIfAllowed(named soundName: String) {
+    private func playAttentionSoundIfAllowed(for event: NotchSoundEvent) {
+        // Resolve at emission, not before an asynchronous focus probe. A
+        // changed choice or master mute must take effect immediately.
+        guard let soundName = NotchSoundSettings.automaticSound(for: event).soundName else {
+            return
+        }
         let suppressionReason = NotchAttentionSilencePolicy.suppressionReason(
             quietScenesEnabled: preferences.quietScenesEnabled,
             sceneState: quietSceneMonitor.state,
