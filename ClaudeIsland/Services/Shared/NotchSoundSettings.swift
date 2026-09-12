@@ -11,6 +11,18 @@ enum NotchSoundEvent: String, CaseIterable, Identifiable {
 
 enum NotchSoundSettings {
     static let enabledKey = "notchAutomaticSoundsEnabled"
+    static let volumeKey = "notchSoundVolume"
+
+    /// App-local gain, independent of system volume. Preserve the previous
+    /// full-volume behavior until the user explicitly changes it.
+    static func volume(defaults: UserDefaults = .standard) -> Double {
+        normalizedVolume(defaults.object(forKey: volumeKey) as? Double ?? 1)
+    }
+
+    static func normalizedVolume(_ value: Double) -> Double {
+        guard value.isFinite else { return 1 }
+        return min(1, max(0, value))
+    }
 
     static func sound(
         for event: NotchSoundEvent,
@@ -34,7 +46,8 @@ enum NotchSoundSettings {
         for event: NotchSoundEvent,
         defaults: UserDefaults = .standard
     ) -> NotificationSound {
-        guard defaults.object(forKey: enabledKey) as? Bool ?? true else {
+        guard defaults.object(forKey: enabledKey) as? Bool ?? true,
+              volume(defaults: defaults) > 0 else {
             return .none
         }
         return sound(for: event, defaults: defaults)

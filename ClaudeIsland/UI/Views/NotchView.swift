@@ -1206,7 +1206,7 @@ struct NotchView: View {
     private func playAttentionSoundIfAllowed(for event: NotchSoundEvent) {
         // Resolve at emission, not before an asynchronous focus probe. A
         // changed choice or master mute must take effect immediately.
-        guard let soundName = NotchSoundSettings.automaticSound(for: event).soundName else {
+        guard NotchSoundSettings.automaticSound(for: event) != .none else {
             return
         }
         let suppressionReason = NotchAttentionSilencePolicy.suppressionReason(
@@ -1217,7 +1217,7 @@ struct NotchView: View {
             quietHoursEndMinute: preferences.quietHoursEndMinute
         )
         guard let suppressionReason else {
-            NSSound(named: soundName)?.play()
+            NotchSoundPlayer.shared.playAutomatic(for: event)
             return
         }
 

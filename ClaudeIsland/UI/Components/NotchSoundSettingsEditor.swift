@@ -5,6 +5,9 @@ import SwiftUI
 struct NotchSoundSettingsEditor: View {
     let language: AppLanguage
     @AppStorage(NotchSoundSettings.enabledKey) private var enabled = true
+    @AppStorage(NotchSoundSettings.volumeKey) private var storedVolume = 1.0
+
+    private var volume: Double { NotchSoundSettings.normalizedVolume(storedVolume) }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -16,17 +19,37 @@ struct NotchSoundSettingsEditor: View {
                     .labelsHidden()
                     .toggleStyle(.switch)
             }
+            HStack(spacing: 12) {
+                Text(language.text("Sound volume", "提醒音量"))
+                    .font(.system(size: 12))
+                Slider(value: Binding(
+                    get: { volume },
+                    set: { storedVolume = $0 }
+                ), in: 0...1, step: 0.01)
+                    .accessibilityLabel(language.text("Sound volume", "提醒音量"))
+                    .accessibilityValue("\(Int((volume * 100).rounded()))%")
+                Text("\(Int((volume * 100).rounded()))%")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 38, alignment: .trailing)
+            }
             ForEach(NotchSoundEvent.allCases) { event in
-                NotchSoundRow(event: event, language: language)
+                NotchSoundRow(event: event, language: language, volume: volume)
             }
             Text(language.text(
-                "Quiet scenes, quiet hours and silence rules apply to automatic sounds. Preview plays only when you press the play button.",
-                "自动声音遵循静默场景、静默时段和静默规则。试听仅在点击播放按钮时响起。"
+                "Volume applies to alerts and previews, not system volume. At 0%, both are silent. Automatic sounds follow quiet scenes, quiet hours and silence rules. Preview only plays when you press play.",
+                "音量同时用于提醒和试听，不修改系统音量；0% 时均无声。自动声音遵循静默场景、静默时段和静默规则。试听仅在点击播放时响起。"
             ))
             .font(.system(size: 10))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .multilineTextAlignment(.leading)
+        }
+        .onChange(of: storedVolume) { _, _ in
+            NotchSoundPlayer.shared.refreshSettings()
+        }
+        .onChange(of: enabled) { _, _ in
+            NotchSoundPlayer.shared.refreshSettings()
         }
     }
 }
@@ -34,12 +57,14 @@ struct NotchSoundSettingsEditor: View {
 private struct NotchSoundRow: View {
     let event: NotchSoundEvent
     let language: AppLanguage
+    let volume: Double
     @AppStorage private var selected: String
     @AppStorage("notificationSound") private var completionChoice = "Pop"
 
-    init(event: NotchSoundEvent, language: AppLanguage) {
+    init(event: NotchSoundEvent, language: AppLanguage, volume: Double) {
         self.event = event
         self.language = language
+        self.volume = volume
         _selected = AppStorage(wrappedValue: "", event.key)
     }
 
@@ -81,11 +106,11 @@ private struct NotchSoundRow: View {
             .labelsHidden()
             .frame(width: 180)
             Button {
-                if let name = sound.soundName { NSSound(named: name)?.play() }
+                NotchSoundPlayer.shared.preview(sound)
             } label: {
                 Image(systemName: "play.fill")
             }
-            .disabled(sound == .none)
+            .disabled(sound == .none || volume == 0)
             .help(language.text("Preview sound", "试听声音"))
             .accessibilityLabel(language.text("Preview \(title)", "试听\(title)"))
         }
