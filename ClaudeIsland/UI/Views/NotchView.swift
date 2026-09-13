@@ -995,7 +995,7 @@ struct NotchView: View {
             // Play notification sound if the session is not actively focused
             delayedUIWork.completionSoundTask?.cancel()
             delayedUIWork.completionSoundTask = nil
-            if NotchSoundSettings.automaticSound(for: .completion) != .none {
+            if NotchSoundSettings.automaticSource(for: .completion) != nil {
                 // Focus detection may yield while another turn begins. Keep
                 // one cancellable task and revalidate the exact completion
                 // generation before emitting a now-stale sound.
@@ -1206,7 +1206,7 @@ struct NotchView: View {
     private func playAttentionSoundIfAllowed(for event: NotchSoundEvent) {
         // Resolve at emission, not before an asynchronous focus probe. A
         // changed choice or master mute must take effect immediately.
-        guard NotchSoundSettings.automaticSound(for: event) != .none else {
+        guard NotchSoundSettings.automaticSource(for: event) != nil else {
             return
         }
         let suppressionReason = NotchAttentionSilencePolicy.suppressionReason(

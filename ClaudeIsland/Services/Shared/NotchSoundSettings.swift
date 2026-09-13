@@ -9,6 +9,11 @@ enum NotchSoundEvent: String, CaseIterable, Identifiable {
     }
 }
 
+enum NotchSoundSource: Equatable {
+    case system(NotificationSound)
+    case file(NotchImportedSound)
+}
+
 enum NotchSoundSettings {
     static let enabledKey = "notchAutomaticSoundsEnabled"
     static let volumeKey = "notchSoundVolume"
@@ -24,33 +29,40 @@ enum NotchSoundSettings {
         return min(1, max(0, value))
     }
 
-    static func sound(
+    static func source(
         for event: NotchSoundEvent,
-        defaults: UserDefaults = .standard
-    ) -> NotificationSound {
-        if let value = defaults.string(forKey: event.key),
-           let sound = NotificationSound(rawValue: value) {
-            return sound
+        defaults: UserDefaults = .standard,
+        directory: URL = NotchCustomSoundStore.directory
+    ) -> NotchSoundSource? {
+        let value = defaults.string(forKey: event.key) ?? ""
+        if value.hasPrefix("custom:") {
+            guard let record = NotchImportedSound.decode(value),
+                  NotchCustomSoundStore.isAvailable(record, in: directory) else { return nil }
+            return .file(record)
+        }
+        if let sound = NotificationSound(rawValue: value) {
+            return sound == .none ? nil : .system(sound)
         }
         switch event {
-        case .approval, .question: return .none
-        case .completion: return .pop
+        case .approval, .question: return nil
+        case .completion: return .system(.pop)
         case .followUp:
             // Preserve the previous completion/follow-up shared choice until
             // the user explicitly chooses a separate follow-up sound.
-            return sound(for: .completion, defaults: defaults)
+            return source(for: .completion, defaults: defaults, directory: directory)
         }
     }
 
-    static func automaticSound(
+    static func automaticSource(
         for event: NotchSoundEvent,
-        defaults: UserDefaults = .standard
-    ) -> NotificationSound {
+        defaults: UserDefaults = .standard,
+        directory: URL = NotchCustomSoundStore.directory
+    ) -> NotchSoundSource? {
         guard defaults.object(forKey: enabledKey) as? Bool ?? true,
               volume(defaults: defaults) > 0 else {
-            return .none
+            return nil
         }
-        return sound(for: event, defaults: defaults)
+        return source(for: event, defaults: defaults, directory: directory)
     }
 
     /// Filter before selecting so a newer silent question cannot mask an
@@ -69,7 +81,7 @@ enum NotchSoundSettings {
                   context.receivedAt >= trackingStartedAt else { return nil }
             let event: NotchSoundEvent = context.toolName == "AskUserQuestion"
                 ? .question : .approval
-            guard automaticSound(for: event, defaults: defaults) != .none else {
+            guard automaticSource(for: event, defaults: defaults) != nil else {
                 return nil
             }
             return (event, context.receivedAt)

@@ -26,15 +26,15 @@ final class NotchSoundSettingsTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("Glass", forKey: "notificationSound")
-        XCTAssertEqual(NotchSoundSettings.sound(for: .completion, defaults: defaults), .glass)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .followUp, defaults: defaults), .glass)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .approval, defaults: defaults), .none)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .question, defaults: defaults), .none)
+        XCTAssertEqual(NotchSoundSettings.source(for: .completion, defaults: defaults), .system(.glass))
+        XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: defaults), .system(.glass))
+        XCTAssertEqual(NotchSoundSettings.source(for: .approval, defaults: defaults), nil)
+        XCTAssertEqual(NotchSoundSettings.source(for: .question, defaults: defaults), nil)
         defaults.set("None", forKey: NotchSoundEvent.followUp.key)
         defaults.set("Ping", forKey: NotchSoundEvent.question.key)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .followUp, defaults: defaults), .none)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .question, defaults: defaults), .ping)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .completion, defaults: defaults), .glass)
+        XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: defaults), nil)
+        XCTAssertEqual(NotchSoundSettings.source(for: .question, defaults: defaults), .system(.ping))
+        XCTAssertEqual(NotchSoundSettings.source(for: .completion, defaults: defaults), .system(.glass))
     }
 
     func testInvalidStoredChoicesUseCompatibleDefaults() async {
@@ -44,9 +44,9 @@ final class NotchSoundSettingsTests: XCTestCase {
         for event in NotchSoundEvent.allCases {
             defaults.set("missing-sound", forKey: event.key)
         }
-        XCTAssertEqual(NotchSoundSettings.sound(for: .completion, defaults: defaults), .pop)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .followUp, defaults: defaults), .pop)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .approval, defaults: defaults), .none)
+        XCTAssertEqual(NotchSoundSettings.source(for: .completion, defaults: defaults), .system(.pop))
+        XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: defaults), .system(.pop))
+        XCTAssertEqual(NotchSoundSettings.source(for: .approval, defaults: defaults), nil)
     }
 
     func testMasterMutePreservesChoicesAndExplicitPreview() async {
@@ -55,16 +55,16 @@ final class NotchSoundSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         for event in NotchSoundEvent.allCases {
             defaults.set("Ping", forKey: event.key)
-            XCTAssertEqual(NotchSoundSettings.automaticSound(for: event, defaults: defaults), .ping)
+            XCTAssertEqual(NotchSoundSettings.automaticSource(for: event, defaults: defaults), .system(.ping))
         }
         defaults.set(false, forKey: NotchSoundSettings.enabledKey)
         for event in NotchSoundEvent.allCases {
-            XCTAssertEqual(NotchSoundSettings.automaticSound(for: event, defaults: defaults), .none)
-            XCTAssertEqual(NotchSoundSettings.sound(for: event, defaults: defaults), .ping)
+            XCTAssertEqual(NotchSoundSettings.automaticSource(for: event, defaults: defaults), nil)
+            XCTAssertEqual(NotchSoundSettings.source(for: event, defaults: defaults), .system(.ping))
         }
         defaults.set(true, forKey: NotchSoundSettings.enabledKey)
         defaults.set("Glass", forKey: NotchSoundEvent.completion.key)
-        XCTAssertEqual(NotchSoundSettings.automaticSound(for: .completion, defaults: defaults), .glass)
+        XCTAssertEqual(NotchSoundSettings.automaticSource(for: .completion, defaults: defaults), .system(.glass))
     }
 
     func testFollowUpCanResumeFollowingCompletion() async {
@@ -73,11 +73,11 @@ final class NotchSoundSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("None", forKey: NotchSoundEvent.followUp.key)
         defaults.set("Glass", forKey: NotchSoundEvent.completion.key)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .followUp, defaults: defaults), .none)
+        XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: defaults), nil)
         defaults.set("", forKey: NotchSoundEvent.followUp.key)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .followUp, defaults: defaults), .glass)
+        XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: defaults), .system(.glass))
         defaults.set("Ping", forKey: NotchSoundEvent.completion.key)
-        XCTAssertEqual(NotchSoundSettings.sound(for: .followUp, defaults: defaults), .ping)
+        XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: defaults), .system(.ping))
     }
 
     func testSilentQuestionCannotMaskApprovalAndNewestAudibleEventWins() async {

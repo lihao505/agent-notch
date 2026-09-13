@@ -17,7 +17,8 @@ final class NotchSoundPlayer {
     static let shared = NotchSoundPlayer()
 
     private let defaults: UserDefaults
-    private let makeSound: (String) -> (any NotchSoundPlayback)?
+    private let directory: URL
+    private let makeSound: @MainActor (NotchSoundSource) -> (any NotchSoundPlayback)?
     private var currentSound: (any NotchSoundPlayback)?
     private var automaticEvent: NotchSoundEvent?
     private var settingsObserver: NSObjectProtocol?
@@ -25,14 +26,23 @@ final class NotchSoundPlayer {
     init(
         defaults: UserDefaults = .standard,
         observeChanges: Bool = true,
-        makeSound: @escaping (String) -> (any NotchSoundPlayback)? = {
-            // Named sounds are cached by AppKit; own a copy so gain and stop
-            // changes cannot alter other users of the named sound instance.
-            NSSound(named: $0)?.copy() as? NSSound
-        }
+        directory: URL = NotchCustomSoundStore.directory,
+        makeSound: (@MainActor (NotchSoundSource) -> (any NotchSoundPlayback)?)? = nil
     ) {
         self.defaults = defaults
-        self.makeSound = makeSound
+        self.directory = directory
+        self.makeSound = makeSound ?? {
+            // Named sounds are cached by AppKit; own a copy so gain and stop
+            // changes cannot alter other users of the named sound instance.
+            switch $0 {
+            case .system(let sound):
+                guard let name = sound.soundName else { return nil }
+                return NSSound(named: name)?.copy() as? NSSound
+            case .file(let record):
+                guard NotchCustomSoundStore.isAvailable(record, in: directory) else { return nil }
+                return NSSound(contentsOf: NotchCustomSoundStore.fileURL(for: record, in: directory), byReference: false)
+            }
+        }
         if observeChanges {
             settingsObserver = NotificationCenter.default.addObserver(
                 forName: UserDefaults.didChangeNotification,
@@ -52,18 +62,23 @@ final class NotchSoundPlayer {
 
     @discardableResult
     func playAutomatic(for event: NotchSoundEvent) -> Bool {
-        play(NotchSoundSettings.automaticSound(for: event, defaults: defaults), automaticEvent: event)
+        play(NotchSoundSettings.automaticSource(for: event, defaults: defaults, directory: directory), automaticEvent: event)
     }
 
     @discardableResult
     func preview(_ sound: NotificationSound) -> Bool {
-        play(sound, automaticEvent: nil)
+        play(sound == .none ? nil : .system(sound), automaticEvent: nil)
+    }
+
+    @discardableResult
+    func preview(for event: NotchSoundEvent) -> Bool {
+        play(NotchSoundSettings.source(for: event, defaults: defaults, directory: directory), automaticEvent: nil)
     }
 
     func refreshSettings() {
         let volume = NotchSoundSettings.volume(defaults: defaults)
         if volume == 0 || automaticEvent.map({
-            NotchSoundSettings.automaticSound(for: $0, defaults: defaults) == .none
+            NotchSoundSettings.automaticSource(for: $0, defaults: defaults, directory: directory) == nil
         }) == true {
             stop()
         } else {
@@ -77,10 +92,10 @@ final class NotchSoundPlayer {
         automaticEvent = nil
     }
 
-    private func play(_ sound: NotificationSound, automaticEvent: NotchSoundEvent?) -> Bool {
+    private func play(_ source: NotchSoundSource?, automaticEvent: NotchSoundEvent?) -> Bool {
         let volume = NotchSoundSettings.volume(defaults: defaults)
-        guard volume > 0, let name = sound.soundName,
-              let nextSound = makeSound(name) else { return false }
+        guard volume > 0, let source,
+              let nextSound = makeSound(source) else { return false }
         stop()
         nextSound.volume = Float(volume)
         guard nextSound.play() else { return false }
