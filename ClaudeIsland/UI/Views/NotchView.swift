@@ -349,6 +349,7 @@ struct NotchView: View {
             handlePendingSessionsChange(sessions)
         }
         .onChange(of: sessionMonitor.instances) { _, instances in
+            revalidatePlayingAttentionSound()
             viewModel.updateVisibleSessionCount(instances.count)
             handleProcessingChange()
             handleWaitingForInputChange(instances)
@@ -369,11 +370,15 @@ struct NotchView: View {
         .onChange(of: silenceRuleStore.rules) { _, _ in
             handleSilenceRulesChange()
         }
+        .onChange(of: automaticSoundSuppressionReason) { _, _ in
+            revalidatePlayingAttentionSound()
+        }
         .onChange(of: followUpReminderCoordinator.pendingTargets) {
             _, targets in
             deliverFollowUpReminders(targets)
         }
         .onDisappear {
+            NotchSoundPlayer.shared.revalidateAutomaticPlayback(in: [], sceneSuppressed: true)
             cancelDelayedUIWork()
             followUpReminderCoordinator.cancelAll()
         }
@@ -880,12 +885,12 @@ struct NotchView: View {
         }
         // One sound for the newest fresh interaction in this publication.
         // Sound choice is independent of whether questions auto-expand.
-        if let event = NotchSoundSettings.newestInteractionEvent(
+        if let sound = NotchSoundSettings.newestInteractionSound(
             in: attentionEligibleSessions,
             excluding: previousInteractionTokens,
             trackingStartedAt: attentionTrackingStartedAt
         ) {
-            playAttentionSoundIfAllowed(for: event)
+            playAttentionSoundIfAllowed(for: sound.event, targets: [sound.target])
         }
         if let pendingSession = NotchAttentionPolicy.newestSessionToAutoExpand(
             from: attentionEligibleSessions,
@@ -1000,12 +1005,12 @@ struct NotchView: View {
                 // one cancellable task and revalidate the exact completion
                 // generation before emitting a now-stale sound.
                 delayedUIWork.completionSoundTask = Task { @MainActor in
-                    let shouldPlaySound = await shouldPlayNotificationSound(
+                    let audibleToken = await notificationSoundTarget(
                         for: completionTargets
                     )
                     guard !Task.isCancelled else { return }
-                    if shouldPlaySound {
-                        playAttentionSoundIfAllowed(for: .completion)
+                    if let audibleToken {
+                        playAttentionSoundIfAllowed(for: .completion, targets: [.completion(audibleToken)])
                     }
                     delayedUIWork.completionSoundTask = nil
                 }
@@ -1178,7 +1183,7 @@ struct NotchView: View {
                 isVisible = true
                 handleProcessingChange()
                 triggerAttentionBounce()
-                playAttentionSoundIfAllowed(for: .followUp)
+                playAttentionSoundIfAllowed(for: .followUp, targets: eligibleTargets)
             }
 
             delayedUIWork.followUpDeliveryTask = nil
@@ -1203,21 +1208,40 @@ struct NotchView: View {
         }
     }
 
-    private func playAttentionSoundIfAllowed(for event: NotchSoundEvent) {
-        // Resolve at emission, not before an asynchronous focus probe. A
-        // changed choice or master mute must take effect immediately.
-        guard NotchSoundSettings.automaticSource(for: event) != nil else {
-            return
-        }
-        let suppressionReason = NotchAttentionSilencePolicy.suppressionReason(
+    private var automaticSoundSuppressionReason: NotchAttentionSilenceReason? {
+        NotchAttentionSilencePolicy.suppressionReason(
             quietScenesEnabled: preferences.quietScenesEnabled,
             sceneState: quietSceneMonitor.state,
             quietHoursEnabled: preferences.quietHoursEnabled,
             quietHoursStartMinute: preferences.quietHoursStartMinute,
             quietHoursEndMinute: preferences.quietHoursEndMinute
         )
+    }
+
+    private func revalidatePlayingAttentionSound() {
+        NotchSoundPlayer.shared.revalidateAutomaticPlayback(
+            in: sessionMonitor.instances,
+            silencedSessionIds: Set(sessionMonitor.instances.filter(isSessionSilenced).map(\.sessionId)),
+            sceneSuppressed: automaticSoundSuppressionReason != nil
+        )
+    }
+
+    private func playAttentionSoundIfAllowed(for event: NotchSoundEvent, targets: Set<NotchFollowUpTarget>) {
+        // Resolve at emission, not before an asynchronous focus probe. A
+        // changed choice or master mute must take effect immediately.
+        guard NotchSoundSettings.automaticSource(for: event) != nil else {
+            return
+        }
+        let eligibleSessions = sessionMonitor.instances.filter { !isSessionSilenced($0) }
+        let currentTargets = targets.filter {
+            NotchAttentionPolicy.isStillCurrent(
+                $0, in: eligibleSessions, completionTrackingStartedAt: attentionTrackingStartedAt
+            )
+        }
+        guard !currentTargets.isEmpty else { return }
+        let suppressionReason = automaticSoundSuppressionReason
         guard let suppressionReason else {
-            NotchSoundPlayer.shared.playAutomatic(for: event)
+            NotchSoundPlayer.shared.playAutomatic(for: event, targets: currentTargets)
             return
         }
 
@@ -1235,6 +1259,7 @@ struct NotchView: View {
     /// a completion that already happened. Cancel in-flight UI work and let
     /// the coordinator consume matched generations without forgetting them.
     private func handleSilenceRulesChange() {
+        revalidatePlayingAttentionSound()
         delayedUIWork.completionSoundTask?.cancel()
         delayedUIWork.completionSoundTask = nil
         delayedUIWork.followUpDeliveryTask?.cancel()
@@ -1277,11 +1302,11 @@ struct NotchView: View {
         delayedUIWork.cancelAll()
     }
 
-    /// Determine if notification sound should play for the given sessions
-    /// Returns true if ANY session is not actively focused
-    private func shouldPlayNotificationSound(
+    /// Preserve the exact unfocused generation through playback so a later
+    /// state transition can stop its sound without affecting other sessions.
+    private func notificationSoundTarget(
         for targets: [(SessionState, NotchCompletionToken)]
-    ) async -> Bool {
+    ) async -> NotchCompletionToken? {
         for (_, token) in targets {
             guard let currentSession = sessionMonitor.instances.first(
                 where: {
@@ -1294,7 +1319,7 @@ struct NotchView: View {
             guard let pid = currentSession.pid else {
                 // No PID means we can't check focus. It is still safe to alert
                 // only if this exact completion remains current.
-                return true
+                return token
             }
 
             let isFocused = await TerminalVisibilityDetector.isSessionFocused(sessionPid: pid)
@@ -1308,10 +1333,10 @@ struct NotchView: View {
                 continue
             }
             if !isFocused {
-                return true
+                return token
             }
         }
 
-        return false
+        return nil
     }
 }

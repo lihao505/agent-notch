@@ -21,6 +21,7 @@ final class NotchSoundPlayer {
     private let makeSound: @MainActor (NotchSoundSource) -> (any NotchSoundPlayback)?
     private var currentSound: (any NotchSoundPlayback)?
     private var automaticEvent: NotchSoundEvent?
+    private var automaticTargets: Set<NotchFollowUpTarget> = []
     private var settingsObserver: NSObjectProtocol?
 
     init(
@@ -62,7 +63,36 @@ final class NotchSoundPlayer {
 
     @discardableResult
     func playAutomatic(for event: NotchSoundEvent) -> Bool {
-        play(NotchSoundSettings.automaticSource(for: event, defaults: defaults, directory: directory), automaticEvent: event)
+        playAutomatic(for: event, targets: [])
+    }
+
+    @discardableResult
+    func playAutomatic(for event: NotchSoundEvent, targets: Set<NotchFollowUpTarget>) -> Bool {
+        let started = play(NotchSoundSettings.automaticSource(for: event, defaults: defaults, directory: directory), automaticEvent: event)
+        if started { automaticTargets = targets }
+        return started
+    }
+
+    /// Revalidate the exact generations that caused playback, not just their
+    /// event kind. This only stops sound; state recovery must never replay it.
+    func revalidateAutomaticPlayback(
+        in sessions: [SessionState],
+        silencedSessionIds: Set<String> = [],
+        sceneSuppressed: Bool = false
+    ) {
+        guard automaticEvent != nil else { return }
+        if sceneSuppressed {
+            stop()
+            return
+        }
+        guard !automaticTargets.isEmpty else { return }
+        automaticTargets = automaticTargets.filter { target in
+            !silencedSessionIds.contains(target.sessionId) &&
+                NotchAttentionPolicy.isStillCurrent(
+                    target, in: sessions, completionTrackingStartedAt: .distantPast
+                )
+        }
+        if automaticTargets.isEmpty { stop() }
     }
 
     @discardableResult
@@ -90,6 +120,7 @@ final class NotchSoundPlayer {
         _ = currentSound?.stop()
         currentSound = nil
         automaticEvent = nil
+        automaticTargets.removeAll()
     }
 
     private func play(_ source: NotchSoundSource?, automaticEvent: NotchSoundEvent?) -> Bool {

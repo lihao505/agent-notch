@@ -14,6 +14,12 @@ enum NotchSoundSource: Equatable {
     case file(NotchImportedSound)
 }
 
+struct NotchInteractionSound {
+    let event: NotchSoundEvent
+    let target: NotchFollowUpTarget
+    let receivedAt: Date
+}
+
 enum NotchSoundSettings {
     static let enabledKey = "notchAutomaticSoundsEnabled"
     static let volumeKey = "notchSoundVolume"
@@ -74,7 +80,17 @@ enum NotchSoundSettings {
         trackingStartedAt: Date,
         defaults: UserDefaults = .standard
     ) -> NotchSoundEvent? {
-        sessions.compactMap { session -> (NotchSoundEvent, Date)? in
+        newestInteractionSound(in: sessions, excluding: previousTokens,
+                               trackingStartedAt: trackingStartedAt, defaults: defaults)?.event
+    }
+
+    static func newestInteractionSound(
+        in sessions: [SessionState],
+        excluding previousTokens: Set<NotchInteractionToken>,
+        trackingStartedAt: Date,
+        defaults: UserDefaults = .standard
+    ) -> NotchInteractionSound? {
+        sessions.compactMap { session -> NotchInteractionSound? in
             guard let token = NotchAttentionPolicy.interactionToken(for: session),
                   !previousTokens.contains(token),
                   let context = session.activePermission,
@@ -84,8 +100,8 @@ enum NotchSoundSettings {
             guard automaticSource(for: event, defaults: defaults) != nil else {
                 return nil
             }
-            return (event, context.receivedAt)
+            return NotchInteractionSound(event: event, target: .interaction(token), receivedAt: context.receivedAt)
         }
-        .max(by: { $0.1 < $1.1 })?.0
+        .max(by: { $0.receivedAt < $1.receivedAt })
     }
 }
