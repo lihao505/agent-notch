@@ -70,6 +70,7 @@ struct NotchView: View {
     @StateObject private var usageMonitor = UsageLimitMonitor.shared
     @StateObject private var preferences = NotchPreferences.shared
     @StateObject private var quietSceneMonitor = NotchQuietSceneMonitor.shared
+    @StateObject private var quietHoursMonitor = NotchQuietHoursMonitor()
     @StateObject private var silenceRuleStore = NotchSilenceRuleStore.shared
     @ObservedObject private var updateManager = UpdateManager.shared
     @State private var previousInteractionTokens:
@@ -337,6 +338,7 @@ struct NotchView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .preferredColorScheme(.dark)
         .onAppear {
+            quietHoursMonitor.configure(quietHoursSchedule)
             sessionMonitor.startMonitoring()
             viewModel.updateVisibleSessionCount(sessionMonitor.instances.count)
             updateIdleVisibility()
@@ -373,11 +375,18 @@ struct NotchView: View {
         .onChange(of: automaticSoundSuppressionReason) { _, _ in
             revalidatePlayingAttentionSound()
         }
+        .onChange(of: quietHoursSchedule) { _, schedule in
+            quietHoursMonitor.configure(schedule)
+        }
+        .onChange(of: quietHoursMonitor.isQuiet) { _, _ in
+            revalidatePlayingAttentionSound()
+        }
         .onChange(of: followUpReminderCoordinator.pendingTargets) {
             _, targets in
             deliverFollowUpReminders(targets)
         }
         .onDisappear {
+            quietHoursMonitor.stop()
             NotchSoundPlayer.shared.revalidateAutomaticPlayback(in: [], sceneSuppressed: true)
             cancelDelayedUIWork()
             followUpReminderCoordinator.cancelAll()
@@ -1206,6 +1215,14 @@ struct NotchView: View {
             isBouncing = false
             delayedUIWork.bounceTask = nil
         }
+    }
+
+    private var quietHoursSchedule: NotchQuietHoursSchedule {
+        NotchQuietHoursSchedule(
+            enabled: preferences.quietHoursEnabled,
+            startMinute: preferences.quietHoursStartMinute,
+            endMinute: preferences.quietHoursEndMinute
+        )
     }
 
     private var automaticSoundSuppressionReason: NotchAttentionSilenceReason? {

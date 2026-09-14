@@ -15,6 +15,36 @@ enum NotchQuietHoursPolicy {
         min(max(0, minute), minutesPerDay - 1)
     }
 
+    /// Schedule only boundaries, including offset changes that can jump into
+    /// or out of a local-time interval. Repeated hours need both occurrences.
+    static func nextRecheckDate(
+        enabled: Bool,
+        startMinute: Int,
+        endMinute: Int,
+        after date: Date,
+        calendar: Calendar = .current
+    ) -> Date? {
+        let start = sanitizedMinute(startMinute)
+        let end = sanitizedMinute(endMinute)
+        guard enabled, start != end else { return nil }
+        var candidates: [Date] = []
+        for minute in [start, end] {
+            let components = DateComponents(hour: minute / 60, minute: minute % 60, second: 0)
+            for repeated: Calendar.RepeatedTimePolicy in [.first, .last] {
+                if let next = calendar.nextDate(
+                    after: date, matching: components,
+                    matchingPolicy: .nextTime, repeatedTimePolicy: repeated
+                ), next > date {
+                    candidates.append(next)
+                }
+            }
+        }
+        if let transition = calendar.timeZone.nextDaylightSavingTimeTransition(after: date), transition > date {
+            candidates.append(transition)
+        }
+        return candidates.min()
+    }
+
     /// Start is inclusive and end is exclusive. An equal start/end represents
     /// an intentional all-day quiet schedule; the separate enable switch is
     /// the unambiguous way to disable it.
