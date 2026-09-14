@@ -78,6 +78,9 @@ PERMISSION_TIMEOUT = bounded_env_seconds(
 SEND_TIMEOUT = bounded_env_seconds(
     "NOTCH_SEND_TIMEOUT", 5, minimum=0.1, maximum=5
 )
+# Replies echo complete question/plan inputs, not only a small allow/deny flag.
+# Bound memory while accommodating multi-page questions and custom answers.
+MAX_RESPONSE_BYTES = 1024 * 1024
 # A completed turn may remain available for up to five hours. The app shows at
 # most one completed row and hides it early when active work gets crowded. Any
 # new activity cancels the pending removal.
@@ -404,6 +407,30 @@ def write_synthetic(source, session_id, cwd, event, data):
         pass  # never let transcript writing break the hook
 
 
+def read_socket_response(connection, deadline):
+    """Read the app's one JSON response, framed by its closing the socket.
+
+    Unix stream reads may split anywhere, including inside a UTF-8 character.
+    Decode only after EOF, with one absolute deadline for the whole exchange:
+    a peer trickling bytes must not renew the permission wait indefinitely.
+    """
+    response = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        connection.settimeout(remaining)
+        chunk = connection.recv(min(65536, MAX_RESPONSE_BYTES + 1 - len(response)))
+        if not chunk:
+            if not response:
+                return None
+            decoded = json.loads(response.decode("utf-8"))
+            return decoded if isinstance(decoded, dict) else None
+        response.extend(chunk)
+        if len(response) > MAX_RESPONSE_BYTES:
+            return None
+
+
 def send_event(sock_path, state, expect_reply):
     s = None
     try:
@@ -414,7 +441,9 @@ def send_event(sock_path, state, expect_reply):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         # Long budget only when we actually block for a decision; otherwise a
         # short budget so a hung socket can't stall the agent's turn.
-        s.settimeout(PERMISSION_TIMEOUT if expect_reply else SEND_TIMEOUT)
+        budget = PERMISSION_TIMEOUT if expect_reply else SEND_TIMEOUT
+        deadline = time.monotonic() + budget
+        s.settimeout(budget)
         s.connect(sock_path)
 
         # Re-check the pathname after connect to close the lstat/connect race,
@@ -426,26 +455,25 @@ def send_event(sock_path, state, expect_reply):
             or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
             or _peer_uid(s) != os.getuid()
         ):
-            s.close()
             return False if not expect_reply else None
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False if not expect_reply else None
+        s.settimeout(remaining)
         s.sendall(json.dumps(state).encode())
         if expect_reply:
-            resp = s.recv(4096)
-            s.close()
-            if resp:
-                return json.loads(resp.decode())
+            return read_socket_response(s, deadline)
         else:
-            s.close()
             return True
-        return None
-    except (socket.error, OSError, ValueError, json.JSONDecodeError):
+    except (socket.error, OSError, ValueError, RecursionError):
+        return False if not expect_reply else None
+    finally:
         if s is not None:
             try:
                 s.close()
             except OSError:
                 pass
-        return False if not expect_reply else None
 
 
 def _private_socket_info(sock_path):

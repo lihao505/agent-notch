@@ -19,6 +19,7 @@ required_files=(
     ThirdPartyLicenses/swift-cmark-0.8.0-COPYING.txt
     AgentBridge/README.md AgentBridge/install.sh AgentBridge/uninstall.sh
     AgentBridge/bin/notch-bridge.py AgentBridge/bin/codex-relay.py
+    AgentBridge/tests/test_socket_responses.py scripts/verify-claude-question.py
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
@@ -206,5 +207,7 @@ python3 -m plistlib ClaudeIsland/Info.plist >/dev/null
 bash -n scripts/build.sh scripts/create-release.sh scripts/generate-keys.sh \
     AgentBridge/install.sh AgentBridge/uninstall.sh
 python3 -B -m unittest discover -s AgentBridge/tests -v
+# Parse the opt-in live fixture without loading an SDK or making model calls.
+python3 -B scripts/verify-claude-question.py --help >/dev/null
 
 echo "Release metadata and scripts verified."

@@ -36,6 +36,7 @@
 - [x] 按当前官方 Codex Hooks 文档确认 allow/deny wire format
 - [x] 使用已安装 bridge + 实际刘海按钮完成 allow/deny 端到端回写验收
 - [ ] 在真实 Claude Code/CLI `PermissionRequest` 回合完成端到端 allow/deny 点击验收
+- [x] 真实 Claude CLI/SDK 经生产 Bridge 接收大于 4 KiB 的分段多行问题答案并继续至 Stop（测试 socket，非实际刘海界面）
 - [ ] 人工确认同一会话的审批不会发送给另一会话
 - [ ] 关闭“问题自动展开”后，`AskUserQuestion` 只显示小刘海待处理状态；普通审批与计划审查仍自动展开
 
@@ -50,6 +51,14 @@ xcodebuild -project ClaudeIsland.xcodeproj -scheme ClaudeIsland \
 自动化测试已经覆盖 `sessionId + toolUseId` 交叉串会话拒绝、同一会话多个交互按
 FIFO 逐个呈现，以及旧批准回调不会擦除较新的完成状态；上面的人工项仍保留，
 用于确认真实 Claude Code/CLI 与已安装 App 的完整 wire path。
+
+问答协议补充验证：`scripts/verify-claude-question.py --live` 复用官方 SDK，
+隔离用户配置、Bridge 持久化及真实 App socket。2026-09-14 使用本机 Claude Code
+2.1.195 / SDK 0.2.152 验证通过：17,821 字节的中文答案分段回传，随机答案标记
+被 Agent 消费，且没有调用备用权限回调。完整命令和验收边界见
+`AgentBridge/README.md`。此结果不勾选上面的真实 UI、普通审批及完整回合验收项。
+同日指定已安装的 Bridge 再次复测通过（17,841 字节），App 保持关闭；安装前保留了
+旧 App 与旧 Bridge 的备份，未重写 Agent 配置。
 
 ## 可选：签名二进制发行
 

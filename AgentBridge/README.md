@@ -54,6 +54,39 @@ bash install.sh
 
 前提：`/Applications/Agent Notch.app` 已安装并运行。
 
+## 问答回传与复测
+
+`AskUserQuestion` 通过 `PreToolUse` 返回原始问题和 `updatedInput.answers`，
+不是普通 `PermissionRequest` 的 allow/deny。协议依据：
+[Claude 官方 Hooks 文档](https://code.claude.com/docs/en/hooks#pretooluse-decision-control)。
+
+Bridge 会读取 App 关闭连接前的完整 JSON 回包，再统一解码 UTF-8；不再假设
+一次 `recv(4096)` 就能拿到整条答案。长答案、分包及中文/emoji 均有真实私有
+socket 回归测试。回包上限为 1 MiB，连接、发送和接收共用总超时预算；截断、
+无效、超限或超时均不输出审批决定，让 Agent 保留原生权限处理。
+
+可选真实回合验证复用 [Anthropic 官方 Python SDK](https://github.com/anthropics/claude-agent-sdk-python)，
+不加入 App 运行依赖。需要已登录的本机 Claude CLI 和 `uv`，从仓库根目录运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run --with claude-agent-sdk==0.2.152 --no-project \
+  python scripts/verify-claude-question.py --live
+```
+
+这会创建一次真实模型请求（最多 3 个回合、API 预算上限 $0.50），只启用
+`AskUserQuestion`，关闭用户/项目设置来源、外部 MCP、Chrome、skills 和会话持久化。
+测试 socket 返回大于 4 KiB 的分段多行答案；答案末尾有未放入模型提示词的随机标记，
+只有 Agent 原样返回标记、请求身份一致且出现后续工具完成及 Stop 事件才算通过。
+备用权限回调只会拒绝，不会代替 Bridge 回答。
+
+`--claude` 可选择本机 CLI，`--bridge` 可指定已安装的 Bridge 脚本；报告包含 CLI/SDK
+版本和 Bridge SHA-256。测试仅替换 Bridge 的日志、快照与过期清理写入，并使用临时
+私有 socket，不改用户配置、既有会话或真实 App socket。SDK 通过其标准 Hook 回调
+转交真实 CLI 事件，未验证用户持久 Hook 注册配置。
+
+此项是 **真实 CLI/SDK + 生产 Bridge + 测试界面** 的协议验收，不是实际刘海按钮、
+会话恢复或普通 PermissionRequest 的端到端验收；这些仍需按发布清单分别完成。
+
 ## 能用 / 局限(MVP)
 
 | 功能 | 状态 |
