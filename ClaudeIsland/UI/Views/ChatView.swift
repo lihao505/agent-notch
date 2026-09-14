@@ -851,12 +851,14 @@ struct ChatView: View {
         if let permission = session.activePermission {
             StructuredInteractivePromptBar(
                 context: permission,
+                draft: InteractiveQuestionDraftStore.shared.draft(sessionId: sessionId, context: permission),
                 isInTmux: session.isInTmux,
                 focusErrorMessage: terminalFocusErrorMessage,
                 onSubmitAnswers: { answers in
                     sessionMonitor.answerQuestions(
                         sessionId: sessionId,
                         expectedToolUseId: permission.toolUseId,
+                        expectedQuestions: permission.interactiveQuestions,
                         answers: answers
                     )
                 },

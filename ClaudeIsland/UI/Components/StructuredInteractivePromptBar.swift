@@ -1,5 +1,6 @@
 //
 //  StructuredInteractivePromptBar.swift
+//  Modified by lihao505 for Agent Notch, 2026.
 //  ClaudeIsland
 //
 //  Native question answering and plan review inside the notch.
@@ -9,6 +10,7 @@ import SwiftUI
 
 struct StructuredInteractivePromptBar: View {
     let context: PermissionContext
+    @ObservedObject var draft: InteractiveQuestionDraft
     let isInTmux: Bool
     let focusErrorMessage: String?
     let onSubmitAnswers: ([String: String]) -> Void
@@ -16,12 +18,10 @@ struct StructuredInteractivePromptBar: View {
     let onDeny: () -> Void
     let onGoToTerminal: () -> Void
 
-    @State private var selectedAnswers: [String: Set<String>] = [:]
-    @State private var customAnswers: [String: String] = [:]
-    @State private var currentQuestionIndex = 0
+    private var currentQuestionIndex: Int { draft.currentQuestionIndex }
 
     private var questions: [InteractiveQuestion] {
-        context.interactiveQuestions
+        draft.questions
     }
 
     var body: some View {
@@ -46,6 +46,7 @@ struct StructuredInteractivePromptBar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Color.black.opacity(0.28))
+        .id(context.toolName == "AskUserQuestion" ? ObjectIdentifier(draft) : nil)
     }
 
     private var questionContent: some View {
@@ -58,7 +59,7 @@ struct StructuredInteractivePromptBar: View {
                     subtitle: "\(currentQuestionIndex + 1) / \(questions.count)"
                 )
                 Spacer()
-                Text(question.multiSelect ? "可多选" : "单选")
+                Text(question.options.isEmpty ? "自定义" : (question.multiSelect ? "可多选" : "单选"))
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.white.opacity(0.4))
             }
@@ -75,8 +76,12 @@ struct StructuredInteractivePromptBar: View {
 
                 TextField(
                     "其他答案…",
-                    text: customAnswerBinding(for: question.question)
+                    text: customAnswerBinding,
+                    axis: .vertical
                 )
+                .lineLimit(1...4)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel("自定义答案")
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .foregroundColor(.white)
@@ -89,7 +94,7 @@ struct StructuredInteractivePromptBar: View {
             HStack(spacing: 8) {
                 if currentQuestionIndex > 0 {
                     actionButton("上一步", systemImage: "chevron.left", primary: false) {
-                        currentQuestionIndex -= 1
+                        draft.move(by: -1)
                     }
                 }
                 Spacer()
@@ -101,13 +106,13 @@ struct StructuredInteractivePromptBar: View {
                     primary: true
                 ) {
                     if currentQuestionIndex == questions.count - 1 {
-                        onSubmitAnswers(compiledAnswers())
+                        if let answers = draft.compiledAnswers { onSubmitAnswers(answers) }
                     } else {
-                        currentQuestionIndex += 1
+                        draft.move(by: 1)
                     }
                 }
-                .disabled(answer(for: question).isEmpty)
-                .opacity(answer(for: question).isEmpty ? 0.4 : 1)
+                .disabled(!canContinue)
+                .opacity(canContinue ? 1 : 0.4)
             }
         }
     }
@@ -170,22 +175,11 @@ struct StructuredInteractivePromptBar: View {
         _ option: InteractiveQuestion.Option,
         for question: InteractiveQuestion
     ) -> some View {
-        let isSelected = selectedAnswers[question.question, default: []]
+        let isSelected = draft.selectedAnswers[currentQuestionIndex, default: []]
             .contains(option.label)
 
         return Button {
-            var selected = selectedAnswers[question.question, default: []]
-            if question.multiSelect {
-                if isSelected {
-                    selected.remove(option.label)
-                } else {
-                    selected.insert(option.label)
-                }
-            } else {
-                selected = [option.label]
-            }
-            selectedAnswers[question.question] = selected
-            customAnswers[question.question] = ""
+            draft.toggleOption(option.label, at: currentQuestionIndex)
         } label: {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: isSelected
@@ -216,34 +210,17 @@ struct StructuredInteractivePromptBar: View {
         .buttonStyle(.plain)
     }
 
-    private func customAnswerBinding(for question: String) -> Binding<String> {
-        Binding(
-            get: { customAnswers[question, default: ""] },
-            set: { value in
-                customAnswers[question] = value
-                if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    selectedAnswers[question] = []
-                }
-            }
+    private var customAnswerBinding: Binding<String> {
+        let index = currentQuestionIndex
+        return Binding(
+            get: { draft.customAnswers[index, default: ""] },
+            set: { draft.setCustomAnswer($0, at: index) }
         )
     }
 
-    private func answer(for question: InteractiveQuestion) -> String {
-        let custom = customAnswers[question.question, default: ""]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !custom.isEmpty {
-            return custom
-        }
-        return selectedAnswers[question.question, default: []]
-            .sorted()
-            .joined(separator: ", ")
-    }
-
-    private func compiledAnswers() -> [String: String] {
-        Dictionary(uniqueKeysWithValues: questions.compactMap { question in
-            let value = answer(for: question)
-            return value.isEmpty ? nil : (question.question, value)
-        })
+    private var canContinue: Bool {
+        if currentQuestionIndex == questions.count - 1 { return draft.compiledAnswers != nil }
+        return !draft.answer(at: currentQuestionIndex).isEmpty
     }
 
     private func actionButton(

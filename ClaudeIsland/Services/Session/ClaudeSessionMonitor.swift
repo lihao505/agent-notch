@@ -206,6 +206,7 @@ class ClaudeSessionMonitor: ObservableObject {
     func answerQuestions(
         sessionId: String,
         expectedToolUseId: String,
+        expectedQuestions: [InteractiveQuestion],
         answers: [String: String]
     ) {
         let resolvedAt = Date()
@@ -213,7 +214,11 @@ class ClaudeSessionMonitor: ObservableObject {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
                   permission.toolName == "AskUserQuestion",
-                  permission.toolUseId == expectedToolUseId else {
+                  permission.toolUseId == expectedToolUseId,
+                  InteractiveQuestionSubmissionPolicy.canSubmit(
+                    answers, expectedQuestions: expectedQuestions,
+                    currentQuestions: permission.interactiveQuestions
+                  ) else {
                 return
             }
 
@@ -293,6 +298,7 @@ class ClaudeSessionMonitor: ObservableObject {
     // MARK: - State Update
 
     private func updateFromSessions(_ sessions: [SessionState]) {
+        InteractiveQuestionDraftStore.shared.reconcile(sessions: sessions)
         let now = Date()
         let active = sessions.filter {
             $0.completedAt == nil &&
