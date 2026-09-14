@@ -9,7 +9,12 @@ nonisolated struct NotchImportedSound: Codable, Equatable, Sendable {
 
     nonisolated var filename: String { "\(id.uuidString).\(fileExtension)" }
     nonisolated var rawValue: String {
-        get throws { "custom:" + String(decoding: try JSONEncoder().encode(self), as: UTF8.self) }
+        get throws {
+            let encoder = JSONEncoder()
+            // Preferences and picker tags use the encoded value as identity.
+            encoder.outputFormatting = [.sortedKeys]
+            return "custom:" + String(decoding: try encoder.encode(self), as: UTF8.self)
+        }
     }
 
     nonisolated static func decode(_ raw: String) -> Self? {

@@ -55,7 +55,8 @@ final class NotchCustomSoundTests: XCTestCase {
         try wave(at: source)
         let directory = root.appendingPathComponent("sounds")
         let record = try NotchCustomSoundStore.importSound(from: source, into: directory)
-        defaults.set(try record.rawValue, forKey: NotchSoundEvent.completion.key)
+        let storedValue = try record.rawValue
+        defaults.set(storedValue, forKey: NotchSoundEvent.completion.key)
         let restored = try XCTUnwrap(UserDefaults(suiteName: suite))
         XCTAssertEqual(NotchSoundSettings.source(for: .completion, defaults: restored, directory: directory), .file(record))
         XCTAssertEqual(NotchSoundSettings.source(for: .followUp, defaults: restored, directory: directory), .file(record))
@@ -66,7 +67,19 @@ final class NotchCustomSoundTests: XCTestCase {
         try FileManager.default.removeItem(at: NotchCustomSoundStore.fileURL(for: record, in: directory))
         XCTAssertNil(NotchSoundSettings.source(for: .completion, defaults: defaults, directory: directory))
         XCTAssertNil(NotchSoundSettings.source(for: .followUp, defaults: defaults, directory: directory))
-        XCTAssertEqual(defaults.string(forKey: NotchSoundEvent.completion.key), try record.rawValue)
+        XCTAssertEqual(defaults.string(forKey: NotchSoundEvent.completion.key), storedValue)
+    }
+
+    func testEncodingIsStableAndLegacyFieldOrdersStillDecode() async throws {
+        let id = try XCTUnwrap(UUID(uuidString: "FBDA9594-191E-4583-AC91-94D1863C19F9"))
+        let record = NotchImportedSound(id: id, displayName: "tone.wav", fileExtension: "wav")
+        let canonical = "custom:{\"displayName\":\"tone.wav\",\"fileExtension\":\"wav\",\"id\":\"\(id.uuidString)\"}"
+        for _ in 0..<50 {
+            XCTAssertEqual(try record.rawValue, canonical)
+        }
+        let legacy = "custom:{\"id\":\"\(id.uuidString)\",\"fileExtension\":\"wav\",\"displayName\":\"tone.wav\"}"
+        XCTAssertEqual(NotchImportedSound.decode(legacy), record)
+        XCTAssertEqual(NotchImportedSound.decode(canonical), record)
     }
 
     func testCorruptAndOverlongAudioLeaveNoCopy() async throws {
