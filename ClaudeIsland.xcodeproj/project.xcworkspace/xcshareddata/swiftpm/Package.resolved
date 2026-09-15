@@ -1,6 +1,15 @@
 {
-  "originHash" : "b08ed00e29c46b57a444efbd07d5a74605e29a435f773d84f2829673136c4bf3",
+  "originHash" : "7e5503916fcb6e7abb39413218752faaec7f3ba1c626e14dc4ca4a3555cd94d4",
   "pins" : [
+    {
+      "identity" : "keyboardshortcuts",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sindresorhus/KeyboardShortcuts",
+      "state" : {
+        "revision" : "1aef85578fdd4f9eaeeb8d53b7b4fc31bf08fe27",
+        "version" : "2.4.0"
+      }
+    },
     {
       "identity" : "sparkle",
       "kind" : "remoteSourceControl",

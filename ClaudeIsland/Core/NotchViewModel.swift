@@ -18,10 +18,13 @@ enum NotchStatus: Equatable {
 
 enum NotchOpenReason: Equatable {
     case click
+    case keyboard
     case hover
     case notification
     case boot
     case unknown
+
+    var isUserInitiated: Bool { self == .click || self == .keyboard }
 }
 
 enum NotchContentType: Equatable {
@@ -48,6 +51,7 @@ class NotchViewModel: ObservableObject {
     @Published var isHovering: Bool = false
     @Published private(set) var visibleSessionCount: Int = 0
     @Published private var compactApprovalSessionId: String?
+    private(set) var presentationGeneration = 0
 
     // MARK: - Dependencies
 
@@ -380,6 +384,7 @@ class NotchViewModel: ObservableObject {
     func notchOpen(reason: NotchOpenReason = .unknown) {
         hoverTimer?.cancel()
         hoverTimer = nil
+        presentationGeneration += 1
         openReason = reason
         status = .opened
 
@@ -402,6 +407,7 @@ class NotchViewModel: ObservableObject {
     func notchClose() {
         hoverTimer?.cancel()
         hoverTimer = nil
+        presentationGeneration += 1
         // Save chat session before closing if in chat mode
         if case .chat(let session) = contentType {
             currentChatSession = session
@@ -409,6 +415,26 @@ class NotchViewModel: ObservableObject {
         status = .closed
         contentType = .instances
         compactApprovalSessionId = nil
+    }
+
+    /// Explicit keyboard actions bypass dwell timers and shell animation.
+    /// Reuse normal close/open so chat restoration and draft ownership remain
+    /// identical to pointer navigation, without issuing any Agent decision.
+    func toggleFromKeyboard() {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            if status == .opened {
+                notchClose()
+                openReason = .keyboard
+            } else {
+                notchOpen(reason: .keyboard)
+            }
+        }
+    }
+
+    func canDeliverDeferredFocus(generation: Int) -> Bool {
+        status == .opened && presentationGeneration == generation
     }
 
     /// Transfers an automatically opened panel to direct user ownership.
@@ -456,10 +482,11 @@ class NotchViewModel: ObservableObject {
     func showApproval(for session: SessionState) {
         hoverTimer?.cancel()
         hoverTimer = nil
+        presentationGeneration += 1
         // Do not downgrade a panel already owned by direct user interaction.
         // The actionable conversation may change, but its close policy should
         // not suddenly become automatic while the user is inside it.
-        if status != .opened || openReason != .click {
+        if status != .opened || !openReason.isUserInitiated {
             openReason = .notification
         }
         currentChatSession = nil
@@ -478,6 +505,7 @@ class NotchViewModel: ObservableObject {
 
     /// Perform boot animation: expand briefly then collapse
     func performBootAnimation() {
+        guard status == .closed, openReason == .unknown else { return }
         notchOpen(reason: .boot)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self = self, self.openReason == .boot else { return }

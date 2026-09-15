@@ -7,9 +7,14 @@ Agent Notch 的直接 Swift Package 依赖固定在
 
 | 组件 | 固定版本 / revision | 许可证 | 随附原文 | 项目 |
 | --- | --- | --- | --- | --- |
+| KeyboardShortcuts | 2.4.0 / `1aef85578fdd4f9eaeeb8d53b7b4fc31bf08fe27` | MIT | [`ThirdPartyLicenses/KeyboardShortcuts-2.4.0-license.txt`](ThirdPartyLicenses/KeyboardShortcuts-2.4.0-license.txt) | <https://github.com/sindresorhus/KeyboardShortcuts> |
 | Sparkle | 2.9.4 / `b6496a74a087257ef5e6da1c5b29a447a60f5bd7` | MIT 与上游汇总的第三方许可 | [`ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt`](ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt) | <https://github.com/sparkle-project/Sparkle> |
 | swift-markdown | 0.8.0 / `3c6f9523da3a1ec2fd829673e472d95b8097a3b8` | Apache License 2.0（含 Runtime Library Exception） | [`ThirdPartyLicenses/swift-markdown-0.8.0-LICENSE.txt`](ThirdPartyLicenses/swift-markdown-0.8.0-LICENSE.txt) | <https://github.com/swiftlang/swift-markdown> |
 | swift-cmark | 0.8.0 / `924936d0427cb25a61169739a7660230bffa6ea6` | BSD-2-Clause；上游 `COPYING` 另汇总其打包内容的 MIT、CC-BY-SA-4.0 与 BSD-2-Clause 声明 | [`ThirdPartyLicenses/swift-cmark-0.8.0-COPYING.txt`](ThirdPartyLicenses/swift-cmark-0.8.0-COPYING.txt) | <https://github.com/swiftlang/swift-cmark> |
 
 二进制发布必须保留这些完整许可证文本。发布检查会确认依赖版本、revision、许可证
 文件哈希和 Xcode Resources 引用没有漂移。本文件不替代各依赖自己的 LICENSE/COPYING。
+
+KeyboardShortcuts 固定为兼容 Xcode 16.4 / Swift 6.1 的 2.4.0，复用其原生录制控件、
+快捷键持久化、系统／菜单冲突检测和事件监听，不引入其他传递依赖。3.x 需要更高版本
+Swift，升级须同步核对 CI 工具链与录制行为。

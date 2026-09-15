@@ -16,6 +16,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsPresentationTask: Task<Void, Never>?
     private weak var trackedSettingsWindow: NSWindow?
     private var terminationRequested = false
+    private var shortcutController: NotchShortcutController?
 
     private static var isRunningUnitTests: Bool {
         Foundation.ProcessInfo.processInfo.environment[
@@ -76,6 +77,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         windowManager = WindowManager()
         _ = windowManager?.setupNotchWindow()
 
+        shortcutController = NotchShortcutController(
+            canToggle: { [weak self] in
+                guard let self else { return false }
+                return !self.terminationRequested &&
+                    self.onboardingWindowController?.window?.isVisible != true &&
+                    NSApp.modalWindow == nil &&
+                    !NotchQuietSceneMonitor.shared.state.shouldSuppressAttention
+            },
+            toggle: { [weak self] in
+                // Resolve the current controller after any display changes.
+                self?.windowController?.viewModel.toggleFromKeyboard()
+            }
+        )
+        shortcutController?.start()
+
         screenObserver = ScreenObserver { [weak self] in
             self?.handleScreenChange()
         }
@@ -90,6 +106,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        shortcutController?.stop()
         // A clean shutdown must make the app immediately indistinguishable
         // from an offline bridge. Leaving the Unix socket behind made a real
         // quit look ineffective and forced the next launch to recover stale
@@ -110,6 +127,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func quitCompletely() {
         guard !terminationRequested else { return }
         terminationRequested = true
+        shortcutController?.stop()
 
         settingsPresentationTask?.cancel()
         settingsPresentationTask = nil

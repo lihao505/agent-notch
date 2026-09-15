@@ -17,6 +17,7 @@ required_files=(
     ThirdPartyLicenses/Sparkle-2.9.4-LICENSE.txt
     ThirdPartyLicenses/swift-markdown-0.8.0-LICENSE.txt
     ThirdPartyLicenses/swift-cmark-0.8.0-COPYING.txt
+    ThirdPartyLicenses/KeyboardShortcuts-2.4.0-license.txt
     AgentBridge/README.md AgentBridge/install.sh AgentBridge/uninstall.sh
     AgentBridge/bin/notch-bridge.py AgentBridge/bin/codex-relay.py
     AgentBridge/tests/test_socket_responses.py scripts/verify-claude-question.py
@@ -36,6 +37,8 @@ required_files=(
     ClaudeIslandTests/NotchQuietHoursPolicyTests.swift
     ClaudeIslandTests/NotchQuietSceneTests.swift
     ClaudeIslandTests/NotchSilenceRuleTests.swift
+    ClaudeIsland/Services/Shared/NotchShortcutController.swift
+    ClaudeIslandTests/NotchShortcutTests.swift
 )
 for file in "${required_files[@]}"; do
     [ -s "$file" ] || fail "required release file is missing or empty: $file"
@@ -114,6 +117,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     resolved = json.load(handle)
 
 expected = {
+    "keyboardshortcuts": ("2.4.0", "1aef85578fdd4f9eaeeb8d53b7b4fc31bf08fe27"),
     "sparkle": ("2.9.4", "b6496a74a087257ef5e6da1c5b29a447a60f5bd7"),
     "swift-markdown": ("0.8.0", "3c6f9523da3a1ec2fd829673e472d95b8097a3b8"),
     "swift-cmark": ("0.8.0", "924936d0427cb25a61169739a7660230bffa6ea6"),
@@ -143,6 +147,8 @@ check_sha256 167beb36f181bd163c93c6feb45c68e5f9462fe1af55b278f7bfd1df20e673a3 \
     ThirdPartyLicenses/swift-markdown-0.8.0-LICENSE.txt
 check_sha256 c22e885f33b821bddb24cf007145e5540655b6c0f403e49e6c76a93c28e6d9a9 \
     ThirdPartyLicenses/swift-cmark-0.8.0-COPYING.txt
+check_sha256 5c932d88256b4ab958f64a856fa48e8bd1f55bc1d96b8149c65689e0c61789d3 \
+    ThirdPartyLicenses/KeyboardShortcuts-2.4.0-license.txt
 
 grep -Fq 'BSD-2-Clause' THIRD_PARTY_NOTICES.md ||
     fail "swift-cmark must be identified as BSD-2-Clause"

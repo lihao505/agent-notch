@@ -865,7 +865,7 @@ struct NotchView: View {
             isVisible = true
             // A deliberate click acknowledges completion. Merely hovering must
             // not consume the compact reminder and make the notch disappear.
-            if viewModel.openReason == .click {
+            if viewModel.openReason.isUserInitiated {
                 acknowledgeCurrentCompletions()
                 completionVisibilityStartedAt.removeAll()
             }
@@ -1090,7 +1090,7 @@ struct NotchView: View {
 
         // Work that completes while a click-owned panel is already open is
         // already visible to the user and must not produce a delayed ping.
-        if viewModel.status == .opened && viewModel.openReason == .click {
+        if viewModel.status == .opened && viewModel.openReason.isUserInitiated {
             acknowledgeCurrentCompletions()
         }
     }

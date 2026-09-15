@@ -77,6 +77,7 @@ class NotchWindowController: NSWindowController {
         viewModel.$status
             .receive(on: DispatchQueue.main)
             .sink { [weak notchWindow, weak viewModel] status in
+                guard let viewModel, viewModel.status == status else { return }
                 switch status {
                 case .opened:
                     // Accept mouse events when opened so buttons work
@@ -86,14 +87,19 @@ class NotchWindowController: NSWindowController {
                     // activating the app behind it. Promoting it here makes
                     // the chat TextField usable immediately after opening,
                     // including when the panel was opened by a notification.
-                    if viewModel?.openReason != .notification {
+                    if viewModel.openReason != .notification &&
+                       viewModel.openReason != .keyboard {
                         NSApp.activate(ignoringOtherApps: false)
                     }
                     notchWindow?.orderFrontRegardless()
                     notchWindow?.makeKey()
 
-                    let postInteractive = {
-                        guard notchWindow?.isVisible == true else { return }
+                    let generation = viewModel.presentationGeneration
+                    let postInteractive = { [weak viewModel] in
+                        guard notchWindow?.isVisible == true,
+                              viewModel?.canDeliverDeferredFocus(
+                                generation: generation
+                              ) == true else { return }
                         notchWindow?.makeKey()
                         NotificationCenter.default.post(
                             name: .notchPanelDidBecomeInteractive,
@@ -109,6 +115,7 @@ class NotchWindowController: NSWindowController {
                     // Ignore mouse events when closed so clicks pass through
                     notchWindow?.shouldAcceptMouseEvents = false
                     notchWindow?.ignoresMouseEvents = true
+                    notchWindow?.resignKey()
                 }
             }
             .store(in: &cancellables)
