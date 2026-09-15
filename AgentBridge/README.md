@@ -81,11 +81,34 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with claude-agent-sdk==0.2.152 --no-project \
 
 `--claude` 可选择本机 CLI，`--bridge` 可指定已安装的 Bridge 脚本；报告包含 CLI/SDK
 版本和 Bridge SHA-256。测试仅替换 Bridge 的日志、快照与过期清理写入，并使用临时
-私有 socket，不改用户配置、既有会话或真实 App socket。SDK 通过其标准 Hook 回调
+私有 socket。默认模式不连接真实 App；SDK 通过其标准 Hook 回调
 转交真实 CLI 事件，未验证用户持久 Hook 注册配置。
 
-此项是 **真实 CLI/SDK + 生产 Bridge + 测试界面** 的协议验收，不是实际刘海按钮、
-会话恢复或普通 PermissionRequest 的端到端验收；这些仍需按发布清单分别完成。
+默认模式是 **真实 CLI/SDK + 生产 Bridge + 测试界面** 的协议验收，不是实际刘海
+按钮验收。要验证已经运行的 App，在上述命令末尾添加 `--app`：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run --with claude-agent-sdk==0.2.152 --no-project \
+  python scripts/verify-claude-question.py --live --app
+```
+
+1. 手动启动 Agent Notch；脚本不会替你启动 App 或改设置。
+2. 找到脚本输出的 `fixture_project` 对应的测试提问。只操作这条测试任务。
+3. 在“自定义答案”中填写多行文字，最后一行原样填写输出的 `answer_marker`。
+4. 可先返回任务列表，再重新打开同一提问，检查草稿保留，然后点击实际“提交”。
+5. 在正常的 90 秒等待时限内完成操作，查看报告的 `passed`、`answer_consumed`、
+   `identity_preserved` 和 `response_bytes`。未操作、超时或备用回调被触发都不算通过。
+
+`--app` 使用临时 CLI command hooks，经私有转发 socket 把生产 Bridge 事件送到真实
+App；它不会合成答案，只转交 App 返回的决定。会话 UUID 由脚本生成，入站事件必须
+同时匹配该 UUID、测试目录、Claude 来源和允许的事件/工具；清理仅针对这个 UUID。
+完整事件序列必须是 `UserPromptSubmit → PreToolUse → PostToolUse → Stop`，且工具
+请求 ID 一致。成功或失败后都会尝试移除自己的测试会话；不会改写用户 Hook 配置，
+也不会删除既有任务。测试关闭 Bridge 持久化，但运行中的 App 会正常接收并处理
+测试状态。界面操作需人工或原生 UI 自动化完成，不属于脚本自身的自动化能力。
+
+会话恢复、持久 Hook 注册、普通 PermissionRequest、完整多题/多选和计划确认仍需
+按发布清单分别验收；单题自定义回答通过不能替代这些项目。
 
 ## 能用 / 局限(MVP)
 

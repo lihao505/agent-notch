@@ -20,6 +20,7 @@ required_files=(
     AgentBridge/README.md AgentBridge/install.sh AgentBridge/uninstall.sh
     AgentBridge/bin/notch-bridge.py AgentBridge/bin/codex-relay.py
     AgentBridge/tests/test_socket_responses.py scripts/verify-claude-question.py
+    scripts/tests/test_live_question_verifier.py
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
@@ -209,5 +210,6 @@ bash -n scripts/build.sh scripts/create-release.sh scripts/generate-keys.sh \
 python3 -B -m unittest discover -s AgentBridge/tests -v
 # Parse the opt-in live fixture without loading an SDK or making model calls.
 python3 -B scripts/verify-claude-question.py --help >/dev/null
+python3 -B -m unittest discover -s scripts/tests -v
 
 echo "Release metadata and scripts verified."
