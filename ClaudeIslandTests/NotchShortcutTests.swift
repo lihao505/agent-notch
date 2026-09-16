@@ -10,6 +10,7 @@ final class NotchShortcutTests: XCTestCase {
     private final class LiveState {
         var allowed = false
         var current: NotchViewModel?
+        var conflicts: Set<NotchShortcutAction> = []
     }
 
     private func makeViewModel() -> NotchViewModel {
@@ -25,7 +26,9 @@ final class NotchShortcutTests: XCTestCase {
     }
 
     func testShortcutHasNoDefaultCombination() async {
-        XCTAssertNil(KeyboardShortcuts.Name.toggleNotch.defaultShortcut)
+        for action in NotchShortcutAction.allCases {
+            XCTAssertNil(action.name.defaultShortcut)
+        }
     }
 
     func testOneListenerAndOneToggleOnRelease() async throws {
@@ -33,8 +36,8 @@ final class NotchShortcutTests: XCTestCase {
         var subscriptions = 0
         var toggles = 0
         let controller = NotchShortcutController(
-            events: { subscriptions += 1; return stream },
-            canToggle: { true }, toggle: { toggles += 1 }
+            actions: [.toggle], events: { _ in subscriptions += 1; return stream },
+            canPerform: { _ in true }, perform: { _ in toggles += 1 }
         )
         defer { controller.stop(); continuation.finish() }
         controller.start()
@@ -54,7 +57,7 @@ final class NotchShortcutTests: XCTestCase {
         let state = LiveState()
         var toggles = 0
         let controller = NotchShortcutController(
-            events: { stream }, canToggle: { state.allowed }, toggle: { toggles += 1 }
+            actions: [.toggle], events: { _ in stream }, canPerform: { _ in state.allowed }, perform: { _ in toggles += 1 }
         )
         defer { controller.stop(); continuation.finish() }
         controller.start()
@@ -74,10 +77,10 @@ final class NotchShortcutTests: XCTestCase {
         var subscriptions = 0
         var toggles = 0
         let controller = NotchShortcutController(
-            events: {
+            actions: [.toggle], events: { _ in
                 subscriptions += 1
                 return subscriptions == 1 ? first.stream : second.stream
-            }, canToggle: { true }, toggle: { toggles += 1 }
+            }, canPerform: { _ in true }, perform: { _ in toggles += 1 }
         )
         defer { controller.stop(); first.continuation.finish(); second.continuation.finish() }
         controller.start()
@@ -100,7 +103,7 @@ final class NotchShortcutTests: XCTestCase {
         state.current = first
         let (stream, continuation) = AsyncStream<KeyboardShortcuts.EventType>.makeStream()
         let controller = NotchShortcutController(
-            events: { stream }, canToggle: { true }, toggle: { state.current?.toggleFromKeyboard() }
+            actions: [.toggle], events: { _ in stream }, canPerform: { _ in true }, perform: { _ in state.current?.toggleFromKeyboard() }
         )
         defer { controller.stop(); continuation.finish() }
         controller.start()
@@ -171,5 +174,46 @@ final class NotchShortcutTests: XCTestCase {
         model.toggleFromKeyboard()
         model.performBootAnimation()
         XCTAssertEqual(model.status, .closed)
+    }
+
+    func testConflictDetectionOnlyPausesSharedCombinations() async {
+        let shared = KeyboardShortcuts.Shortcut(.a, modifiers: [.command, .control])
+        let different = KeyboardShortcuts.Shortcut(.b, modifiers: [.command, .control])
+        XCTAssertTrue(NotchShortcutConflictPolicy.conflictingActions(in: [:]).isEmpty)
+        XCTAssertTrue(NotchShortcutConflictPolicy.conflictingActions(in: [.toggle: shared]).isEmpty)
+        XCTAssertEqual(NotchShortcutConflictPolicy.conflictingActions(in: [
+            .toggle: shared, .nextSession: shared, .previousSession: different
+        ]), [.toggle, .nextSession])
+        XCTAssertTrue(NotchShortcutConflictPolicy.conflictingActions(in: [
+            .toggle: shared, .previousSession: different
+        ]).isEmpty)
+    }
+
+    func testAllActionsDispatchIndependentlyAndStopTogether() async throws {
+        var continuations: [NotchShortcutAction: AsyncStream<KeyboardShortcuts.EventType>.Continuation] = [:]
+        var performed: [NotchShortcutAction] = []
+        let state = LiveState()
+        state.conflicts = [.toggle, .nextSession]
+        let controller = NotchShortcutController(events: { action in
+            let (stream, continuation) = AsyncStream<KeyboardShortcuts.EventType>.makeStream()
+            continuations[action] = continuation
+            return stream
+        }, canPerform: { !state.conflicts.contains($0) }, perform: { performed.append($0) })
+        defer { controller.stop(); continuations.values.forEach { $0.finish() } }
+        controller.start()
+        controller.start()
+        XCTAssertEqual(continuations.count, 3)
+        for continuation in continuations.values { continuation.yield(.keyUp) }
+        try await drainEvents()
+        XCTAssertEqual(performed, [.previousSession])
+        state.conflicts = []
+        continuations[.nextSession]?.yield(.keyDown)
+        continuations[.nextSession]?.yield(.keyUp)
+        try await drainEvents()
+        XCTAssertEqual(performed, [.previousSession, .nextSession])
+        controller.stop()
+        for continuation in continuations.values { continuation.yield(.keyUp) }
+        try await drainEvents()
+        XCTAssertEqual(performed, [.previousSession, .nextSession])
     }
 }

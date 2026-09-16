@@ -39,6 +39,9 @@ required_files=(
     ClaudeIslandTests/NotchSilenceRuleTests.swift
     ClaudeIsland/Services/Shared/NotchShortcutController.swift
     ClaudeIslandTests/NotchShortcutTests.swift
+    ClaudeIsland/Models/SessionNavigationPolicy.swift
+    ClaudeIsland/UI/Components/NotchShortcutSettingsEditor.swift
+    ClaudeIslandTests/SessionNavigationTests.swift
 )
 for file in "${required_files[@]}"; do
     [ -s "$file" ] || fail "required release file is missing or empty: $file"

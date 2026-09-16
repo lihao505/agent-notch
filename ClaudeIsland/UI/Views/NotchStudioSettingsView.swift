@@ -1,5 +1,4 @@
 import AppKit
-import KeyboardShortcuts
 import ServiceManagement
 import SwiftUI
 
@@ -630,21 +629,12 @@ struct NotchStudioSettingsView: View {
             settingsTitle(
                 t("Global shortcut", "全局快捷键"),
                 caption: t(
-                    "Open or close the notch from another app. Unassigned by default.",
-                    "在其他应用中展开或收起刘海，默认不占用任何组合键。"
+                    "Open the notch and move between conversations without reaching for the mouse.",
+                    "不用鼠标，也能展开刘海和切换会话。"
                 )
             )
             settingsCard {
-                KeyboardShortcuts.Recorder(
-                    t("Toggle notch", "展开 / 收起刘海"), name: .toggleNotch
-                )
-                .accessibilityIdentifier("notch.toggleShortcutRecorder")
-                Text(t(
-                    "Click to record. Escape cancels; the clear button removes the shortcut. System and menu conflicts are checked. Approval shortcuts remain local to the notch.",
-                    "点击录制；Escape 取消，清除按钮移除快捷键。会检查系统和菜单快捷键冲突。审批快捷键仍仅在刘海内生效。"
-                ))
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                NotchShortcutSettingsEditor(language: preferences.language)
             }
 
             settingsTitle(

@@ -78,16 +78,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         _ = windowManager?.setupNotchWindow()
 
         shortcutController = NotchShortcutController(
-            canToggle: { [weak self] in
+            canPerform: { [weak self] action in
                 guard let self else { return false }
                 return !self.terminationRequested &&
                     self.onboardingWindowController?.window?.isVisible != true &&
                     NSApp.modalWindow == nil &&
-                    !NotchQuietSceneMonitor.shared.state.shouldSuppressAttention
+                    !NotchQuietSceneMonitor.shared.state.shouldSuppressAttention &&
+                    !NotchShortcutConflictPolicy.currentConflicts().contains(action)
             },
-            toggle: { [weak self] in
+            perform: { [weak self] action in
                 // Resolve the current controller after any display changes.
-                self?.windowController?.viewModel.toggleFromKeyboard()
+                guard let viewModel = self?.windowController?.viewModel else { return }
+                switch action {
+                case .toggle: viewModel.toggleFromKeyboard()
+                case .previousSession: viewModel.navigateSessionFromKeyboard(.previous)
+                case .nextSession: viewModel.navigateSessionFromKeyboard(.next)
+                }
             }
         )
         shortcutController?.start()

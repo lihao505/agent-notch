@@ -338,6 +338,9 @@ struct NotchView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .preferredColorScheme(.dark)
         .onAppear {
+            viewModel.navigationSessions = { [weak sessionMonitor] in
+                sessionMonitor?.instances ?? []
+            }
             quietHoursMonitor.configure(quietHoursSchedule)
             sessionMonitor.startMonitoring()
             viewModel.updateVisibleSessionCount(sessionMonitor.instances.count)
@@ -386,6 +389,7 @@ struct NotchView: View {
             deliverFollowUpReminders(targets)
         }
         .onDisappear {
+            viewModel.navigationSessions = { [] }
             quietHoursMonitor.stop()
             NotchSoundPlayer.shared.revalidateAutomaticPlayback(in: [], sceneSuppressed: true)
             cancelDelayedUIWork()

@@ -121,6 +121,9 @@ class NotchViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let events = EventMonitors.shared
     private var hoverTimer: DispatchWorkItem?
+    /// Read the monitor's latest UI snapshot at key-up, not a duplicated cache
+    /// of sessions captured when a shortcut or window was first registered.
+    var navigationSessions: @MainActor () -> [SessionState] = { [] }
 
     // MARK: - Initialization
 
@@ -435,6 +438,29 @@ class NotchViewModel: ObservableObject {
 
     func canDeliverDeferredFocus(generation: Int) -> Bool {
         status == .opened && presentationGeneration == generation
+    }
+
+    func navigateSessionFromKeyboard(_ direction: SessionNavigationDirection) {
+        let currentID: String?
+        if case .chat(let session) = contentType {
+            currentID = session.sessionId
+        } else {
+            currentID = status == .closed ? currentChatSession?.sessionId : nil
+        }
+        guard let target = SessionNavigationPolicy.target(
+            in: navigationSessions(), currentID: currentID, direction: direction
+        ) else { return }
+
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            // Do not let notchOpen restore the previous conversation over the
+            // newly selected one. Drafts remain owned by their request store.
+            currentChatSession = nil
+            compactApprovalSessionId = nil
+            contentType = .chat(target)
+            notchOpen(reason: .keyboard)
+        }
     }
 
     /// Transfers an automatically opened panel to direct user ownership.

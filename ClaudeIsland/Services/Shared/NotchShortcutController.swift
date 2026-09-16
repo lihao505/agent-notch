@@ -4,6 +4,48 @@ import KeyboardShortcuts
 extension KeyboardShortcuts.Name {
     // Intentionally unbound: never take over an existing global combination.
     static let toggleNotch = Self("agentNotch.toggleNotch")
+    static let previousNotchSession = Self("agentNotch.previousSession")
+    static let nextNotchSession = Self("agentNotch.nextSession")
+}
+
+enum NotchShortcutAction: String, CaseIterable, Identifiable {
+    case toggle, previousSession, nextSession
+    var id: String { rawValue }
+
+    var name: KeyboardShortcuts.Name {
+        switch self {
+        case .toggle: return .toggleNotch
+        case .previousSession: return .previousNotchSession
+        case .nextSession: return .nextNotchSession
+        }
+    }
+
+    func title(_ language: AppLanguage) -> String {
+        switch self {
+        case .toggle: return language.text("Toggle notch", "展开 / 收起刘海")
+        case .previousSession: return language.text("Previous session", "上一个会话")
+        case .nextSession: return language.text("Next session", "下一个会话")
+        }
+    }
+}
+
+enum NotchShortcutConflictPolicy {
+    static func conflictingActions(
+        in bindings: [NotchShortcutAction: KeyboardShortcuts.Shortcut]
+    ) -> Set<NotchShortcutAction> {
+        Set(bindings.keys.filter { action in
+            bindings.contains { $0.key != action && $0.value == bindings[action] }
+        })
+    }
+
+    static func currentConflicts() -> Set<NotchShortcutAction> {
+        let bindings = Dictionary(uniqueKeysWithValues: NotchShortcutAction.allCases.compactMap {
+            action -> (NotchShortcutAction, KeyboardShortcuts.Shortcut)? in
+            guard let shortcut = KeyboardShortcuts.getShortcut(for: action.name) else { return nil }
+            return (action, shortcut)
+        })
+        return conflictingActions(in: bindings)
+    }
 }
 
 /// One app-owned listener, independent of settings and display/window rebuilds.
@@ -11,45 +53,50 @@ extension KeyboardShortcuts.Name {
 /// older registration cannot act on a newly started controller.
 @MainActor
 final class NotchShortcutController {
-    private var task: Task<Void, Never>?
+    private var tasks: [NotchShortcutAction: Task<Void, Never>] = [:]
     private var generation = 0
-    private let events: @MainActor () -> AsyncStream<KeyboardShortcuts.EventType>
-    private let canToggle: @MainActor () -> Bool
-    private let toggle: @MainActor () -> Void
+    private let actions: [NotchShortcutAction]
+    private let events: @MainActor (NotchShortcutAction) -> AsyncStream<KeyboardShortcuts.EventType>
+    private let canPerform: @MainActor (NotchShortcutAction) -> Bool
+    private let perform: @MainActor (NotchShortcutAction) -> Void
 
     init(
-        events: @escaping @MainActor () -> AsyncStream<KeyboardShortcuts.EventType> = {
-            KeyboardShortcuts.events(for: .toggleNotch)
+        actions: [NotchShortcutAction] = NotchShortcutAction.allCases,
+        events: @escaping @MainActor (NotchShortcutAction) -> AsyncStream<KeyboardShortcuts.EventType> = {
+            KeyboardShortcuts.events(for: $0.name)
         },
-        canToggle: @escaping @MainActor () -> Bool,
-        toggle: @escaping @MainActor () -> Void
+        canPerform: @escaping @MainActor (NotchShortcutAction) -> Bool,
+        perform: @escaping @MainActor (NotchShortcutAction) -> Void
     ) {
+        self.actions = actions
         self.events = events
-        self.canToggle = canToggle
-        self.toggle = toggle
+        self.canPerform = canPerform
+        self.perform = perform
     }
 
     func start() {
-        guard task == nil else { return }
+        guard tasks.isEmpty else { return }
         generation += 1
         let currentGeneration = generation
-        let stream = events()
-        task = Task { @MainActor [weak self] in
-            for await event in stream {
-                guard !Task.isCancelled,
-                      let self, self.generation == currentGeneration else { return }
-                // Key-up toggles once, not repeatedly while a key is held.
-                guard event == .keyUp, self.canToggle() else { continue }
-                self.toggle()
+        for action in actions where tasks[action] == nil {
+            let stream = events(action)
+            tasks[action] = Task { @MainActor [weak self] in
+                for await event in stream {
+                    guard !Task.isCancelled,
+                          let self, self.generation == currentGeneration else { return }
+                    // Key-up acts once, not repeatedly while a key is held.
+                    guard event == .keyUp, self.canPerform(action) else { continue }
+                    self.perform(action)
+                }
             }
         }
     }
 
     func stop() {
         generation += 1
-        task?.cancel()
-        task = nil
+        tasks.values.forEach { $0.cancel() }
+        tasks.removeAll()
     }
 
-    deinit { task?.cancel() }
+    deinit { tasks.values.forEach { $0.cancel() } }
 }

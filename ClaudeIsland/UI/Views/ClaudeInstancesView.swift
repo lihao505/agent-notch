@@ -44,28 +44,7 @@ struct ClaudeInstancesView: View {
     /// Secondary sort: by last user message date (stable - doesn't change when agent responds)
     /// Note: approval requests stay in their date-based position to avoid layout shift
     private var sortedInstances: [SessionState] {
-        sessionMonitor.instances.sorted { a, b in
-            let priorityA = phasePriority(a.phase)
-            let priorityB = phasePriority(b.phase)
-            if priorityA != priorityB {
-                return priorityA < priorityB
-            }
-            // Sort by last user message date (more recent first)
-            // Fall back to lastActivity if no user messages yet
-            let dateA = a.lastUserMessageDate ?? a.lastActivity
-            let dateB = b.lastUserMessageDate ?? b.lastActivity
-            return dateA > dateB
-        }
-    }
-
-    /// Lower number = higher priority
-    /// Approval requests share priority with processing to maintain stable ordering
-    private func phasePriority(_ phase: SessionPhase) -> Int {
-        switch phase {
-        case .waitingForApproval, .processing, .compacting: return 0
-        case .waitingForInput: return 1
-        case .idle, .ended: return 2
-        }
+        SessionNavigationPolicy.ordered(sessionMonitor.instances)
     }
 
     private var instancesList: some View {
