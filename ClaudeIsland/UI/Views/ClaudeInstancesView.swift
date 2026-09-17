@@ -3,7 +3,7 @@
 //  ClaudeInstancesView.swift
 //  ClaudeIsland
 //
-//  Minimal instances list matching Dynamic Island aesthetic
+//  Readable task list with explicit status and request-specific actions.
 //
 
 import AppKit
@@ -12,6 +12,7 @@ import SwiftUI
 struct ClaudeInstancesView: View {
     @ObservedObject var sessionMonitor: ClaudeSessionMonitor
     @ObservedObject var viewModel: NotchViewModel
+    @ObservedObject private var preferences = NotchPreferences.shared
     @State private var focusFailureSessionId: String?
     @State private var focusTask: Task<Void, Never>?
 
@@ -27,13 +28,16 @@ struct ClaudeInstancesView: View {
 
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Text("No sessions")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.white.opacity(0.4))
-
-            Text("Run an agent in terminal")
-                .font(.system(size: 11))
-                .foregroundColor(.white.opacity(0.25))
+            Image(systemName: "text.bubble")
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(.white.opacity(0.65))
+                .accessibilityHidden(true)
+            Text(t("Your tasks appear here", "任务会在这里出现"))
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+            Text(t("Start a conversation in a connected agent.", "在已连接的 Agent 中开始一段会话。"))
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(0.65))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -48,24 +52,45 @@ struct ClaudeInstancesView: View {
     }
 
     private var instancesList: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            LazyVStack(spacing: 2) {
-                ForEach(sortedInstances) { session in
-                    InstanceRow(
-                        session: session,
-                        focusFailed: focusFailureSessionId == session.sessionId,
-                        onFocus: { focusSession(session) },
-                        onChat: { openChat(session) },
-                        onArchive: { archiveSession(session) },
-                        onApprove: { approveSession(session) },
-                        onReject: { rejectSession(session) }
-                    )
-                    .id(session.stableId)
-                }
+        VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Text(t("Tasks", "任务"))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                Text("\(sortedInstances.count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.65))
+                Spacer()
             }
-            .padding(.vertical, 4)
+            .padding(.horizontal, 12)
+            .frame(height: SessionListMetrics.headingHeight)
+            .accessibilityElement(children: .combine)
+
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 0) {
+                    ForEach(sortedInstances) { session in
+                        InstanceRow(
+                            session: session,
+                            language: preferences.language,
+                            focusFailed: focusFailureSessionId == session.sessionId,
+                            onFocus: { focusSession(session) },
+                            onChat: { openChat(session) },
+                            onArchive: { archiveSession(session) },
+                            onApprove: { approveSession(session) },
+                            onReject: { rejectSession(session) }
+                        )
+                        .id(session.stableId)
+                    }
+                }
+                .padding(.vertical, SessionListMetrics.verticalInset)
+            }
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .scrollBounceBehavior(.basedOnSize)
+    }
+
+    private func t(_ english: String, _ chinese: String) -> String {
+        preferences.language.text(english, chinese)
     }
 
     // MARK: - Actions
@@ -137,7 +162,8 @@ struct ClaudeInstancesView: View {
     }
 
     private func approveSession(_ session: SessionState) {
-        guard let toolUseId = session.pendingToolId else { return }
+        guard SessionRowPresentation(session: session).interaction == .toolApproval,
+              let toolUseId = session.pendingToolId else { return }
         sessionMonitor.approvePermission(
             sessionId: session.sessionId,
             expectedToolUseId: toolUseId
@@ -162,6 +188,7 @@ struct ClaudeInstancesView: View {
 
 struct InstanceRow: View {
     let session: SessionState
+    let language: AppLanguage
     let focusFailed: Bool
     let onFocus: () -> Void
     let onChat: () -> Void
@@ -172,377 +199,259 @@ struct InstanceRow: View {
     @State private var isHovered = false
     @State private var isYabaiAvailable = false
 
-    /// Whether we're showing the approval UI
-    private var isWaitingForApproval: Bool {
-        session.phase.isWaitingForApproval
+    private var presentation: SessionRowPresentation {
+        SessionRowPresentation(session: session)
     }
 
-    /// Whether the pending tool requires interactive input (not just approve/deny)
-    private var isInteractiveTool: Bool {
-        guard let toolName = session.pendingToolName else { return false }
-        return toolName == "AskUserQuestion"
+    private var activity: String {
+        focusFailed
+            ? t("Could not locate terminal. Try opening it directly.", "未定位到终端，请尝试手动打开。")
+            : presentation.activity(language: language)
     }
 
-    /// Status text based on session phase (fallback when no other content)
-    private var phaseStatusText: String {
-        switch session.phase {
-        case .processing:
-            return "Processing..."
-        case .compacting:
-            return "Compacting..."
-        case .waitingForInput:
-            return "Ready"
-        case .waitingForApproval:
-            return "Waiting for approval"
-        case .idle:
-            return "Idle"
-        case .ended:
-            return "Ended"
+    private var focusLabel: String {
+        switch session.source {
+        case .codex: t("Open in Codex", "在 Codex 中打开")
+        case .codebuddy: t("Open in WorkBuddy", "在 WorkBuddy 中打开")
+        default: t("Open in terminal", "在终端中打开")
         }
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            // State indicator on left
-            stateIndicator
-                .frame(width: 14)
-
-            // Text content
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(session.displayTitle)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-
-                    AgentBadge(source: session.source)
-
-                    // Token usage indicator
-                    if session.usage.totalTokens > 0 {
-                        Text(session.usage.formattedTotal)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.3))
+        VStack(alignment: .leading, spacing: 8) {
+            // Only the title/activity region navigates externally. The footer
+            // contains separate buttons; no parent gesture can approve a tool.
+            Button(action: onFocus) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text(session.displayTitle)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        statusLabel
+                            .fixedSize()
                     }
+                    Text(activity)
+                        .font(.system(size: 12))
+                        .foregroundStyle(focusFailed ? TerminalColors.amber : .white.opacity(0.65))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-
-                // A failed jump is more actionable than stale activity text.
-                if focusFailed {
-                    Label("Could not confirm terminal focus", systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.red.opacity(0.85))
-                        .lineLimit(1)
-                } else if isWaitingForApproval, let toolName = session.pendingToolName {
-                    // Show tool name in amber + input on same line
-                    HStack(spacing: 4) {
-                        Text(MCPToolFormatter.formatToolName(toolName))
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(TerminalColors.amber.opacity(0.9))
-                        if isInteractiveTool {
-                            Text("Needs your input")
-                                .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.5))
-                                .lineLimit(1)
-                        } else if let input = session.pendingToolInput {
-                            Text(input)
-                                .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.5))
-                                .lineLimit(1)
-                        }
-                    }
-                } else if let role = session.lastMessageRole {
-                    switch role {
-                    case "tool":
-                        // Tool call - show tool name + input
-                        HStack(spacing: 4) {
-                            if let toolName = session.lastToolName {
-                                Text(MCPToolFormatter.formatToolName(toolName))
-                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.5))
-                            }
-                            if let input = session.lastMessage {
-                                Text(input)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.4))
-                                    .lineLimit(1)
-                            }
-                        }
-                    case "user":
-                        // User message - prefix with "You:"
-                        HStack(spacing: 4) {
-                            Text("You:")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.white.opacity(0.5))
-                            if let msg = session.lastMessage {
-                                Text(msg)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.4))
-                                    .lineLimit(1)
-                            }
-                        }
-                    default:
-                        // Assistant message - just show text
-                        if let msg = session.lastMessage {
-                            Text(msg)
-                                .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.4))
-                                .lineLimit(1)
-                        }
-                    }
-                } else if let lastMsg = session.lastMessage {
-                    Text(lastMsg)
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.4))
-                        .lineLimit(1)
-                } else {
-                    // Fallback: show phase-based status when no other content
-                    Text(phaseStatusText)
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.4))
-                        .lineLimit(1)
-                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                // Clicking the title/activity area returns to the external
-                // agent conversation. Action buttons keep their own behavior.
-                onFocus()
+            .buttonStyle(.plain)
+            .help("\(focusLabel) · \(session.displayTitle)")
+            .accessibilityLabel("\(focusLabel)：\(session.displayTitle)")
+            .accessibilityValue("\(presentation.status.title(language: language))，\(activity)")
+
+            HStack(spacing: 8) {
+                metadata
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                actions
+                    .fixedSize(horizontal: true, vertical: false)
             }
-
-            Spacer(minLength: 0)
-
-            // Action icons or approval buttons
-            if isWaitingForApproval && isInteractiveTool {
-                // Interactive tools like AskUserQuestion - show chat + terminal buttons
-                HStack(spacing: 8) {
-                    IconButton(icon: "bubble.left") {
-                        onChat()
-                    }
-
-                    // Go to Terminal button (only if yabai available)
-                    if isYabaiAvailable {
-                        TerminalButton(
-                            isEnabled: session.isInTmux,
-                            onTap: { onFocus() }
-                        )
-                    }
-                }
-                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-            } else if isWaitingForApproval {
-                InlineApprovalButtons(
-                    onChat: onChat,
-                    onApprove: onApprove,
-                    onReject: onReject
-                )
-                .id(session.pendingToolId)
-                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-            } else {
-                HStack(spacing: 8) {
-                    // Chat icon - always show
-                    IconButton(icon: "bubble.left") {
-                        onChat()
-                    }
-
-                    // Focus icon (only for tmux instances with yabai)
-                    if session.isInTmux && isYabaiAvailable {
-                        IconButton(icon: "eye") {
-                            onFocus()
-                        }
-                    }
-
-                    // Archive button - only for idle or completed sessions
-                    if session.phase == .idle || session.phase == .waitingForInput {
-                        IconButton(icon: "archivebox") {
-                            onArchive()
-                        }
-                    }
-                }
-                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-            }
+            .frame(height: 28)
         }
-        .padding(.leading, 8)
-        .padding(.trailing, 14)
-        .padding(.vertical, 10)
-        .contentShape(Rectangle())
-        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isWaitingForApproval)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(isHovered ? session.source.accentColor.opacity(0.10) : Color.clear)
-        )
+        .padding(.horizontal, 12)
+        .frame(height: SessionListMetrics.rowHeight)
+        .background {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.white.opacity(isHovered ? 0.07 : 0))
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(height: 0.5)
+                .padding(.horizontal, 12)
+        }
         .onHover { isHovered = $0 }
+        .accessibilityElement(children: .contain)
         .task {
             isYabaiAvailable = await WindowFinder.shared.isYabaiAvailable()
         }
     }
 
+    private var metadata: some View {
+        HStack(spacing: 5) {
+            Image(systemName: session.source.symbolName)
+                .foregroundStyle(session.source.accentColor)
+                .accessibilityHidden(true)
+            Text(session.source.displayName)
+                .fixedSize()
+            if session.projectName != session.displayTitle {
+                Text("·").accessibilityHidden(true)
+                Text(session.projectName)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(-1)
+            }
+            if session.usage.totalTokens > 0 {
+                Text(session.usage.formattedTotal)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .help(t("Tokens used", "已用 Token"))
+                    .accessibilityLabel("\(t("Tokens used", "已用 Token"))：\(session.usage.formattedTotal)")
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.white.opacity(0.65))
+        .help("\(session.source.displayName) · \(session.cwd)")
+    }
+
     @ViewBuilder
-    private var stateIndicator: some View {
-        if focusFailed {
-            Image(systemName: "exclamationmark")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundColor(.red.opacity(0.85))
-        } else {
-            switch session.phase {
-            case .processing, .compacting:
-                ProcessingSpinner(color: session.source.accentColor)
-            case .waitingForApproval:
-                ProcessingSpinner(color: TerminalColors.amber)
-            case .waitingForInput:
-                Circle()
-                    .fill(TerminalColors.green)
-                    .frame(width: 6, height: 6)
-            case .idle, .ended:
-                Circle()
-                    .fill(Color.white.opacity(0.2))
-                    .frame(width: 6, height: 6)
+    private var actions: some View {
+        switch presentation.interaction {
+        case .question, .plan:
+            HStack(spacing: 6) {
+                Button(action: onChat) {
+                    Label(
+                        presentation.interaction == .question
+                            ? t("Answer", "回答问题") : t("Review plan", "审阅计划"),
+                        systemImage: presentation.interaction == .question
+                            ? "text.bubble" : "doc.text"
+                    )
+                }
+                .buttonStyle(TaskRowButtonStyle(prominent: true))
+                .help(t("Open inside the notch", "在刘海内查看"))
+                if session.isInTmux && isYabaiAvailable {
+                    TaskRowIconButton(icon: "arrow.up.forward", label: focusLabel, action: onFocus)
+                }
+            }
+            .id(session.pendingToolId)
+        case .toolApproval:
+            InlineApprovalButtons(
+                language: language,
+                onChat: onChat,
+                onApprove: onApprove,
+                onReject: onReject
+            )
+            .id(session.pendingToolId)
+        case .none:
+            HStack(spacing: 6) {
+                Button(action: onChat) {
+                    Label(t("Details", "详情"), systemImage: "bubble.left")
+                }
+                .buttonStyle(TaskRowButtonStyle())
+                .help(t("View conversation inside the notch", "在刘海内查看会话"))
+                if session.isInTmux && isYabaiAvailable {
+                    TaskRowIconButton(
+                        icon: "arrow.up.forward",
+                        label: focusLabel,
+                        action: onFocus
+                    )
+                }
+                if presentation.canArchive {
+                    TaskRowIconButton(
+                        icon: "archivebox",
+                        label: t("Archive task", "归档任务"),
+                        action: onArchive
+                    )
+                }
             }
         }
     }
 
+    private var statusLabel: some View {
+        HStack(spacing: 5) {
+            if presentation.status == .working || presentation.status == .compacting {
+                ProcessingSpinner(color: session.source.accentColor)
+                    .frame(width: 12, height: 12)
+            } else {
+                Image(systemName: statusSymbol)
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            Text(presentation.status.title(language: language))
+                .font(.system(size: 11, weight: .medium))
+        }
+        .foregroundStyle(statusColor)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var statusColor: Color {
+        switch presentation.status {
+        case .approval, .question, .plan: TerminalColors.amber
+        case .completed: TerminalColors.green
+        default: .white.opacity(0.7)
+        }
+    }
+
+    private var statusSymbol: String {
+        switch presentation.status {
+        case .approval: "hand.raised"
+        case .question: "questionmark.bubble"
+        case .plan: "doc.text"
+        case .completed: "checkmark.circle"
+        case .ready: "bubble.left"
+        case .ended: "stop.circle"
+        case .idle: "circle.dotted"
+        case .working, .compacting: "circle"
+        }
+    }
+
+    private func t(_ english: String, _ chinese: String) -> String {
+        language.text(english, chinese)
+    }
 }
 
-// MARK: - Inline Approval Buttons
+// MARK: - Task Actions
 
-/// Compact inline approval buttons with staggered animation
-struct InlineApprovalButtons: View {
+/// Requests are immediately actionable, without stagger or scale transitions.
+/// Identity is supplied by the row so a new request cannot inherit old UI state.
+private struct InlineApprovalButtons: View {
+    let language: AppLanguage
     let onChat: () -> Void
     let onApprove: () -> Void
     let onReject: () -> Void
 
-    @State private var showChatButton = false
-    @State private var showDenyButton = false
-    @State private var showAllowButton = false
-
     var body: some View {
         HStack(spacing: 6) {
-            // Chat button
-            IconButton(icon: "bubble.left") {
-                onChat()
-            }
-            .opacity(showChatButton ? 1 : 0)
-            .scaleEffect(showChatButton ? 1 : 0.8)
-
-            Button {
-                onReject()
-            } label: {
-                Text("Deny")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.6))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .opacity(showDenyButton ? 1 : 0)
-            .scaleEffect(showDenyButton ? 1 : 0.8)
-
-            Button {
-                onApprove()
-            } label: {
-                Text("Allow")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.9))
-                    .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .opacity(showAllowButton ? 1 : 0)
-            .scaleEffect(showAllowButton ? 1 : 0.8)
-        }
-        .onAppear {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.0)) {
-                showChatButton = true
-            }
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.05)) {
-                showDenyButton = true
-            }
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.1)) {
-                showAllowButton = true
-            }
+            TaskRowIconButton(
+                icon: "text.magnifyingglass",
+                label: language.text("Review request", "查看请求"),
+                action: onChat
+            )
+            Button(language.text("Deny", "拒绝"), action: onReject)
+                .buttonStyle(TaskRowButtonStyle())
+            Button(language.text("Allow", "允许"), action: onApprove)
+                .buttonStyle(TaskRowButtonStyle(prominent: true))
         }
     }
 }
 
-// MARK: - Icon Button
-
-struct IconButton: View {
+private struct TaskRowIconButton: View {
     let icon: String
+    let label: String
     let action: () -> Void
 
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .frame(width: 12)
+        }
+        .buttonStyle(TaskRowButtonStyle())
+        .help(label)
+        .accessibilityLabel(label)
+    }
+}
+
+private struct TaskRowButtonStyle: ButtonStyle {
+    var prominent = false
     @State private var isHovered = false
 
-    var body: some View {
-        Button {
-            action()
-        } label: {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isHovered ? .white.opacity(0.8) : .white.opacity(0.4))
-                .frame(width: 24, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isHovered ? Color.white.opacity(0.1) : Color.clear)
-                )
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
-    }
-}
-
-// MARK: - Compact Terminal Button (inline in description)
-
-struct CompactTerminalButton: View {
-    let isEnabled: Bool
-    let onTap: () -> Void
-
-    var body: some View {
-        Button {
-            if isEnabled {
-                onTap()
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(prominent ? .black : .white.opacity(0.85))
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+            .background {
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(prominent
+                        ? .white.opacity(configuration.isPressed ? 0.7 : 0.94)
+                        : .white.opacity(configuration.isPressed ? 0.22 : (isHovered ? 0.17 : 0.09)))
             }
-        } label: {
-            HStack(spacing: 2) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 8, weight: .medium))
-                Text("Go to Terminal")
-                    .font(.system(size: 10, weight: .medium))
-            }
-            .foregroundColor(isEnabled ? .white.opacity(0.9) : .white.opacity(0.3))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(isEnabled ? Color.white.opacity(0.15) : Color.white.opacity(0.05))
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-// MARK: - Terminal Button
-
-struct TerminalButton: View {
-    let isEnabled: Bool
-    let onTap: () -> Void
-
-    var body: some View {
-        Button {
-            if isEnabled {
-                onTap()
-            }
-        } label: {
-            HStack(spacing: 3) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 9, weight: .medium))
-                Text("Terminal")
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .foregroundColor(isEnabled ? .black : .white.opacity(0.4))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(isEnabled ? Color.white.opacity(0.95) : Color.white.opacity(0.1))
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
+            .contentShape(RoundedRectangle(cornerRadius: 7))
+            .onHover { isHovered = $0 }
     }
 }

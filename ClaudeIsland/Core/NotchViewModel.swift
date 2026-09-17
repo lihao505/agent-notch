@@ -98,10 +98,11 @@ class NotchViewModel: ObservableObject {
                 height: min(configuredHeight, 390)
             )
         case .instances:
-            let listHeight: CGFloat = visibleSessionCount == 0
-                ? 82
-                : CGFloat(visibleSessionCount) * 58 + 8
-            let contentDrivenHeight = max(180, 70 + listHeight)
+            let listHeight = SessionListMetrics.contentHeight(sessionCount: visibleSessionCount)
+            let contentDrivenHeight = max(
+                200,
+                CompactNotchMetrics.openedHeaderHeight + 12 + listHeight
+            )
 
             return CGSize(
                 width: configuredWidth,
