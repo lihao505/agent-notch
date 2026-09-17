@@ -34,12 +34,12 @@ struct NotchSilenceRulesEditor: View {
     @State private var editingRuleId: UUID?
     @FocusState private var isPatternFocused: Bool
 
-    private let accent = Color(red: 0.95, green: 0.48, blue: 0.27)
+    private let accent = Color.accentColor
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
-                Picker("", selection: $draftScope) {
+                Picker(t("Match by", "匹配范围"), selection: $draftScope) {
                     ForEach(NotchSilenceRuleScope.allCases) { scope in
                         Text(scopeTitle(scope)).tag(scope)
                     }

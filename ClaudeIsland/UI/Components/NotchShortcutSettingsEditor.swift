@@ -11,10 +11,17 @@ struct NotchShortcutSettingsEditor: View {
         VStack(alignment: .leading, spacing: 12) {
             ForEach(NotchShortcutAction.allCases) { action in
                 if action != .toggle { Divider() }
-                KeyboardShortcuts.Recorder(action.title(language), name: action.name) { _ in
-                    refreshConflicts()
+                HStack(spacing: 16) {
+                    Text(action.title(language))
+                        .font(.system(size: 13))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    KeyboardShortcuts.Recorder(for: action.name) { _ in
+                        refreshConflicts()
+                    }
+                    .accessibilityLabel(action.title(language))
+                    .accessibilityIdentifier("notch.\(action.rawValue)ShortcutRecorder")
                 }
-                .accessibilityIdentifier("notch.\(action.rawValue)ShortcutRecorder")
+                .padding(.vertical, 2)
 
                 if conflicts.contains(action) {
                     Label(language.text(

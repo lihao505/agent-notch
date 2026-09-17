@@ -323,7 +323,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .resizable
         ]
         window.setContentSize(NSSize(width: 860, height: 620))
-        window.minSize = NSSize(width: 780, height: 560)
+        window.contentMinSize = NSSize(width: 780, height: 560)
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
         window.animationBehavior = .none

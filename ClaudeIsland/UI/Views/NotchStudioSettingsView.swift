@@ -1,3 +1,4 @@
+// Modified by lihao505 for Agent Notch, 2026.
 import AppKit
 import ServiceManagement
 import SwiftUI
@@ -5,6 +6,8 @@ import SwiftUI
 private enum NotchStudioSection: String, CaseIterable, Identifiable {
     case general = "General"
     case appearance = "Appearance"
+    case notifications = "Notifications"
+    case shortcuts = "Shortcuts"
     case usage = "Usage"
     case system = "System"
 
@@ -14,6 +17,8 @@ private enum NotchStudioSection: String, CaseIterable, Identifiable {
         switch self {
         case .general: return language.text("General", "通用")
         case .appearance: return language.text("Appearance", "外观")
+        case .notifications: return language.text("Notifications", "通知")
+        case .shortcuts: return language.text("Shortcuts", "快捷键")
         case .usage: return language.text("Usage", "用量")
         case .system: return language.text("System", "系统")
         }
@@ -23,6 +28,8 @@ private enum NotchStudioSection: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "switch.2"
         case .appearance: return "rectangle.topthird.inset.filled"
+        case .notifications: return "bell.badge"
+        case .shortcuts: return "keyboard"
         case .usage: return "chart.bar.fill"
         case .system: return "point.3.connected.trianglepath.dotted"
         }
@@ -57,16 +64,20 @@ struct NotchStudioSettingsView: View {
     @State private var hooksInstalled = false
     @State private var hooksNeedRepair = false
     @State private var previewState: NotchPreviewState = .idle
-    @Namespace private var sectionSelectionNamespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         HStack(spacing: 0) {
             sidebar
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 24) {
                     pageHeader
-                    notchPreview
+
+                    if selection == .appearance {
+                        notchPreview
+                    }
 
                     Group {
                         switch selection {
@@ -74,6 +85,10 @@ struct NotchStudioSettingsView: View {
                             generalSettings
                         case .appearance:
                             appearanceSettings
+                        case .notifications:
+                            notificationSettings
+                        case .shortcuts:
+                            shortcutSettings
                         case .usage:
                             usageSettings
                         case .system:
@@ -81,19 +96,12 @@ struct NotchStudioSettingsView: View {
                         }
                     }
                 }
+                .frame(maxWidth: 660, alignment: .leading)
                 .padding(28)
+                .frame(maxWidth: .infinity, alignment: .top)
             }
-            .background {
-                LinearGradient(
-                    colors: [
-                        Color(nsColor: .windowBackgroundColor),
-                        Color(red: 0.08, green: 0.09, blue: 0.12)
-                            .opacity(0.26),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottomTrailing
-                )
-            }
+            .id(selection)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(minWidth: 780, minHeight: 560)
         .onAppear {
@@ -102,6 +110,9 @@ struct NotchStudioSettingsView: View {
             updateWindowTitle()
         }
         .onChange(of: preferences.language) { _, _ in
+            updateWindowTitle()
+        }
+        .onChange(of: selection) { _, _ in
             updateWindowTitle()
         }
     }
@@ -115,96 +126,64 @@ struct NotchStudioSettingsView: View {
                     .antialiased(false)
                     .aspectRatio(contentMode: .fill)
                     .clipShape(RoundedRectangle(cornerRadius: 9))
-                .frame(width: 34, height: 34)
+                .frame(width: 32, height: 32)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Agent Notch")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                     Text("Claude · Codex · CodeBuddy")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.48))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(.horizontal, 18)
             .padding(.top, 20)
-            .padding(.bottom, 22)
+            .padding(.bottom, 16)
 
-            VStack(spacing: 5) {
+            List(selection: Binding<NotchStudioSection?>(
+                get: { selection },
+                set: { if let section = $0 { selection = section } }
+            )) {
                 ForEach(NotchStudioSection.allCases) { section in
-                    Button {
-                        selection = section
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: section.icon)
-                                .frame(width: 18)
-                            Text(section.title(preferences.language))
-                            Spacer()
-                        }
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(
-                            selection == section
-                                ? Color.white
-                                : Color.white.opacity(0.48)
-                        )
-                        .padding(.horizontal, 12)
-                        .frame(height: 36)
-                        .contentShape(Rectangle())
-                        .background(
-                            ZStack {
-                                if selection == section {
-                                    RoundedRectangle(cornerRadius: 9)
-                                        .fill(Color.white.opacity(0.11))
-                                        .matchedGeometryEffect(
-                                            id: "selected-section",
-                                            in: sectionSelectionNamespace
-                                        )
-                                }
-                            }
-                        )
-                        .overlay(alignment: .leading) {
-                            if selection == section {
-                                Capsule()
-                                    .fill(
-                                        Color(
-                                            red: 0.95,
-                                            green: 0.48,
-                                            blue: 0.27
-                                        )
-                                    )
-                                    .frame(width: 3, height: 16)
-                                    .offset(x: -6)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
+                    Label(section.title(preferences.language), systemImage: section.icon)
+                        .font(.system(size: 13))
+                        .padding(.vertical, 4)
+                        .tag(section)
+                        .accessibilityIdentifier("settings.section.\(section.rawValue)")
                 }
             }
-            .padding(.horizontal, 10)
-
-            Spacer()
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            .accessibilityLabel(t("Settings categories", "设置分类"))
 
             Text(t("Your agents, one glance away.", "一眼掌握所有智能体。"))
-                .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.28))
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
                 .padding(18)
         }
-        .frame(width: 190)
-        .background(Color(red: 0.055, green: 0.06, blue: 0.08))
+        .frame(width: 204)
+        .background {
+            if reduceTransparency {
+                Color(nsColor: .windowBackgroundColor)
+            } else {
+                Rectangle().fill(.bar)
+            }
+        }
         .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 1)
+            Divider()
         }
     }
 
     private var pageHeader: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(selection.title(preferences.language))
-                .font(.system(size: 25, weight: .bold, design: .rounded))
+                .font(.system(size: 24, weight: .bold))
             Text(pageSubtitle)
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -220,6 +199,10 @@ struct NotchStudioSettingsView: View {
                 "Tune the expanded canvas to fit the way you work.",
                 "调整刘海尺寸与信息密度，适配你的工作方式。"
             )
+        case .notifications:
+            return t("Decide what needs your attention, and when.", "决定哪些任务需要提醒，以及何时保持安静。")
+        case .shortcuts:
+            return t("Open the notch and switch conversations from your keyboard.", "用键盘展开刘海、切换会话。")
         case .usage:
             return t(
                 "Keep subscription limits visible without leaving your task.",
@@ -236,34 +219,7 @@ struct NotchStudioSettingsView: View {
     private var notchPreview: some View {
         VStack(spacing: 0) {
             ZStack(alignment: .top) {
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.07, green: 0.08, blue: 0.11),
-                        Color(red: 0.15, green: 0.11, blue: 0.18),
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-
-                Canvas { context, size in
-                    let spacing: CGFloat = 14
-                    for x in stride(from: 7, through: size.width, by: spacing) {
-                        for y in stride(from: 7, through: size.height, by: spacing) {
-                            context.fill(
-                                Path(
-                                    CGRect(
-                                        x: x,
-                                        y: y,
-                                        width: 1.5,
-                                        height: 1.5
-                                    )
-                                ),
-                                with: .color(.white.opacity(0.055))
-                            )
-                        }
-                    }
-                }
-                .allowsHitTesting(false)
+                Color(nsColor: .controlBackgroundColor)
 
                 VStack(spacing: 13) {
                     ZStack(alignment: .top) {
@@ -361,11 +317,11 @@ struct NotchStudioSettingsView: View {
                             )
                         )
                         .animation(
-                            .spring(response: 0.34, dampingFraction: 0.82),
+                            reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.9),
                             value: previewIsHidden
                         )
                         .animation(
-                            .spring(response: 0.3, dampingFraction: 0.84),
+                            reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.9),
                             value: preferences.compactStyle
                         )
                     }
@@ -377,14 +333,18 @@ struct NotchStudioSettingsView: View {
                             "实时预览 · 不会修改真实任务状态"
                         )
                     )
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.34))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
 
-                    HStack(spacing: 7) {
+                    Picker(t("Preview state", "预览状态"), selection: $previewState) {
                         ForEach(NotchPreviewState.allCases) { state in
-                            previewStateButton(state)
+                            Text(previewStateShortTitle(for: state)).tag(state)
                         }
                     }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 320)
+                    .accessibilityIdentifier("settings.previewState")
                 }
                 .padding(.top, 0)
             }
@@ -395,7 +355,7 @@ struct NotchStudioSettingsView: View {
                     previewStateTitle,
                     systemImage: previewStateSystemImage
                 )
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 11, weight: .medium))
 
                 Spacer()
 
@@ -404,17 +364,17 @@ struct NotchStudioSettingsView: View {
                         ? t("Hardware notch only", "仅保留实体刘海")
                         : "\(Int(previewWidth)) pt"
                 )
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .font(.system(size: 11).monospacedDigit())
             }
             .foregroundStyle(.secondary)
             .padding(.horizontal, 14)
             .frame(height: 36)
             .background(Color.primary.opacity(0.025))
         }
-        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay {
-            RoundedRectangle(cornerRadius: 16)
-                .strokeBorder(Color.primary.opacity(0.08))
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5)
                 .allowsHitTesting(false)
         }
     }
@@ -531,41 +491,6 @@ struct NotchStudioSettingsView: View {
         }
     }
 
-    private func previewStateButton(_ state: NotchPreviewState) -> some View {
-        let selected = previewState == state
-
-        return Button {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
-                previewState = state
-            }
-        } label: {
-            Text(previewStateShortTitle(for: state))
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(selected ? Color.white : Color.white.opacity(0.42))
-                .padding(.horizontal, 11)
-                .frame(height: 26)
-                .background(
-                    Capsule()
-                        .fill(
-                            selected
-                                ? previewStateColor(state).opacity(0.2)
-                                : Color.white.opacity(0.045)
-                        )
-                )
-                .overlay {
-                    Capsule()
-                        .strokeBorder(
-                            selected
-                                ? previewStateColor(state).opacity(0.48)
-                                : Color.white.opacity(0.05)
-                        )
-                        .allowsHitTesting(false)
-                }
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
     private var previewStateTitle: String {
         previewStateTitle(for: previewState)
     }
@@ -599,15 +524,6 @@ struct NotchStudioSettingsView: View {
         }
     }
 
-    private func previewStateColor(_ state: NotchPreviewState) -> Color {
-        switch state {
-        case .idle: return Color.white
-        case .working: return Color(red: 0.95, green: 0.48, blue: 0.27)
-        case .waiting: return Color(red: 0.75, green: 0.50, blue: 0.29)
-        case .complete: return TerminalColors.green
-        }
-    }
-
     private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 16) {
             settingsTitle(
@@ -618,24 +534,13 @@ struct NotchStudioSettingsView: View {
                 )
             )
 
-            Picker("", selection: $preferences.language) {
+            Picker(t("Language", "语言"), selection: $preferences.language) {
                 Text("English").tag(AppLanguage.english)
                 Text("简体中文").tag(AppLanguage.simplifiedChinese)
             }
             .labelsHidden()
             .pickerStyle(.segmented)
             .frame(maxWidth: 320)
-
-            settingsTitle(
-                t("Global shortcut", "全局快捷键"),
-                caption: t(
-                    "Open the notch and move between conversations without reaching for the mouse.",
-                    "不用鼠标，也能展开刘海和切换会话。"
-                )
-            )
-            settingsCard {
-                NotchShortcutSettingsEditor(language: preferences.language)
-            }
 
             settingsTitle(
                 t("Default approval policy", "默认审批方式"),
@@ -685,7 +590,7 @@ struct NotchStudioSettingsView: View {
                     ),
                     systemImage: "info.circle"
                 )
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             }
 
@@ -770,7 +675,23 @@ struct NotchStudioSettingsView: View {
                     isOn: $preferences.expandQuestionsAutomatically
                 )
 
-                Divider()
+            }
+        }
+    }
+
+    private var shortcutSettings: some View {
+        settingsCard {
+            NotchShortcutSettingsEditor(language: preferences.language)
+        }
+    }
+
+    private var notificationSettings: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            settingsTitle(
+                t("Reminders", "任务提醒"),
+                caption: t("Keep track of work that needs your attention.", "查看完成结果，以及仍在等待处理的请求。")
+            )
+            settingsCard {
                 sliderRow(
                     title: t("Completion dwell", "完成后停留"),
                     value: $preferences.completionCompactDuration,
@@ -855,64 +776,12 @@ struct NotchStudioSettingsView: View {
     }
 
     private func approvalModeCard(
-        _ mode: ApprovalMode,
-        icon: String,
-        title: String,
-        subtitle: String
+        _ mode: ApprovalMode, icon: String, title: String, subtitle: String
     ) -> some View {
-        let isSelected = preferences.approvalMode == mode
-        return Button {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                preferences.approvalMode = mode
-            }
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(isSelected ? Color.white : Color.primary.opacity(0.55))
-                    .frame(width: 30, height: 30)
-                    .background(
-                        Circle().fill(
-                            isSelected
-                                ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                                : Color.primary.opacity(0.08)
-                        )
-                    )
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.primary)
-                    Text(subtitle)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.leading)
-                }
-
-                Spacer(minLength: 8)
-
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(
-                        isSelected
-                            ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                            : Color.secondary.opacity(0.45)
-                    )
-            }
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(isSelected ? Color.orange.opacity(0.08) : Color.primary.opacity(0.035))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12)
-                            .strokeBorder(
-                                isSelected ? Color.orange.opacity(0.45) : Color.primary.opacity(0.08),
-                                lineWidth: isSelected ? 1.5 : 1
-                            )
-                    }
-            )
+        choiceRow(selected: preferences.approvalMode == mode,
+                  icon: icon, title: title, subtitle: subtitle) {
+            preferences.approvalMode = mode
         }
-        .buttonStyle(.plain)
     }
 
     private var appearanceSettings: some View {
@@ -964,7 +833,7 @@ struct NotchStudioSettingsView: View {
                             "最窄时只保留桌宠；中等宽度加入微型信号，足够宽时再显示完整伴生动画。"
                         )
                     )
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
 
                     Spacer()
@@ -1123,7 +992,7 @@ struct NotchStudioSettingsView: View {
                         )
                     )
                     Spacer()
-                    Picker("", selection: screenBinding) {
+                    Picker(t("Display", "显示屏"), selection: screenBinding) {
                         Text(t("Automatic", "自动")).tag("automatic")
                         ForEach(screenSelector.availableScreens, id: \.self) { screen in
                             Text(screen.localizedName).tag(screen.localizedName)
@@ -1258,16 +1127,16 @@ struct NotchStudioSettingsView: View {
                     $0.identifier?.rawValue ==
                         "com_apple_SwiftUI_Settings_window"
                 }?
-                .title = t("Agent Notch Settings", "Agent Notch 设置")
+                .title = "\(selection.title(preferences.language)) — Agent Notch"
         }
     }
 
     private func settingLabel(_ title: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 13, weight: .medium))
             Text(detail)
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
     }
@@ -1278,10 +1147,10 @@ struct NotchStudioSettingsView: View {
     ) -> some View {
         HStack {
             Text(title)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 13, weight: .medium))
             Spacer()
             DatePicker(
-                "",
+                title,
                 selection: timeBinding(for: minute),
                 displayedComponents: .hourAndMinute
             )
@@ -1400,154 +1269,62 @@ struct NotchStudioSettingsView: View {
     }
 
     private func behaviorCard(
-        behavior: IdleNotchBehavior,
-        icon: String,
-        title: String,
-        subtitle: String
+        behavior: IdleNotchBehavior, icon: String, title: String, subtitle: String
     ) -> some View {
-        let selected = preferences.idleBehavior == behavior
-
-        return Button {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                preferences.idleBehavior = behavior
-            }
-        } label: {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: icon)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(
-                        selected
-                            ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                            : .secondary
-                    )
-                    .frame(width: 30, height: 30)
-                    .background(
-                        Circle().fill(
-                            selected
-                                ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                                    .opacity(0.14)
-                                : Color.primary.opacity(0.05)
-                        )
-                    )
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(subtitle)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 0)
-
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(
-                        selected
-                            ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                            : Color.secondary.opacity(0.4)
-                    )
-            }
-            .padding(14)
-            .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
-            .background(
-                RoundedRectangle(cornerRadius: 13)
-                    .fill(
-                        selected
-                            ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                                .opacity(0.08)
-                            : Color.primary.opacity(0.035)
-                    )
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 13)
-                    .strokeBorder(
-                        selected
-                            ? Color(red: 0.95, green: 0.48, blue: 0.27)
-                                .opacity(0.45)
-                            : Color.primary.opacity(0.08),
-                        lineWidth: selected ? 1.5 : 1
-                    )
-                    .allowsHitTesting(false)
-            }
-            .contentShape(RoundedRectangle(cornerRadius: 13))
+        choiceRow(selected: preferences.idleBehavior == behavior,
+                  icon: icon, title: title, subtitle: subtitle) {
+            preferences.idleBehavior = behavior
         }
-        .buttonStyle(.plain)
+        .settingsSurface()
     }
 
     private func compactStyleCard(
-        style: CompactNotchStyle,
-        icon: String,
-        title: String,
-        subtitle: String
+        style: CompactNotchStyle, icon: String, title: String, subtitle: String
     ) -> some View {
-        let selected = preferences.compactStyle == style
+        choiceRow(selected: preferences.compactStyle == style,
+                  icon: icon, title: title, subtitle: subtitle) {
+            preferences.compactStyle = style
+        }
+        .settingsSurface()
+    }
 
-        return Button {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                preferences.compactStyle = style
-            }
-        } label: {
+    private func choiceRow(
+        selected: Bool, icon: String, title: String, subtitle: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: icon)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(
-                        selected
-                            ? Color(red: 0.36, green: 0.67, blue: 0.98)
-                            : .secondary
-                    )
-                    .frame(width: 30, height: 30)
-                    .background(
-                        Circle().fill(
-                            selected
-                                ? Color(red: 0.36, green: 0.67, blue: 0.98)
-                                    .opacity(0.14)
-                                : Color.primary.opacity(0.05)
-                        )
-                    )
-
+                    .font(.system(size: 16))
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .frame(width: 24, height: 24)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.primary)
                     Text(subtitle)
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Spacer(minLength: 0)
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(
-                        selected
-                            ? Color(red: 0.36, green: 0.67, blue: 0.98)
-                            : Color.secondary.opacity(0.4)
-                    )
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 16))
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .accessibilityHidden(true)
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
-            .background(
-                RoundedRectangle(cornerRadius: 13)
-                    .fill(
-                        selected
-                            ? Color(red: 0.36, green: 0.67, blue: 0.98)
-                                .opacity(0.08)
-                            : Color.primary.opacity(0.035)
-                    )
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 13)
-                    .strokeBorder(
-                        selected
-                            ? Color(red: 0.36, green: 0.67, blue: 0.98)
-                                .opacity(0.45)
-                            : Color.primary.opacity(0.08),
-                        lineWidth: selected ? 1.5 : 1
-                    )
-                    .allowsHitTesting(false)
-            }
-            .contentShape(RoundedRectangle(cornerRadius: 13))
+            .padding(12)
+            .background(selected ? Color.accentColor.opacity(0.08) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .multilineTextAlignment(.leading)
+        .accessibilityLabel(title)
+        .accessibilityValue(selected ? t("Selected", "已选择") : t("Not selected", "未选择"))
+        .accessibilityHint(subtitle)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func settingsTitle(_ title: String, caption: String) -> some View {
@@ -1555,7 +1332,7 @@ struct NotchStudioSettingsView: View {
             Text(title)
                 .font(.system(size: 14, weight: .semibold))
             Text(caption)
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
     }
@@ -1567,15 +1344,8 @@ struct NotchStudioSettingsView: View {
             content()
         }
         .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(Color.primary.opacity(0.035))
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14)
-                .strokeBorder(Color.primary.opacity(0.08))
-                .allowsHitTesting(false)
-        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .settingsSurface()
     }
 
     private func settingToggle(
@@ -1586,15 +1356,17 @@ struct NotchStudioSettingsView: View {
         Toggle(isOn: isOn) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                 Text(detail)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
         .toggleStyle(.switch)
+        .accessibilityLabel(title)
+        .accessibilityHint(detail)
         .contentShape(Rectangle())
     }
 
@@ -1608,14 +1380,16 @@ struct NotchStudioSettingsView: View {
         VStack(spacing: 9) {
             HStack {
                 Text(title)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                 Spacer()
                 Text(valueText)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(value: value, in: range, step: step)
-                .tint(Color(red: 0.95, green: 0.48, blue: 0.27))
+                .tint(.accentColor)
+                .accessibilityLabel(title)
+                .accessibilityValue(valueText)
                 .padding(.vertical, 6)
                 .contentShape(Rectangle())
         }
@@ -1643,20 +1417,20 @@ private struct UsageDisplayModeSetting: View {
         HStack {
             VStack(alignment: .leading, spacing: 3) {
                 Text(preferences.language.text("Display mode", "显示方式"))
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                 Text(
                     preferences.language.text(
                         "Switch between consumed and available allowance.",
                         "切换已使用与剩余额度。"
                     )
                 )
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            Picker("", selection: $displayRemaining) {
+            Picker(preferences.language.text("Display mode", "显示方式"), selection: $displayRemaining) {
                 Text(preferences.language.text("Used", "已使用")).tag(false)
                 Text(preferences.language.text("Remaining", "剩余")).tag(true)
             }
