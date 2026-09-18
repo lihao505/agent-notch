@@ -34,6 +34,8 @@ required_files=(
     ClaudeIslandTests/PermissionRoutingTests.swift
     ClaudeIslandTests/ConversationParserIndexTests.swift
     ClaudeIslandTests/NotchPresentationTimingTests.swift
+    ClaudeIslandTests/NotchPointerInteractionTests.swift
+    ClaudeIslandTests/NotchHitTestingTests.swift
     ClaudeIslandTests/NotchQuietHoursPolicyTests.swift
     ClaudeIslandTests/NotchQuietSceneTests.swift
     ClaudeIslandTests/NotchSilenceRuleTests.swift
@@ -51,6 +53,7 @@ done
 # a prominent notice. This checked-in list also works in shallow CI clones that
 # do not have the upstream remote configured.
 modified_upstream_sources=(
+    ClaudeIsland/Events/EventMonitors.swift
     ClaudeIsland/App/AppDelegate.swift
     ClaudeIsland/App/ClaudeIslandApp.swift
     ClaudeIsland/App/ScreenObserver.swift

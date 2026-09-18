@@ -107,6 +107,7 @@ struct NotchQuickControls: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .accessibilityLabel(t("Expand on hover", "悬停展开"))
                 Toggle(isOn: $showUsageLimits) {
                     Text(t("Show usage", "显示用量"))
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -164,6 +165,8 @@ struct NotchQuickControls: View {
             }
             .toggleStyle(.switch)
             .disabled(isUpdatingHooks)
+            .accessibilityLabel(t("Agent Bridge", "智能体桥接"))
+            .accessibilityHint(bridgeStatus)
             .padding(.vertical, 4)
         }
     }

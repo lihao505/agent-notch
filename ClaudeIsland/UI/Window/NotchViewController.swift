@@ -12,11 +12,13 @@ import SwiftUI
 /// Custom NSHostingView that only accepts mouse events within the panel bounds.
 /// Clicks outside the panel pass through to windows behind.
 class PassThroughHostingView<Content: View>: NSHostingView<Content> {
+    /// Panel bounds in window coordinates, independent of hosting-view flips.
     var hitTestRect: () -> CGRect = { .zero }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // Only accept hits within the panel rect
-        guard hitTestRect().contains(point) else {
+        // AppKit supplies hitTest points in the receiver's superview space.
+        let pointInWindow = superview?.convert(point, to: nil) ?? point
+        guard hitTestRect().contains(pointInWindow) else {
             return nil  // Pass through to windows behind
         }
         return super.hitTest(point)

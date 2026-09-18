@@ -318,6 +318,24 @@ struct NotchView: View {
                         value: isBouncing
                     )
                     .contentShape(Rectangle())
+                    .overlay {
+                        if viewModel.status != .opened {
+                            // Keep the closed artwork and its matched geometry
+                            // intact. A real button adds a named AXPress entry
+                            // without wrapping or intercepting expanded controls.
+                            Button(action: viewModel.openFromAccessibility) {
+                                Color.clear.contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(preferences.language.text(
+                                "Expand Agent Notch", "展开 Agent Notch"
+                            ))
+                            .accessibilityHint(preferences.language.text(
+                                "Show tasks and quick settings", "显示任务和快捷设置"
+                            ))
+                            .accessibilityIdentifier("notch.expand")
+                        }
+                    }
                     .onHover { hovering in
                         withAnimation(
                             reduceMotion
@@ -731,10 +749,10 @@ struct NotchView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(
-                    preferences.language == .simplifiedChinese
-                        ? "快捷设置"
-                        : "Quick Controls"
-                    )
+                    viewModel.contentType == .menu
+                        ? preferences.language.text("Back to tasks", "返回任务列表")
+                        : preferences.language.text("Quick Settings", "快捷设置")
+                )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 

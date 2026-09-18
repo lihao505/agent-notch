@@ -120,7 +120,7 @@ class NotchViewModel: ObservableObject {
     // MARK: - Private
 
     private var cancellables = Set<AnyCancellable>()
-    private let events = EventMonitors.shared
+    private let events: EventMonitors
     private var hoverTimer: DispatchWorkItem?
     /// Read the monitor's latest UI snapshot at key-up, not a duplicated cache
     /// of sessions captured when a shortcut or window was first registered.
@@ -128,7 +128,9 @@ class NotchViewModel: ObservableObject {
 
     // MARK: - Initialization
 
-    init(deviceNotchRect: CGRect, screenRect: CGRect, windowHeight: CGFloat, hasPhysicalNotch: Bool) {
+    init(deviceNotchRect: CGRect, screenRect: CGRect, windowHeight: CGFloat,
+         hasPhysicalNotch: Bool, events: EventMonitors? = nil) {
+        self.events = events ?? .shared
         self.geometry = NotchGeometry(
             deviceNotchRect: deviceNotchRect,
             screenRect: screenRect,
@@ -184,8 +186,8 @@ class NotchViewModel: ObservableObject {
 
         events.mouseDown
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleMouseDown()
+            .sink { [weak self] location in
+                self?.handleMouseDown(at: location)
             }
             .store(in: &cancellables)
     }
@@ -328,15 +330,13 @@ class NotchViewModel: ObservableObject {
             openReason == .hover
     }
 
-    private func handleMouseDown() {
-        let location = NSEvent.mouseLocation
-
+    private func handleMouseDown(at location: CGPoint) {
         switch status {
         case .opened:
             if geometry.isPointOutsidePanel(location, size: openedSize) {
                 notchClose()
-                // Re-post the click so it reaches the window/app behind us
-                repostClickAt(location)
+                // Monitors observe the original event; they do not consume it.
+                // Only NotchPanel may forward events it actually intercepted.
             } else {
                 // A hover preview becomes an intentional presentation as
                 // soon as the user interacts anywhere inside it. Without
@@ -352,38 +352,21 @@ class NotchViewModel: ObservableObject {
         }
     }
 
-    /// Re-posts a mouse click at the given screen location so it reaches windows behind us
-    private func repostClickAt(_ location: CGPoint) {
-        // Small delay to let the window's ignoresMouseEvents update
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            // Convert to CGEvent coordinate system (screen coordinates with Y from top-left)
-            guard let screen = NSScreen.main else { return }
-            let screenHeight = screen.frame.height
-            let cgPoint = CGPoint(x: location.x, y: screenHeight - location.y)
+    // MARK: - Actions
 
-            // Create and post mouse down event
-            if let mouseDown = CGEvent(
-                mouseEventSource: nil,
-                mouseType: .leftMouseDown,
-                mouseCursorPosition: cgPoint,
-                mouseButton: .left
-            ) {
-                mouseDown.post(tap: .cghidEventTap)
-            }
-
-            // Create and post mouse up event
-            if let mouseUp = CGEvent(
-                mouseEventSource: nil,
-                mouseType: .leftMouseUp,
-                mouseCursorPosition: cgPoint,
-                mouseButton: .left
-            ) {
-                mouseUp.post(tap: .cghidEventTap)
-            }
+    /// Assistive activation is an explicit, idempotent open, not a hover and
+    /// not a toggle. It must not depend on the physical pointer being nearby.
+    func openFromAccessibility() {
+        guard status != .opened else {
+            claimOpenedPanelInteraction()
+            return
+        }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            notchOpen(reason: .keyboard)
         }
     }
-
-    // MARK: - Actions
 
     func notchOpen(reason: NotchOpenReason = .unknown) {
         hoverTimer?.cancel()

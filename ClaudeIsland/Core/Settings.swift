@@ -522,6 +522,11 @@ final class NotchPreferences: ObservableObject {
     /// not visible to it. Keep a tiny, atomic policy file as the shared source
     /// of truth. It contains no credentials and is recreated at app startup.
     private func writeApprovalPolicy() {
+        // Hosted unit tests load the real app executable and shared preferences,
+        // but must never replace a running user's temporary approval policy.
+        guard Self.shouldPersistApprovalPolicy(
+            environment: Foundation.ProcessInfo.processInfo.environment
+        ) else { return }
         let url = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".multiagent-notch/approval-policy.json")
         do {
@@ -548,5 +553,9 @@ final class NotchPreferences: ObservableObject {
         } catch {
             print("Failed to write approval policy: \(error)")
         }
+    }
+
+    static func shouldPersistApprovalPolicy(environment: [String: String]) -> Bool {
+        environment["XCTestConfigurationFilePath"] == nil
     }
 }

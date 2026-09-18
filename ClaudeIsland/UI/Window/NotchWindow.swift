@@ -75,21 +75,21 @@ class NotchPanel: NSPanel {
         // For mouse events, check if we should pass through
         if event.type == .leftMouseDown || event.type == .leftMouseUp ||
            event.type == .rightMouseDown || event.type == .rightMouseUp {
-            // Get the location in window coordinates
-            let locationInWindow = event.locationInWindow
-
             // Check if any view wants to handle this event
             if let contentView = self.contentView,
-               contentView.hitTest(locationInWindow) == nil {
+               contentView.hitTest(
+                    contentView.superview?.convert(event.locationInWindow, from: nil)
+                        ?? event.locationInWindow
+               ) == nil,
+               let forwardedEvent = Self.passThroughEvent(from: event) {
                 // No view wants this event - pass it through to windows behind
                 // by temporarily ignoring mouse events and re-posting
-                let screenLocation = convertPoint(toScreen: locationInWindow)
                 ignoresMouseEvents = true
 
                 // Re-post the event after a tiny delay
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.repostMouseEvent(event, at: screenLocation)
+                    forwardedEvent.post(tap: .cghidEventTap)
 
                     // A pass-through click must not leave the opened panel
                     // permanently click-through. This used to make the next
@@ -113,30 +113,15 @@ class NotchPanel: NSPanel {
         super.sendEvent(event)
     }
 
-    private func repostMouseEvent(_ event: NSEvent, at screenLocation: NSPoint) {
-        // Convert to CGEvent coordinate system (Y from top of screen)
-        guard let screen = NSScreen.main else { return }
-        let screenHeight = screen.frame.height
-        let cgPoint = CGPoint(x: screenLocation.x, y: screenHeight - screenLocation.y)
-
-        let mouseType: CGEventType
+    /// Copy only an intercepted event, preserving its original screen location,
+    /// button, modifiers and click count. NSScreen.main is the key-window screen,
+    /// not necessarily the primary display that defines Quartz coordinates.
+    static func passThroughEvent(from event: NSEvent) -> CGEvent? {
         switch event.type {
-        case .leftMouseDown: mouseType = .leftMouseDown
-        case .leftMouseUp: mouseType = .leftMouseUp
-        case .rightMouseDown: mouseType = .rightMouseDown
-        case .rightMouseUp: mouseType = .rightMouseUp
-        default: return
-        }
-
-        let mouseButton: CGMouseButton = event.type == .rightMouseDown || event.type == .rightMouseUp ? .right : .left
-
-        if let cgEvent = CGEvent(
-            mouseEventSource: nil,
-            mouseType: mouseType,
-            mouseCursorPosition: cgPoint,
-            mouseButton: mouseButton
-        ) {
-            cgEvent.post(tap: .cghidEventTap)
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp:
+            return event.cgEvent?.copy()
+        default:
+            return nil
         }
     }
 }
