@@ -54,24 +54,13 @@ final class ConversationParserIndexTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let previous = getenv("AGENT_NOTCH_CODEX_SESSIONS_ROOT")
-            .map { String(cString: $0) }
-        setenv("AGENT_NOTCH_CODEX_SESSIONS_ROOT", root.path, 1)
-        defer {
-            if let previous {
-                setenv("AGENT_NOTCH_CODEX_SESSIONS_ROOT", previous, 1)
-            } else {
-                unsetenv("AGENT_NOTCH_CODEX_SESSIONS_ROOT")
-            }
-        }
-
         try writeRollout(
             root: root,
             date: Date(timeIntervalSince1970: 1_600_000_000),
             sessionId: "historical-session",
             cwd: "/tmp/historical"
         )
-        let parser = ConversationParser()
+        let parser = ConversationParser(codexSessionsRoot: root)
         var observations = await parser.discoverCodexTasks(
             modifiedAfter: Date().addingTimeInterval(-60)
         )

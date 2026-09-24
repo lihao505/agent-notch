@@ -185,6 +185,7 @@ struct ChatView: View {
     @State private var session: SessionState
     @State private var isLoading: Bool = true
     @State private var hasLoadedOnce: Bool = false
+    @State private var historyLoadFailed: Bool = false
     @State private var shouldScrollToBottom: Bool = false
     @State private var isAutoscrollPaused: Bool = false
     @State private var newMessageCount: Int = 0
@@ -282,24 +283,7 @@ struct ChatView: View {
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: isWaitingForApproval)
         .animation(nil, value: viewModel.status)
         .task {
-            // Skip if already loaded (prevents redundant work on view recreation)
-            guard !hasLoadedOnce else { return }
-            hasLoadedOnce = true
-
-            // Check if already loaded (from previous visit)
-            if ChatHistoryManager.shared.isLoaded(sessionId: sessionId) {
-                history = ChatHistoryManager.shared.history(for: sessionId)
-                isLoading = false
-                return
-            }
-
-            // Load in background, show loading state
-            await ChatHistoryManager.shared.loadFromFile(sessionId: sessionId, cwd: session.cwd)
-            history = ChatHistoryManager.shared.history(for: sessionId)
-
-            withAnimation(.easeOut(duration: 0.2)) {
-                isLoading = false
-            }
+            await loadHistoryIfNeeded()
         }
         .onReceive(ChatHistoryManager.shared.$histories) { histories in
             // Update when count changes, last item differs, or content changes (e.g., tool status)
@@ -581,14 +565,61 @@ struct ChatView: View {
 
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Image(systemName: "bubble.left.and.bubble.right")
+            Image(systemName: historyLoadFailed
+                ? "arrow.clockwise.circle"
+                : "bubble.left.and.bubble.right")
                 .font(.system(size: 24))
                 .foregroundColor(.white.opacity(0.2))
-            Text("No messages yet")
+            Text(emptyStateTitle)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(.white.opacity(0.4))
+            if historyLoadFailed {
+                Button("Retry") {
+                    Task { await loadHistoryIfNeeded(force: true) }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(session.source.accentColor)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyStateTitle: String {
+        if historyLoadFailed {
+            return "Messages unavailable"
+        }
+        if session.phase == .processing {
+            return "Waiting for the first update..."
+        }
+        return "No messages yet"
+    }
+
+    @MainActor
+    private func loadHistoryIfNeeded(force: Bool = false) async {
+        guard force || !hasLoadedOnce else { return }
+        hasLoadedOnce = true
+        historyLoadFailed = false
+        isLoading = true
+
+        if ChatHistoryManager.shared.isLoaded(sessionId: sessionId) {
+            history = ChatHistoryManager.shared.history(for: sessionId)
+            isLoading = false
+            return
+        }
+
+        let didLoad = await ChatHistoryManager.shared.loadFromFile(
+            sessionId: sessionId,
+            cwd: session.cwd
+        )
+        history = ChatHistoryManager.shared.history(for: sessionId)
+        historyLoadFailed = !didLoad
+        if !didLoad {
+            hasLoadedOnce = false
+        }
+        withAnimation(.easeOut(duration: 0.2)) {
+            isLoading = false
+        }
     }
 
     // MARK: - Message List

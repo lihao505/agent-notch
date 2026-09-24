@@ -9,6 +9,11 @@ import Foundation
 
 @MainActor
 class ChatHistoryManager: ObservableObject {
+    private struct HistoryLoadTask {
+        let id: UUID
+        let task: Task<Bool, Never>
+    }
+
     static let shared = ChatHistoryManager()
 
     @Published private(set) var histories: [String: [ChatHistoryItem]] = [:]
@@ -19,6 +24,7 @@ class ChatHistoryManager: ObservableObject {
     /// discovery via hooks. (Hook events only give tool calls, not the
     /// full user/assistant text conversation.)
     private var jsonlParsedSessions: Set<String> = []
+    private var historyLoadTasks: [String: HistoryLoadTask] = [:]
     private var cancellables = Set<AnyCancellable>()
 
     private init() {
@@ -43,10 +49,47 @@ class ChatHistoryManager: ObservableObject {
         jsonlParsedSessions.contains(sessionId)
     }
 
-    func loadFromFile(sessionId: String, cwd: String) async {
-        guard !jsonlParsedSessions.contains(sessionId) else { return }
-        jsonlParsedSessions.insert(sessionId)
-        await SessionStore.shared.process(.loadHistory(sessionId: sessionId, cwd: cwd))
+    /// Returns true only after a real source was parsed into a still-existing
+    /// session. A missing file is deliberately not cached as success, so a
+    /// native rollout discovered a moment later can be retried by the view.
+    func loadFromFile(sessionId: String, cwd: String) async -> Bool {
+        if jsonlParsedSessions.contains(sessionId) {
+            return true
+        }
+        if let existing = historyLoadTasks[sessionId] {
+            return await existing.task.value
+        }
+
+        let loadID = UUID()
+        let task = Task { @MainActor in
+            guard !Task.isCancelled else { return false }
+            guard await ConversationParser.shared.hasConversationSource(
+                sessionId: sessionId,
+                cwd: cwd
+            ) else {
+                return false
+            }
+            await SessionStore.shared.process(
+                .loadHistory(sessionId: sessionId, cwd: cwd)
+            )
+            guard !Task.isCancelled else { return false }
+            guard await SessionStore.shared.session(for: sessionId) != nil else {
+                return false
+            }
+            return await ConversationParser.shared.hasConversationSource(
+                sessionId: sessionId,
+                cwd: cwd
+            )
+        }
+        historyLoadTasks[sessionId] = HistoryLoadTask(id: loadID, task: task)
+        let didLoad = await task.value
+        if historyLoadTasks[sessionId]?.id == loadID {
+            historyLoadTasks.removeValue(forKey: sessionId)
+        }
+        if didLoad && !task.isCancelled {
+            jsonlParsedSessions.insert(sessionId)
+        }
+        return didLoad
     }
 
     func syncFromFile(sessionId: String, cwd: String) async {
@@ -99,6 +142,7 @@ class ChatHistoryManager: ObservableObject {
     }
 
     func clearHistory(for sessionId: String) {
+        historyLoadTasks.removeValue(forKey: sessionId)?.task.cancel()
         jsonlParsedSessions.remove(sessionId)
         histories.removeValue(forKey: sessionId)
         Task {

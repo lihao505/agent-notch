@@ -33,6 +33,7 @@ required_files=(
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
     ClaudeIslandTests/PermissionRoutingTests.swift
     ClaudeIslandTests/ConversationParserIndexTests.swift
+    ClaudeIslandTests/CodexNativeConversationTests.swift
     ClaudeIslandTests/NotchPresentationTimingTests.swift
     ClaudeIslandTests/NotchPointerInteractionTests.swift
     ClaudeIslandTests/NotchHitTestingTests.swift

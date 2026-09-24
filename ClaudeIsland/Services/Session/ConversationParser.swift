@@ -148,6 +148,15 @@ nonisolated struct CodexTaskObservation: Sendable {
 actor ConversationParser {
     static let shared = ConversationParser()
 
+    private let codexSessionsRootOverride: URL?
+
+    /// Tests inject an isolated Codex sessions root instead of mutating the
+    /// process environment, which can race with other parser tests. Production
+    /// keeps honoring the existing environment override for diagnostics.
+    init(codexSessionsRoot: URL? = nil) {
+        codexSessionsRootOverride = codexSessionsRoot
+    }
+
     /// Logger for conversation parser (nonisolated static for cross-context access)
     nonisolated static let logger = Logger(subsystem: "com.claudeisland", category: "Parser")
 
@@ -191,6 +200,14 @@ actor ConversationParser {
         var lastClearOffset: UInt64 = 0  // Offset of last /clear command (0 = none or at start)
         var clearPending: Bool = false  // True if a /clear was just detected
         var nativeApprovalMode: ApprovalMode?
+        var seenNativeMessageIDs: Set<String> = []
+        var sourceFilePath: String?
+        var sourceModificationDate: Date?
+        var sourceDeviceNumber: UInt64?
+        var sourceFileNumber: UInt64?
+        /// Last bytes immediately before `lastFileOffset`. This detects a
+        /// truncate-and-regrow that passes the old cursor between two polls.
+        var sourceAnchor = Data()
     }
 
     /// A separate cursor for the small subset of Codex rollout rows that
@@ -623,6 +640,9 @@ actor ConversationParser {
     }
 
     private func codexSessionsRootURL() -> URL {
+        if let codexSessionsRootOverride {
+            return codexSessionsRootOverride
+        }
         if let override = Foundation.ProcessInfo.processInfo.environment[
             "AGENT_NOTCH_CODEX_SESSIONS_ROOT"
         ]?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines),
@@ -1426,6 +1446,18 @@ actor ConversationParser {
         return state.messages
     }
 
+    /// Whether a real transcript currently exists for this session. Callers
+    /// use this to distinguish a successfully loaded empty conversation from
+    /// a discovery/load race that should remain retryable.
+    func hasConversationSource(sessionId: String, cwd: String) -> Bool {
+        if nativeConversationURL(sessionId: sessionId, cwd: cwd) != nil {
+            return true
+        }
+        return FileManager.default.fileExists(
+            atPath: Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
+        )
+    }
+
     /// Result of incremental parsing
     struct IncrementalParseResult {
         let newMessages: [ChatMessage]
@@ -1519,16 +1551,11 @@ actor ConversationParser {
         }
         defer { try? fileHandle.close() }
 
-        let fileSize: UInt64
-        do {
-            fileSize = try fileHandle.seekToEnd()
-        } catch {
-            return []
-        }
-
-        if fileSize < state.lastFileOffset {
-            state = IncrementalParseState()
-        }
+        guard let fileSize = prepareIncrementalSource(
+            filePath: filePath,
+            fileHandle: fileHandle,
+            state: &state
+        ) else { return [] }
 
         if fileSize == state.lastFileOffset {
             return []
@@ -1625,6 +1652,11 @@ actor ConversationParser {
         }
 
         state.lastFileOffset = readOffset + completePrefix.byteCount
+        refreshIncrementalSourceAnchor(
+            filePath: filePath,
+            fileHandle: fileHandle,
+            state: &state
+        )
         return newMessages
     }
 
@@ -1721,10 +1753,11 @@ actor ConversationParser {
         }
         defer { try? fileHandle.close() }
 
-        guard let fileSize = try? fileHandle.seekToEnd() else { return [] }
-        if fileSize < state.lastFileOffset {
-            state = IncrementalParseState()
-        }
+        guard let fileSize = prepareIncrementalSource(
+            filePath: filePath,
+            fileHandle: fileHandle,
+            state: &state
+        ) else { return [] }
         if fileSize == state.lastFileOffset { return [] }
 
         let startOffset = state.lastFileOffset
@@ -1739,16 +1772,19 @@ actor ConversationParser {
         // only one incomplete JSONL row in memory and prefilter by the small set
         // of row types we actually render before asking JSONSerialization to
         // materialize an object graph.
-        let codexEventNeedle = Data("\"type\":\"event_msg\"".utf8)
-        let codexContextNeedle = Data("\"type\":\"turn_context\"".utf8)
+        // Match values, not a particular JSON whitespace convention. These
+        // cheap candidates still pass strict envelope/type checks below.
+        let codexEventNeedle = Data("\"event_msg\"".utf8)
+        let codexContextNeedle = Data("\"turn_context\"".utf8)
         let codexPayloadNeedles = [
-            Data("\"type\":\"user_message\"".utf8),
-            Data("\"type\":\"agent_message\"".utf8),
-            Data("\"type\":\"thread_settings_applied\"".utf8),
+            Data("\"user_message\"".utf8),
+            Data("\"agent_message\"".utf8),
+            Data("\"thread_settings_applied\"".utf8),
+            Data("\"UserMessage\"".utf8),
+            Data("\"AgentMessage\"".utf8),
         ]
         let codeBuddyMessageNeedles = [
-            Data("\"type\":\"message\"".utf8),
-            Data("\"type\": \"message\"".utf8),
+            Data("\"message\"".utf8),
         ]
 
         var newMessages: [ChatMessage] = []
@@ -1809,9 +1845,12 @@ actor ConversationParser {
                             state.nativeApprovalMode = mode
                         }
                         let parsed: (ChatRole, String, Date?)?
+                        var nativeItemID: String?
                         switch kind {
                         case .codex:
-                            parsed = Self.parseCodexNativeRow(row)
+                            let decoded = Self.parseCodexNativeRow(row)
+                            parsed = decoded?.message
+                            nativeItemID = decoded?.itemID
                         case .codeBuddy:
                             parsed = Self.parseCodeBuddyNativeRow(row)
                         }
@@ -1821,16 +1860,22 @@ actor ConversationParser {
                                 in: .whitespacesAndNewlines
                             )
                             if !cleaned.isEmpty {
-                                // The byte offset is stable across incremental
-                                // reads and unique for every native JSONL row.
-                                let message = ChatMessage(
-                                    id: "native-\(lineOffset)",
-                                    role: role,
-                                    timestamp: timestamp ?? Date(),
-                                    content: [.text(cleaned)]
-                                )
-                                state.messages.append(message)
-                                newMessages.append(message)
+                                // Completed UI items can be replayed. Dedupe by
+                                // identity, never by text: two turns may both
+                                // contain the user's same "continue" prompt.
+                                let messageID = nativeItemID.map {
+                                    "native-item-\($0)"
+                                } ?? "native-\(lineOffset)"
+                                if state.seenNativeMessageIDs.insert(messageID).inserted {
+                                    let message = ChatMessage(
+                                        id: messageID,
+                                        role: role,
+                                        timestamp: timestamp ?? Date(),
+                                        content: [.text(cleaned)]
+                                    )
+                                    state.messages.append(message)
+                                    newMessages.append(message)
+                                }
                             }
                         }
                     }
@@ -1853,18 +1898,152 @@ actor ConversationParser {
         }
 
         state.lastFileOffset = pendingOffset
+        refreshIncrementalSourceAnchor(
+            filePath: filePath,
+            fileHandle: fileHandle,
+            state: &state
+        )
         return newMessages
+    }
+
+    /// Validate an incremental cursor against the concrete file, not only the
+    /// session ID. Native agents can rotate or atomically replace a rollout,
+    /// and a synthetic bridge transcript can later give way to a native file.
+    /// Reusing the old byte offset in either case silently skips real messages.
+    private func prepareIncrementalSource(
+        filePath: String,
+        fileHandle: FileHandle,
+        state: inout IncrementalParseState
+    ) -> UInt64? {
+        guard let attributes = try? FileManager.default.attributesOfItem(
+            atPath: filePath
+        ),
+        let size = attributes[.size] as? NSNumber else {
+            return nil
+        }
+        let fileSize = size.uint64Value
+        let modificationDate = attributes[.modificationDate] as? Date
+        let deviceNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value
+        let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+
+        let hasCursor = state.sourceFilePath != nil || state.lastFileOffset > 0
+        let pathChanged = state.sourceFilePath.map { $0 != filePath }
+            ?? (state.lastFileOffset > 0)
+        let identityChanged = hasCursor && (
+            (state.sourceDeviceNumber != nil && deviceNumber != nil &&
+                state.sourceDeviceNumber != deviceNumber) ||
+            (state.sourceFileNumber != nil && fileNumber != nil &&
+                state.sourceFileNumber != fileNumber)
+        )
+        let sameSizeRewrite = hasCursor &&
+            fileSize == state.lastFileOffset &&
+            state.sourceModificationDate != modificationDate
+        var mustReset = pathChanged || identityChanged || sameSizeRewrite ||
+            fileSize < state.lastFileOffset
+
+        // A writer can truncate and regrow the same inode beyond the previous
+        // cursor before the next poll. Compare a small byte anchor to detect
+        // that race without rereading the rollout.
+        if !mustReset,
+           state.lastFileOffset > 0,
+           !state.sourceAnchor.isEmpty {
+            let anchorOffset = state.lastFileOffset -
+                UInt64(state.sourceAnchor.count)
+            do {
+                try fileHandle.seek(toOffset: anchorOffset)
+                let currentAnchor = try fileHandle.read(
+                    upToCount: state.sourceAnchor.count
+                )
+                if currentAnchor != state.sourceAnchor {
+                    mustReset = true
+                }
+            } catch {
+                mustReset = true
+            }
+        }
+
+        if mustReset {
+            state = IncrementalParseState()
+        }
+        state.sourceFilePath = filePath
+        state.sourceModificationDate = modificationDate
+        state.sourceDeviceNumber = deviceNumber
+        state.sourceFileNumber = fileNumber
+        return fileSize
+    }
+
+    private func refreshIncrementalSourceAnchor(
+        filePath: String,
+        fileHandle: FileHandle,
+        state: inout IncrementalParseState
+    ) {
+        let anchorCount = Int(min(state.lastFileOffset, 64))
+        if anchorCount > 0 {
+            do {
+                try fileHandle.seek(
+                    toOffset: state.lastFileOffset - UInt64(anchorCount)
+                )
+                state.sourceAnchor = try fileHandle.read(
+                    upToCount: anchorCount
+                ) ?? Data()
+            } catch {
+                state.sourceAnchor = Data()
+            }
+        } else {
+            state.sourceAnchor = Data()
+        }
+
+        if let attributes = try? FileManager.default.attributesOfItem(
+            atPath: filePath
+        ) {
+            state.sourceModificationDate =
+                attributes[.modificationDate] as? Date
+            state.sourceDeviceNumber =
+                (attributes[.systemNumber] as? NSNumber)?.uint64Value
+            state.sourceFileNumber =
+                (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+        }
+        state.sourceFilePath = filePath
     }
 
     private static func parseCodexNativeRow(
         _ row: [String: Any]
-    ) -> (ChatRole, String, Date?)? {
+    ) -> (message: (ChatRole, String, Date?), itemID: String?)? {
         guard row["type"] as? String == "event_msg",
               let payload = row["payload"] as? [String: Any],
               let type = payload["type"] as? String else {
             return nil
         }
 
+        let timestamp = (row["timestamp"] as? String).flatMap(parseISO8601)
+        if type == "item_completed" {
+            guard let item = payload["item"] as? [String: Any],
+                  let itemType = item["type"] as? String,
+                  let blocks = item["content"] as? [[String: Any]] else {
+                return nil
+            }
+            let role: ChatRole
+            switch itemType {
+            case "UserMessage": role = .user
+            case "AgentMessage": role = .assistant
+            default: return nil
+            }
+            if let phase = item["phase"] as? String,
+               phase != "commentary" && phase != "final_answer" {
+                return nil
+            }
+            let text = blocks.compactMap { block -> String? in
+                guard let kind = block["type"] as? String,
+                      kind == "text" || kind == "Text" else { return nil }
+                return block["text"] as? String
+            }.joined(separator: "\n")
+            let id = (item["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ((role, text, timestamp), id?.isEmpty == false ? id : nil)
+        }
+
+        // Keep legacy visible-message events. Raw response_item rows are model
+        // context, not the UI transcript: they may repeat completed items and
+        // contain injected instructions, tool output or encrypted content.
         let role: ChatRole
         switch type {
         case "user_message": role = .user
@@ -1872,9 +2051,12 @@ actor ConversationParser {
         default: return nil
         }
 
+        if let phase = payload["phase"] as? String,
+           phase != "commentary" && phase != "final_answer" {
+            return nil
+        }
         guard let message = payload["message"] as? String else { return nil }
-        let timestamp = (row["timestamp"] as? String).flatMap(parseISO8601)
-        return (role, message, timestamp)
+        return ((role, message, timestamp), nil)
     }
 
     private static func parseCodeBuddyNativeRow(
