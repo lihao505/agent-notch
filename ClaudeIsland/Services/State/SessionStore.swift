@@ -67,6 +67,14 @@ actor SessionStore {
     /// All sessions keyed by sessionId
     private var sessions: [String: SessionState] = [:]
 
+    /// Bounded, privacy-minimized reasons behind native lifecycle decisions.
+    /// This remains in memory until a future diagnostics UI exposes it.
+    private var lifecycleTraceEntries: [(
+        sessionId: String,
+        entry: LifecycleTraceEntry
+    )] = []
+    private static let lifecycleTraceCapacity = 500
+
     /// Pending file syncs (debounced)
     private var pendingSyncs: [String: Task<Void, Never>] = [:]
 
@@ -1564,6 +1572,7 @@ actor SessionStore {
         for observation in discoveredCodexTasks {
             if reconcileCodexLifecycle(
                 observation,
+                origin: .codexDiscovery,
                 now: now,
                 allowCreation: true
             ) {
@@ -1608,6 +1617,7 @@ actor SessionStore {
                     )
                     if reconcileCodexLifecycle(
                         observation,
+                        origin: .codexPolling,
                         now: now,
                         allowCreation: false
                     ) {
@@ -1672,158 +1682,119 @@ actor SessionStore {
     @discardableResult
     private func reconcileCodexLifecycle(
         _ observation: CodexTaskObservation,
+        origin: LifecycleObservationOrigin,
         now: Date,
         allowCreation: Bool
     ) -> Bool {
         let sessionId = observation.sessionId
+        let previous = sessions[sessionId].map(SessionLifecycleSnapshot.init)
+        let lifecycleObservation = SessionLifecycleObservation(
+            sessionId: sessionId,
+            cwd: observation.cwd,
+            source: .codex,
+            origin: origin,
+            evidence: LifecycleEvidence(
+                codexLifecycle: observation.lifecycle
+            ),
+            observedAt: observation.fileModifiedAt,
+            receivedAt: now
+        )
+        let transition = LifecycleReducer.reduce(
+            current: previous,
+            observation: lifecycleObservation,
+            allowCreation: allowCreation,
+            activeStaleInterval: codexActiveStaleInterval,
+            missingGracePeriod:
+                SessionRetentionPolicy.missingCodexGracePeriod
+        )
+        appendLifecycleTrace(
+            observation: lifecycleObservation,
+            previous: previous,
+            transition: transition
+        )
 
-        switch observation.lifecycle {
-        case .active(let turnStartedAt, let lastEvidenceAt):
-            let evidenceAt = lastEvidenceAt ??
-                turnStartedAt ??
-                observation.fileModifiedAt
+        switch transition.mutation {
+        case .create(let snapshot):
+            let projectName = URL(
+                fileURLWithPath: observation.cwd
+            ).lastPathComponent
+            let title = ConversationParser.codexThreadTitle(
+                sessionId: sessionId
+            )
+            sessions[sessionId] = SessionState(
+                sessionId: sessionId,
+                cwd: observation.cwd,
+                projectName: projectName,
+                source: snapshot.source,
+                phase: snapshot.phase,
+                conversationInfo: ConversationInfo(
+                    summary: title,
+                    lastMessage: nil,
+                    lastMessageRole: nil,
+                    lastToolName: nil,
+                    firstUserMessage: nil,
+                    lastUserMessageDate: nil
+                ),
+                lastActivity: snapshot.lastActivity,
+                createdAt: snapshot.createdAt,
+                lastHookEventAt: snapshot.lastHookEventAt,
+                lastCodexTurnStartedAt: snapshot.turnStartedAt,
+                completedAt: snapshot.completedAt
+            )
+            scheduleFileSync(
+                sessionId: sessionId,
+                cwd: observation.cwd
+            )
 
+        case .update(let snapshot):
             guard var session = sessions[sessionId] else {
-                guard allowCreation,
-                      now.timeIntervalSince(evidenceAt) <
-                        codexActiveStaleInterval else {
-                    return false
-                }
-                let projectName = URL(
-                    fileURLWithPath: observation.cwd
-                ).lastPathComponent
-                let title = ConversationParser.codexThreadTitle(
-                    sessionId: sessionId
-                )
-                sessions[sessionId] = SessionState(
-                    sessionId: sessionId,
-                    cwd: observation.cwd,
-                    projectName: projectName,
-                    source: .codex,
-                    phase: .processing,
-                    conversationInfo: ConversationInfo(
-                        summary: title,
-                        lastMessage: nil,
-                        lastMessageRole: nil,
-                        lastToolName: nil,
-                        firstUserMessage: nil,
-                        lastUserMessageDate: nil
-                    ),
-                    lastActivity: evidenceAt,
-                    createdAt: turnStartedAt ?? evidenceAt,
-                    lastCodexTurnStartedAt: turnStartedAt
-                )
-                scheduleFileSync(
-                    sessionId: sessionId,
-                    cwd: observation.cwd
-                )
-                Self.logger.info(
-                    "Discovered active Codex turn \(sessionId.prefix(8), privacy: .public) from native rollout"
-                )
-                return true
+                return false
             }
-
-            let newestEvidenceAt = max(
-                evidenceAt,
-                session.lastHookEventAt ?? .distantPast
-            )
-            let isStale = now.timeIntervalSince(newestEvidenceAt) >=
-                codexActiveStaleInterval
-            if !session.phase.isWaitingForApproval && isStale {
-                guard session.completedAt == nil ||
-                        session.phase != .waitingForInput else {
-                    return false
-                }
-                session.phase = .waitingForInput
-                session.completedAt = now
-                finalizeDanglingTools(in: &session)
-                sessions[sessionId] = session
-                return true
-            }
-
-            if let completedAt = session.completedAt {
-                // Token counts and commentary from the completed turn can be
-                // newer than Stop. Only a genuinely newer task_started (or a
-                // safe fallback boundary) may revive the card.
-                guard let turnStartedAt,
-                      turnStartedAt > completedAt else {
-                    return false
-                }
-            }
-
-            let previousPhase = session.phase
             let previousCompletion = session.completedAt
-            let previousActivity = session.lastActivity
-            session.source = .codex
-            session.lastCodexTurnStartedAt = turnStartedAt ??
-                session.lastCodexTurnStartedAt
-            session.lastActivity = max(session.lastActivity, evidenceAt)
-            if !session.phase.isWaitingForApproval &&
-               !session.phase.isActive {
-                session.phase = .processing
-            }
-            if !session.phase.isWaitingForApproval {
-                session.completedAt = nil
+            snapshot.applying(to: &session)
+            if session.phase == .waitingForInput,
+               previousCompletion != session.completedAt {
+                finalizeDanglingTools(in: &session)
             }
             sessions[sessionId] = session
-            return previousPhase != session.phase ||
-                previousCompletion != session.completedAt ||
-                previousActivity != session.lastActivity
 
-        case .completed(let completedAt):
-            guard var session = sessions[sessionId],
-                  !session.phase.isWaitingForApproval else {
-                return false
-            }
-            let completionEvidenceAt = completedAt ??
-                observation.fileModifiedAt
-            if session.completedAt == nil,
-               let lastHookEventAt = session.lastHookEventAt,
-               lastHookEventAt > completionEvidenceAt {
-                return false
-            }
-            if let turnStartedAt = session.lastCodexTurnStartedAt,
-               turnStartedAt > completionEvidenceAt {
-                return false
-            }
-            guard session.completedAt == nil ||
-                    session.phase != .waitingForInput else {
-                return false
-            }
-            session.phase = .waitingForInput
-            session.completedAt = completionEvidenceAt
-            session.lastActivity = max(
-                session.lastActivity,
-                completionEvidenceAt
-            )
-            finalizeDanglingTools(in: &session)
-            sessions[sessionId] = session
-            return true
-
-        case .missing:
-            guard sessions[sessionId] != nil,
-                  let session = sessions[sessionId],
-                  now.timeIntervalSince(session.lastActivity) >=
-                    SessionRetentionPolicy.missingCodexGracePeriod else {
-                return false
-            }
+        case .remove:
             sessions.removeValue(forKey: sessionId)
             cancelPendingSync(sessionId: sessionId)
-            return true
 
-        case .unknown:
-            guard var session = sessions[sessionId],
-                  !session.phase.isWaitingForApproval,
-                  session.phase.isActive,
-                  now.timeIntervalSince(session.lastActivity) >=
-                    codexActiveStaleInterval else {
-                return false
-            }
-            session.phase = .waitingForInput
-            session.completedAt = now
-            finalizeDanglingTools(in: &session)
-            sessions[sessionId] = session
-            return true
+        case .none:
+            break
+        }
+
+        if transition.didMutate {
+            Self.logger.info(
+                "Codex lifecycle \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
+            )
+        } else if transition.reason != .alreadyCurrent {
+            Self.logger.debug(
+                "Ignored Codex lifecycle: \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
+            )
+        }
+        return transition.didMutate
+    }
+
+    private func appendLifecycleTrace(
+        observation: SessionLifecycleObservation,
+        previous: SessionLifecycleSnapshot?,
+        transition: LifecycleTransition
+    ) {
+        lifecycleTraceEntries.append((
+            sessionId: observation.sessionId,
+            entry: LifecycleTraceEntry(
+                observation: observation,
+                previous: previous,
+                transition: transition
+            )
+        ))
+        if lifecycleTraceEntries.count > Self.lifecycleTraceCapacity {
+            lifecycleTraceEntries.removeFirst(
+                lifecycleTraceEntries.count - Self.lifecycleTraceCapacity
+            )
         }
     }
 
@@ -2304,5 +2275,13 @@ actor SessionStore {
     /// Get all current sessions
     func allSessions() -> [SessionState] {
         Array(sessions.values)
+    }
+
+    /// Bounded native lifecycle evidence for diagnostics and regression tests.
+    /// Entries contain no transcript text, tool input, or filesystem path.
+    func lifecycleTrace(for sessionId: String) -> [LifecycleTraceEntry] {
+        lifecycleTraceEntries.compactMap {
+            $0.sessionId == sessionId ? $0.entry : nil
+        }
     }
 }

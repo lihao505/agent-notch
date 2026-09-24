@@ -24,6 +24,7 @@ required_files=(
     scripts/tests/test_live_question_verifier.py
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
+    ClaudeIsland/Services/State/LifecycleReducer.swift
     ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
     ClaudeIsland/Services/Shared/NotchSilenceRuleStore.swift
     ClaudeIsland/Services/Shared/NotchQuietSceneMonitor.swift
@@ -31,6 +32,7 @@ required_files=(
     ClaudeIslandTests/ProcessExecutorTests.swift
     ClaudeIslandTests/AgentTransportTests.swift
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
+    ClaudeIslandTests/LifecycleReducerTests.swift
     ClaudeIslandTests/PermissionRoutingTests.swift
     ClaudeIslandTests/ConversationParserIndexTests.swift
     ClaudeIslandTests/CodexNativeConversationTests.swift
