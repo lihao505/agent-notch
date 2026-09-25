@@ -14,6 +14,7 @@ nonisolated enum LifecycleObservationOrigin: String, Equatable, Sendable {
     case codexDiscovery
     case codexPolling
     case hook
+    case transcript
 }
 
 /// Redacted hook intent retained by the decision trace. The concrete target
@@ -149,6 +150,7 @@ nonisolated enum LifecycleTransitionReason: String, Equatable, Sendable {
     case sourceMissingBeyondGrace
     case creationNotAllowed
     case staleDiscovery
+    case activeOlderThanHook
     case activeWithoutNewGeneration
     case completionOlderThanHook
     case completionOlderThanTurn
@@ -201,6 +203,7 @@ nonisolated struct LifecycleTransition: Equatable, Sendable {
         switch reason {
         case .creationNotAllowed,
              .staleDiscovery,
+             .activeOlderThanHook,
              .activeWithoutNewGeneration,
              .completionOlderThanHook,
              .completionOlderThanTurn,
@@ -365,6 +368,14 @@ nonisolated enum LifecycleReducer {
 
         let interactionHasPriority = next.phase.isWaitingForApproval
 
+        if let lastHookEventAt = next.lastHookEventAt,
+           evidenceAt <= lastHookEventAt {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .activeOlderThanHook
+            )
+        }
+
         let newestEvidenceAt = max(
             evidenceAt,
             next.lastHookEventAt ?? .distantPast
@@ -397,7 +408,12 @@ nonisolated enum LifecycleReducer {
 
         let previous = next
         next.source = observation.source
-        next.turnStartedAt = turnStartedAt ?? next.turnStartedAt
+        if let turnStartedAt {
+            next.turnStartedAt = max(
+                next.turnStartedAt ?? .distantPast,
+                turnStartedAt
+            )
+        }
         next.lastActivity = max(next.lastActivity, evidenceAt)
         if !interactionHasPriority, !next.phase.isActive {
             next.phase = .processing

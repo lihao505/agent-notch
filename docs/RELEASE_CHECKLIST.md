@@ -154,6 +154,17 @@ Codex 任务执行中途启动／重启 App 时，刘海能发现 1 个任务并
 这些自动化用例记为真实跨进程端到端通过。Transcript fallback、本地交互回调以及
 Claude／CodeBuddy 原生发现仍有直接状态写入，后续继续迁入统一内核。
 
+2026-09-25 状态内核第三阶段：Claude／CodeBuddy 的 Transcript fallback 不再直接写入
+`phase` 和 `completedAt`。用户消息、运行工具与最终助手文本会携带原始消息时间进入
+`LifecycleReducer`，异步解析完成后若发现更新的 Hook、Stop、审批结果或 socket 失败边界，
+旧 transcript 只更新呈现内容，不再错误恢复“工作中”、提前结束新回合或清理新工具。
+原生 active 证据也不再回退已知轮次开始时间。新增 6 项 reducer／SessionStore 时序测试，
+全套 201 项 Swift 测试、79 项 Bridge 测试及 5 项 verifier 测试通过，Release 无签名构建
+通过。安装 Release 后，构建与 `/Applications/Agent Notch.app` 主二进制 SHA-256 一致；
+在本条 Codex 任务执行中途重启 App，原生辅助功能树仍确认 1 个任务、状态“工作中”和
+当前活动摘要。真实 Claude／CodeBuddy 的乱序跨进程回合本轮未主动注入，自动化时序矩阵
+不替代该端到端验收；本地交互回调、interrupt 和进程退出仍待完全迁入统一 reducer。
+
 ## 可选：签名二进制发行
 
 以下项目不是公开源码仓库的前置条件；只有未来提供免 Gatekeeper 警告的官方安装包

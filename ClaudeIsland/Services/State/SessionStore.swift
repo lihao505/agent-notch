@@ -1480,7 +1480,10 @@ actor SessionStore {
 
     /// Transcript updates are a fallback for a missed socket hook. A new user
     /// row or running tool means work is active; a final assistant text with no
-    /// running tool means the turn has completed.
+    /// running tool means the turn has completed. The transcript timestamp is
+    /// evidence, not permission to write phase directly: reducer arbitration
+    /// prevents an asynchronous parse from crossing a newer hook or local
+    /// interaction boundary.
     private func reconcilePhaseFromTranscript(
         payload: FileUpdatePayload,
         session: inout SessionState
@@ -1500,42 +1503,98 @@ actor SessionStore {
             return false
         } ?? false
 
-        // A text-only final assistant turn is a terminal boundary. Close any
-        // stale tool placeholders before looking at the historical tool list;
-        // otherwise a missed result from an old turn wins forever.
+        let latestRunningToolAt = session.chatItems.compactMap { item -> Date? in
+            guard case .toolCall(let tool) = item.type else {
+                return nil
+            }
+            guard tool.status == .running ||
+                    tool.status == .waitingForApproval else {
+                return nil
+            }
+            return item.timestamp
+        }.max()
+
+        let evidence: LifecycleEvidence
+        let observedAt: Date
         if let lastMessage,
            lastMessage.role == .assistant,
            !lastAssistantStartsTool,
            !lastMessage.textContent.trimmingCharacters(
                 in: .whitespacesAndNewlines
            ).isEmpty {
-            finalizeDanglingTools(in: &session)
-            session.phase = .waitingForInput
-            session.completedAt = session.completedAt ?? Date()
+            evidence = .completed(lastMessage.timestamp)
+            observedAt = lastMessage.timestamp
+        } else if let latestRunningToolAt {
+            let latestUserMessageAt = payload.messages
+                .filter { $0.role == .user }
+                .map(\.timestamp)
+                .max()
+            evidence = .active(
+                turnStartedAt: latestUserMessageAt,
+                lastEvidenceAt: latestRunningToolAt
+            )
+            observedAt = latestRunningToolAt
+        } else if let lastMessage, lastMessage.role == .user {
+            evidence = .active(
+                turnStartedAt: lastMessage.timestamp,
+                lastEvidenceAt: lastMessage.timestamp
+            )
+            observedAt = lastMessage.timestamp
+        } else {
             return
         }
 
-        let hasRunningTool = session.chatItems.contains { item in
-            guard case .toolCall(let tool) = item.type else {
-                return false
+        let receivedAt = Date()
+        let previous = SessionLifecycleSnapshot(session: session)
+        let observation = SessionLifecycleObservation(
+            sessionId: payload.sessionId,
+            cwd: payload.cwd,
+            source: session.source,
+            origin: .transcript,
+            evidence: evidence,
+            observedAt: observedAt,
+            receivedAt: receivedAt
+        )
+        let transition = LifecycleReducer.reduce(
+            current: previous,
+            observation: observation,
+            allowCreation: false,
+            activeStaleInterval: codexActiveStaleInterval,
+            missingGracePeriod:
+                SessionRetentionPolicy.missingCodexGracePeriod
+        )
+        appendLifecycleTrace(
+            observation: observation,
+            previous: previous,
+            transition: transition
+        )
+
+        switch transition.mutation {
+        case .create(let snapshot), .update(let snapshot):
+            snapshot.applying(to: &session)
+            if snapshot.phase == .waitingForInput,
+               snapshot.completedAt != previous.completedAt {
+                // A text-only final assistant turn is a terminal boundary.
+                // Close stale tool placeholders only after the reducer accepts
+                // the evidence; rejected old transcripts remain presentation
+                // data and cannot tear down newer running work.
+                finalizeDanglingTools(in: &session)
             }
-            return tool.status == .running ||
-                tool.status == .waitingForApproval
+        case .remove:
+            // Active/completed transcript evidence never removes a session.
+            break
+        case .none:
+            break
         }
 
-        if hasRunningTool {
-            session.phase = .processing
-            session.completedAt = nil
-            return
-        }
-
-        guard let lastMessage else {
-            return
-        }
-
-        if lastMessage.role == .user {
-            session.phase = .processing
-            session.completedAt = nil
+        if transition.didMutate {
+            Self.logger.info(
+                "Transcript lifecycle \(transition.reason.rawValue, privacy: .public) for \(payload.sessionId.prefix(8), privacy: .public)"
+            )
+        } else if transition.reason != .alreadyCurrent {
+            Self.logger.debug(
+                "Ignored transcript lifecycle: \(transition.reason.rawValue, privacy: .public) for \(payload.sessionId.prefix(8), privacy: .public)"
+            )
         }
     }
 

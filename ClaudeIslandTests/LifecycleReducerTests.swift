@@ -504,4 +504,55 @@ final class LifecycleReducerTests: XCTestCase {
         XCTAssertEqual(trace.nextPhase, .waitingForApproval)
         XCTAssertFalse(String(reflecting: trace).contains(secret))
     }
+
+    func testOlderActiveEvidenceCannotRegressTurnBoundary() throws {
+        let currentTurnAt = Date(timeIntervalSince1970: 16_000)
+        let evidenceAt = currentTurnAt.addingTimeInterval(2)
+        let transition = reduce(
+            current: snapshot(
+                lastActivity: currentTurnAt,
+                turnStartedAt: currentTurnAt
+            ),
+            observation: observation(
+                .active(
+                    turnStartedAt: currentTurnAt.addingTimeInterval(-10),
+                    lastEvidenceAt: evidenceAt
+                ),
+                observedAt: evidenceAt,
+                receivedAt: evidenceAt,
+                origin: .transcript
+            )
+        )
+
+        guard case .update(let next) = transition.mutation else {
+            return XCTFail("Expected newer activity metadata to advance")
+        }
+        XCTAssertEqual(next.lastActivity, evidenceAt)
+        XCTAssertEqual(next.turnStartedAt, currentTurnAt)
+    }
+
+    func testActiveEvidenceCannotCrossNewerLocalBoundary() {
+        let evidenceAt = Date(timeIntervalSince1970: 17_000)
+        let localBoundaryAt = evidenceAt.addingTimeInterval(1)
+        let transition = reduce(
+            current: snapshot(
+                phase: .idle,
+                lastActivity: localBoundaryAt,
+                lastHookEventAt: localBoundaryAt
+            ),
+            observation: observation(
+                .active(
+                    turnStartedAt: evidenceAt,
+                    lastEvidenceAt: evidenceAt
+                ),
+                observedAt: evidenceAt,
+                receivedAt: localBoundaryAt,
+                origin: .transcript
+            )
+        )
+
+        XCTAssertEqual(transition.mutation, .none)
+        XCTAssertEqual(transition.reason, .activeOlderThanHook)
+        XCTAssertFalse(transition.acceptsObservation)
+    }
 }

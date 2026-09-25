@@ -10,7 +10,8 @@ final class SessionStoreLifecycleTests: XCTestCase {
         tool: String? = nil,
         toolUseId: String? = nil,
         toolInput: [String: AnyCodable]? = nil,
-        notificationType: String? = nil
+        notificationType: String? = nil,
+        source: String? = "codex"
     ) -> HookEvent {
         HookEvent(
             sessionId: sessionId,
@@ -18,7 +19,7 @@ final class SessionStoreLifecycleTests: XCTestCase {
             event: event,
             status: status,
             observedAt: observedAt.timeIntervalSince1970,
-            source: "codex",
+            source: source,
             pid: nil,
             tty: nil,
             tool: tool,
@@ -26,6 +27,20 @@ final class SessionStoreLifecycleTests: XCTestCase {
             toolUseId: toolUseId,
             notificationType: notificationType,
             message: nil
+        )
+    }
+
+    private func message(
+        id: String,
+        role: ChatRole,
+        timestamp: Date,
+        text: String
+    ) -> ChatMessage {
+        ChatMessage(
+            id: id,
+            role: role,
+            timestamp: timestamp,
+            content: [.text(text)]
         )
     }
 
@@ -507,5 +522,198 @@ final class SessionStoreLifecycleTests: XCTestCase {
             session.pendingInteractions.toolUseIds,
             ["compact-tool"]
         )
+    }
+
+    func testStaleTranscriptUserCannotReviveHookCompletion() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-transcript-user-\(UUID().uuidString)"
+        let now = Date()
+        let startedAt = now.addingTimeInterval(-3)
+        let staleUserAt = now.addingTimeInterval(-2)
+        let completedAt = now.addingTimeInterval(-1)
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: startedAt,
+            source: "claude"
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "Stop",
+            status: "waiting_for_input",
+            observedAt: completedAt,
+            source: "claude"
+        )))
+        await store.process(.fileUpdated(FileUpdatePayload(
+            sessionId: sessionId,
+            cwd: "/tmp/agent-notch-state-tests",
+            messages: [message(
+                id: "stale-user",
+                role: .user,
+                timestamp: staleUserAt,
+                text: "old prompt"
+            )],
+            isIncremental: true,
+            completedToolIds: [],
+            toolResults: [:],
+            structuredResults: [:]
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .waitingForInput)
+        XCTAssertEqual(
+            try XCTUnwrap(session.completedAt).timeIntervalSince1970,
+            completedAt.timeIntervalSince1970,
+            accuracy: 0.001
+        )
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.origin, .transcript)
+        XCTAssertEqual(trace.last?.reason, .activeOlderThanHook)
+    }
+
+    func testFreshTranscriptUserStartsNextGeneration() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "fresh-transcript-user-\(UUID().uuidString)"
+        let now = Date()
+        let startedAt = now.addingTimeInterval(-3)
+        let completedAt = now.addingTimeInterval(-2)
+        let resumedAt = now.addingTimeInterval(-1)
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: startedAt,
+            source: "claude"
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "Stop",
+            status: "waiting_for_input",
+            observedAt: completedAt,
+            source: "claude"
+        )))
+        await store.process(.fileUpdated(FileUpdatePayload(
+            sessionId: sessionId,
+            cwd: "/tmp/agent-notch-state-tests",
+            messages: [message(
+                id: "fresh-user",
+                role: .user,
+                timestamp: resumedAt,
+                text: "new prompt"
+            )],
+            isIncremental: true,
+            completedToolIds: [],
+            toolResults: [:],
+            structuredResults: [:]
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertNil(session.completedAt)
+        XCTAssertEqual(session.lastCodexTurnStartedAt, resumedAt)
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.origin, .transcript)
+        XCTAssertEqual(trace.last?.reason, .newerTurnStarted)
+    }
+
+    func testStaleTranscriptAssistantCannotCompleteNewerHookTurn() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-transcript-assistant-\(UUID().uuidString)"
+        let now = Date()
+        let staleAssistantAt = now.addingTimeInterval(-2)
+        let hookAt = now.addingTimeInterval(-1)
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: hookAt,
+            source: "claude"
+        )))
+        await store.process(.fileUpdated(FileUpdatePayload(
+            sessionId: sessionId,
+            cwd: "/tmp/agent-notch-state-tests",
+            messages: [message(
+                id: "stale-assistant",
+                role: .assistant,
+                timestamp: staleAssistantAt,
+                text: "old final response"
+            )],
+            isIncremental: true,
+            completedToolIds: [],
+            toolResults: [:],
+            structuredResults: [:]
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertNil(session.completedAt)
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.origin, .transcript)
+        XCTAssertEqual(trace.last?.reason, .completionOlderThanHook)
+    }
+
+    func testStaleTranscriptCannotCrossNewerSocketFailureBoundary() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-transcript-local-\(UUID().uuidString)"
+        let now = Date()
+        let requestAt = now.addingTimeInterval(-3)
+        let staleUserAt = now.addingTimeInterval(-2)
+        let failureAt = now.addingTimeInterval(-1)
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: requestAt,
+            tool: "Bash",
+            toolUseId: "failed-tool",
+            source: "claude"
+        )))
+        await store.process(.permissionSocketFailed(
+            sessionId: sessionId,
+            toolUseId: "failed-tool",
+            resolvedAt: failureAt
+        ))
+        await store.process(.fileUpdated(FileUpdatePayload(
+            sessionId: sessionId,
+            cwd: "/tmp/agent-notch-state-tests",
+            messages: [message(
+                id: "stale-local-user",
+                role: .user,
+                timestamp: staleUserAt,
+                text: "old prompt"
+            )],
+            isIncremental: true,
+            completedToolIds: [],
+            toolResults: [:],
+            structuredResults: [:]
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .idle)
+        XCTAssertNil(session.completedAt)
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.origin, .transcript)
+        XCTAssertEqual(trace.last?.reason, .activeOlderThanHook)
     }
 }
