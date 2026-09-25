@@ -17,7 +17,8 @@ import os.log
 actor SessionStore {
     static let shared = SessionStore(
         persistenceEnabled: true,
-        fileSyncEnabled: true
+        fileSyncEnabled: true,
+        externalLifecycleEffectsEnabled: true
     )
 
     /// Logger for session store (nonisolated static for cross-context access)
@@ -110,6 +111,7 @@ actor SessionStore {
     private var lastCodexDiscoverySweepAt: Date?
     private let persistenceEnabled: Bool
     private let fileSyncEnabled: Bool
+    private let externalLifecycleEffectsEnabled: Bool
 
     // MARK: - Published State (for UI)
 
@@ -125,9 +127,14 @@ actor SessionStore {
 
     /// Dependency switches keep reducer tests isolated from the user's live
     /// session files while production continues using the shared instance.
-    init(persistenceEnabled: Bool, fileSyncEnabled: Bool) {
+    init(
+        persistenceEnabled: Bool,
+        fileSyncEnabled: Bool,
+        externalLifecycleEffectsEnabled: Bool = false
+    ) {
         self.persistenceEnabled = persistenceEnabled
         self.fileSyncEnabled = fileSyncEnabled
+        self.externalLifecycleEffectsEnabled = externalLifecycleEffectsEnabled
     }
 
     // MARK: - Event Processing
@@ -172,7 +179,7 @@ actor SessionStore {
             )
 
         case .processExited(let sessionId, let pid, let observedAt):
-            processProcessExit(
+            await processProcessExit(
                 sessionId: sessionId,
                 pid: pid,
                 observedAt: observedAt
@@ -241,6 +248,7 @@ actor SessionStore {
         ) {
             sessions.removeValue(forKey: sessionId)
             cancelPendingSync(sessionId: sessionId)
+            await cleanupExternalLifecycle(sessionId: sessionId)
             return
         }
 
@@ -310,6 +318,7 @@ actor SessionStore {
             case .remove:
                 sessions.removeValue(forKey: sessionId)
                 cancelPendingSync(sessionId: sessionId)
+                await cleanupExternalLifecycle(sessionId: sessionId)
                 Self.logger.info(
                     "Hook lifecycle \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
                 )
@@ -378,6 +387,7 @@ actor SessionStore {
             finalizeDanglingTools(in: &session)
             sessions[sessionId] = session
             cancelPendingSync(sessionId: sessionId)
+            await cleanupExternalLifecycle(sessionId: sessionId)
             return
         }
 
@@ -385,8 +395,33 @@ actor SessionStore {
         // older PreToolUse must never create fresh running work after a newer
         // Stop. Transcript reconciliation can recover its historical row
         // without making the completed card look active again.
-        let mayStartTrackedWork = shouldApplyLifecycle || event.event != "PreToolUse"
-        if mayStartTrackedWork {
+        let isExactPendingCompletion = (
+            event.event == "PostToolUse" ||
+            event.event == "PostToolUseFailure" ||
+            event.event == "PermissionDenied"
+        ) && event.toolUseId.map {
+            session.pendingInteractions.contains(toolUseId: $0)
+        } == true
+        var didAcceptExactPendingCompletion = !isExactPendingCompletion
+        if shouldApplyLifecycle,
+           isExactPendingCompletion,
+           let toolUseId = event.toolUseId,
+           let resolution = pendingInteractionResolution(
+                toolUseId: toolUseId,
+                fallbackPhase: .processing,
+                session: session
+           ) {
+            didAcceptExactPendingCompletion = applyInteractionResolution(
+                .hookCompleted,
+                origin: .hook,
+                resolution: resolution,
+                observedAt: observedAt,
+                session: &session
+            )
+        }
+        let mayStartTrackedWork = shouldApplyLifecycle ||
+            (event.event != "PreToolUse" && !isExactPendingCompletion)
+        if mayStartTrackedWork && didAcceptExactPendingCompletion {
             processToolTracking(event: event, session: &session)
             processSubagentTracking(event: event, session: &session)
         }
@@ -400,23 +435,6 @@ actor SessionStore {
                     observedAt: observedAt,
                     session: &session
                 )
-            } else if (event.event == "PostToolUse" ||
-                        event.event == "PostToolUseFailure" ||
-                        event.event == "PermissionDenied"),
-                      let toolUseId = event.toolUseId {
-                if let resolution = pendingInteractionResolution(
-                    toolUseId: toolUseId,
-                    fallbackPhase: .processing,
-                    session: session
-                ) {
-                    applyInteractionResolution(
-                        .hookCompleted,
-                        origin: .hook,
-                        resolution: resolution,
-                        observedAt: observedAt,
-                        session: &session
-                    )
-                }
             }
         }
 
@@ -449,6 +467,29 @@ actor SessionStore {
         }
 
         sessions[sessionId] = session
+
+        if shouldApplyLifecycle && isCompletionSignal {
+            await cleanupExternalLifecycle(sessionId: sessionId)
+        } else if shouldApplyLifecycle,
+                  newPhase == .processing,
+                  session.source == .claude {
+            await startInterruptWatcher(
+                sessionId: sessionId,
+                cwd: session.cwd
+            )
+        }
+
+        if shouldApplyLifecycle,
+           didAcceptExactPendingCompletion,
+           (event.event == "PostToolUse" ||
+            event.event == "PostToolUseFailure" ||
+            event.event == "PermissionDenied"),
+           let toolUseId = event.toolUseId {
+            await cancelPendingPermission(
+                sessionId: sessionId,
+                toolUseId: toolUseId
+            )
+        }
 
         if fileSyncEnabled && event.shouldSyncFile {
             scheduleFileSync(sessionId: sessionId, cwd: event.cwd)
@@ -792,21 +833,20 @@ actor SessionStore {
             return
         }
 
-        // Update tool status in chat history first
-        updateToolStatus(in: &session, toolId: toolUseId, status: .running)
-
         guard let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
             session: session
         ) else { return }
-        applyInteractionResolution(
+        guard applyInteractionResolution(
             .approved,
             origin: .localInteraction,
             resolution: resolution,
             observedAt: resolvedAt,
             session: &session
-        )
+        ) else { return }
+
+        updateToolStatus(in: &session, toolId: toolUseId, status: .running)
 
         sessions[sessionId] = session
     }
@@ -817,6 +857,24 @@ actor SessionStore {
     /// This is the authoritative handler for tool completions - ensures consistent state updates
     private func processToolCompleted(sessionId: String, toolUseId: String, result: ToolCompletionResult) async {
         guard var session = sessions[sessionId] else { return }
+
+        if let resolution = pendingInteractionResolution(
+            toolUseId: toolUseId,
+            fallbackPhase: .processing,
+            session: session
+        ) {
+            guard let observedAt = result.observedAt,
+                  applyInteractionResolution(
+                    .transcriptCompleted,
+                    origin: .transcript,
+                    resolution: resolution,
+                    observedAt: observedAt,
+                    session: &session
+                  ) else {
+                sessions[sessionId] = session
+                return
+            }
+        }
 
         // Check if this tool is already completed (avoid duplicate processing)
         let isAlreadyCompleted: Bool
@@ -849,24 +907,6 @@ actor SessionStore {
             }
         }
 
-        // A transcript row without a source timestamp is presentation data,
-        // not safe lifecycle evidence. It may finish the card, but it cannot
-        // dismiss a newer approval request.
-        if let observedAt = result.observedAt,
-           let resolution = pendingInteractionResolution(
-                toolUseId: toolUseId,
-                fallbackPhase: .processing,
-                session: session
-           ) {
-            applyInteractionResolution(
-                .transcriptCompleted,
-                origin: .transcript,
-                resolution: resolution,
-                observedAt: observedAt,
-                session: &session
-            )
-        }
-
         sessions[sessionId] = session
     }
 
@@ -881,21 +921,20 @@ actor SessionStore {
             return
         }
 
-        // Update tool status in chat history first
-        updateToolStatus(in: &session, toolId: toolUseId, status: .error)
-
         guard let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
             session: session
         ) else { return }
-        applyInteractionResolution(
+        guard applyInteractionResolution(
             .denied,
             origin: .localInteraction,
             resolution: resolution,
             observedAt: resolvedAt,
             session: &session
-        )
+        ) else { return }
+
+        updateToolStatus(in: &session, toolId: toolUseId, status: .error)
 
         sessions[sessionId] = session
     }
@@ -910,21 +949,20 @@ actor SessionStore {
             return
         }
 
-        // Mark the failed tool's status as error
-        updateToolStatus(in: &session, toolId: toolUseId, status: .error)
-
         guard let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
             fallbackPhase: .idle,
             session: session
         ) else { return }
-        applyInteractionResolution(
+        guard applyInteractionResolution(
             .deliveryFailed,
             origin: .localInteraction,
             resolution: resolution,
             observedAt: resolvedAt,
             session: &session
-        )
+        ) else { return }
+
+        updateToolStatus(in: &session, toolId: toolUseId, status: .error)
 
         sessions[sessionId] = session
     }
@@ -1416,13 +1454,14 @@ actor SessionStore {
         snapshot.applying(to: &session)
         finalizeDanglingTools(in: &session)
         sessions[sessionId] = session
+        await cleanupExternalLifecycle(sessionId: sessionId)
     }
 
     private func processProcessExit(
         sessionId: String,
         pid: Int,
         observedAt: Date
-    ) {
+    ) async {
         guard var session = sessions[sessionId], session.pid == pid else {
             return
         }
@@ -1457,6 +1496,7 @@ actor SessionStore {
         finalizeDanglingTools(in: &session)
         sessions[sessionId] = session
         cancelPendingSync(sessionId: sessionId)
+        await cleanupExternalLifecycle(sessionId: sessionId)
     }
 
     // MARK: - Clear Processing
@@ -1479,6 +1519,46 @@ actor SessionStore {
     private func processSessionEnd(sessionId: String) async {
         sessions.removeValue(forKey: sessionId)
         cancelPendingSync(sessionId: sessionId)
+        await cleanupExternalLifecycle(sessionId: sessionId)
+    }
+
+    // External listeners and reply sockets are lifecycle resources. They may
+    // only be changed after the same reducer decision that updates the card;
+    // otherwise a delayed row can tear down a newer active turn.
+    private func cleanupExternalLifecycle(sessionId: String) async {
+        guard externalLifecycleEffectsEnabled else { return }
+        await MainActor.run {
+            HookSocketServer.shared.cancelPendingPermissions(
+                sessionId: sessionId
+            )
+            InterruptWatcherManager.shared.stopWatching(sessionId: sessionId)
+        }
+    }
+
+    private func startInterruptWatcher(
+        sessionId: String,
+        cwd: String
+    ) async {
+        guard externalLifecycleEffectsEnabled else { return }
+        await MainActor.run {
+            InterruptWatcherManager.shared.startWatching(
+                sessionId: sessionId,
+                cwd: cwd
+            )
+        }
+    }
+
+    private func cancelPendingPermission(
+        sessionId: String,
+        toolUseId: String
+    ) async {
+        guard externalLifecycleEffectsEnabled else { return }
+        await MainActor.run {
+            HookSocketServer.shared.cancelPendingPermission(
+                sessionId: sessionId,
+                toolUseId: toolUseId
+            )
+        }
     }
 
     // MARK: - History Loading
@@ -1865,7 +1945,7 @@ actor SessionStore {
                 let isRunning = isProcessRunning(pid: pid)
                 if !isRunning {
                     Self.logger.info("Process \(pid) no longer running, ending session \(sessionId.prefix(8))")
-                    processProcessExit(
+                    await processProcessExit(
                         sessionId: sessionId,
                         pid: pid,
                         observedAt: now

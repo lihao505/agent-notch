@@ -738,4 +738,53 @@ final class LifecycleReducerTests: XCTestCase {
 
         XCTAssertEqual(observedAt, detectedAt)
     }
+
+    func testInterruptWatcherAcceptsWhitespaceAndReorderedJSON() throws {
+        let detectedAt = Date(timeIntervalSince1970: 1_700_000_100)
+        let line = """
+        { "message" : { "content" : "[Request interrupted by user]" }, "timestamp" : "2023-11-14T22:13:20.000Z", "type" : "user" }
+        """
+
+        let observedAt = try XCTUnwrap(
+            JSONLInterruptWatcher.interruptObservedAt(
+                in: line,
+                detectedAt: detectedAt
+            )
+        )
+        XCTAssertEqual(
+            observedAt.timeIntervalSince1970,
+            1_700_000_000,
+            accuracy: 0.001
+        )
+    }
+
+    func testInterruptWatcherRejectsJSONLookingSubstringInPlainText() {
+        let line = #"prefix {\"type\":\"user\",\"interrupted\":true} suffix"#
+        XCTAssertNil(JSONLInterruptWatcher.interruptObservedAt(
+            in: line,
+            detectedAt: Date()
+        ))
+    }
+
+    func testJSONLLineBufferPreservesPartialUTF8Record() throws {
+        let line = #"{ "type": "user", "message": "用户中断" }"#
+        let bytes = try XCTUnwrap(line.data(using: .utf8))
+        let split = bytes.count - 2
+        var buffer = JSONLLineBuffer()
+
+        XCTAssertTrue(buffer.append(Data(bytes[..<split])).isEmpty)
+        var remainder = Data(bytes[split...])
+        remainder.append(0x0A)
+        XCTAssertEqual(buffer.append(remainder), [line])
+    }
+
+    func testJSONLLineBufferResetsAfterTruncationBoundary() {
+        var buffer = JSONLLineBuffer()
+        XCTAssertTrue(buffer.append(Data("partial".utf8)).isEmpty)
+        buffer.reset()
+        XCTAssertEqual(
+            buffer.append(Data("{\"fresh\":true}\n".utf8)),
+            ["{\"fresh\":true}"]
+        )
+    }
 }

@@ -60,35 +60,6 @@ class ClaudeSessionMonitor: ObservableObject {
         HookSocketServer.shared.start(
             onEvent: { event in
                 continuation.yield(.hookReceived(event))
-
-                if event.sessionPhase == .processing {
-                    Task { @MainActor in
-                        InterruptWatcherManager.shared.startWatching(
-                            sessionId: event.sessionId,
-                            cwd: event.cwd
-                        )
-                    }
-                }
-
-                if event.status == "ended" {
-                    Task { @MainActor in
-                        InterruptWatcherManager.shared.stopWatching(sessionId: event.sessionId)
-                    }
-                }
-
-                if event.event == "Stop" ||
-                    event.event == "StopFailure" ||
-                    event.status == "ended" {
-                    HookSocketServer.shared.cancelPendingPermissions(sessionId: event.sessionId)
-                } else if (event.event == "PostToolUse" ||
-                            event.event == "PostToolUseFailure" ||
-                            event.event == "PermissionDenied"),
-                           let toolUseId = event.toolUseId {
-                    HookSocketServer.shared.cancelPendingPermission(
-                        sessionId: event.sessionId,
-                        toolUseId: toolUseId
-                    )
-                }
             },
             onPermissionFailure: { sessionId, toolUseId in
                 continuation.yield(.permissionSocketFailed(
@@ -349,10 +320,6 @@ extension ClaudeSessionMonitor: JSONLInterruptWatcherDelegate {
                 sessionId: sessionId,
                 observedAt: observedAt
             ))
-        }
-
-        Task { @MainActor in
-            InterruptWatcherManager.shared.stopWatching(sessionId: sessionId)
         }
     }
 }

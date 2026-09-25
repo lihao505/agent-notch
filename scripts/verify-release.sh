@@ -75,6 +75,7 @@ modified_upstream_sources=(
     ClaudeIsland/Services/Hooks/HookSocketServer.swift
     ClaudeIsland/Services/Session/ClaudeSessionMonitor.swift
     ClaudeIsland/Services/Session/ConversationParser.swift
+    ClaudeIsland/Services/Session/JSONLInterruptWatcher.swift
     ClaudeIsland/Services/Shared/ProcessExecutor.swift
     ClaudeIsland/Services/Shared/ProcessTreeBuilder.swift
     ClaudeIsland/Services/Shared/TerminalAppRegistry.swift

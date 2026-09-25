@@ -836,8 +836,88 @@ final class SessionStoreLifecycleTests: XCTestCase {
         let session = try XCTUnwrap(storedSession)
         XCTAssertEqual(session.activePermission?.toolUseId, "approval-a")
         XCTAssertEqual(session.pendingInteractions.toolUseIds, ["approval-a"])
+        guard let item = session.chatItems.first(where: {
+            $0.id == "approval-a"
+        }), case .toolCall(let tool) = item.type else {
+            return XCTFail("Expected the pending tool card")
+        }
+        XCTAssertEqual(tool.status, .waitingForApproval)
         let trace = await store.lifecycleTrace(for: sessionId)
         XCTAssertEqual(trace.last?.reason, .interactionOlderThanBoundary)
+    }
+
+    func testUntimestampedExactCompletionKeepsApprovalCardAtomic() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "untimestamped-exact-\(UUID().uuidString)"
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: Date(),
+            tool: "Bash",
+            toolUseId: "approval-a"
+        )))
+
+        await store.process(.toolCompleted(
+            sessionId: sessionId,
+            toolUseId: "approval-a",
+            result: ToolCompletionResult(
+                status: .success,
+                result: "stale result",
+                structuredResult: nil,
+                observedAt: nil
+            )
+        ))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.activePermission?.toolUseId, "approval-a")
+        guard let item = session.chatItems.first(where: {
+            $0.id == "approval-a"
+        }), case .toolCall(let tool) = item.type else {
+            return XCTFail("Expected the pending tool card")
+        }
+        XCTAssertEqual(tool.status, .waitingForApproval)
+        XCTAssertNil(tool.result)
+    }
+
+    func testStaleExactHookCompletionKeepsApprovalCardAtomic() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-hook-exact-\(UUID().uuidString)"
+        let requestAt = Date()
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: requestAt,
+            tool: "Bash",
+            toolUseId: "approval-a"
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PostToolUse",
+            status: "processing",
+            observedAt: requestAt.addingTimeInterval(-1),
+            tool: "Bash",
+            toolUseId: "approval-a"
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.activePermission?.toolUseId, "approval-a")
+        XCTAssertEqual(session.pendingInteractions.toolUseIds, ["approval-a"])
+        guard let item = session.chatItems.first(where: {
+            $0.id == "approval-a"
+        }), case .toolCall(let tool) = item.type else {
+            return XCTFail("Expected the pending tool card")
+        }
+        XCTAssertEqual(tool.status, .waitingForApproval)
     }
 
     func testStaleInterruptCannotStopNewerHookActivity() async throws {
