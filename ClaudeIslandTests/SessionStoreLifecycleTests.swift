@@ -474,4 +474,38 @@ final class SessionStoreLifecycleTests: XCTestCase {
         )
         XCTAssertTrue(session.pendingInteractions.toolUseIds.isEmpty)
     }
+
+    func testPermissionRequestInterruptsCompactionWithoutBeingDropped() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "compact-approval-\(UUID().uuidString)"
+        let now = Date()
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PreCompact",
+            status: "compacting",
+            observedAt: now.addingTimeInterval(-1)
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: now,
+            tool: "Bash",
+            toolUseId: "compact-tool",
+            toolInput: ["command": AnyCodable("echo ready")]
+        )))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.activePermission?.toolUseId, "compact-tool")
+        XCTAssertEqual(session.activePermission?.toolName, "Bash")
+        XCTAssertEqual(
+            session.pendingInteractions.toolUseIds,
+            ["compact-tool"]
+        )
+    }
 }

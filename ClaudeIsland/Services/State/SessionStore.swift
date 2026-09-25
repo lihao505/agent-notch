@@ -240,10 +240,90 @@ actor SessionStore {
             observedAt: observedAt
         )
         let newPhase = event.determinePhase(observedAt: observedAt)
-        let isCurrentObservation = session.lastHookEventAt.map {
-            observedAt >= $0
-        } ?? true
-        let shouldApplyLifecycle = isCurrentObservation && newPhase != nil
+        let isCompletionSignal =
+            event.event == "Stop" ||
+            event.event == "StopFailure" ||
+            (event.event == "Notification" &&
+                event.notificationType == "idle_prompt")
+        let hookSignal: HookLifecycleSignal?
+        if event.status == "ended" {
+            hookSignal = event.event == "SessionExpired" ||
+                event.event == "SessionEnd"
+                ? .removed
+                : .ended
+        } else if isCompletionSignal || newPhase == .waitingForInput {
+            hookSignal = .completed
+        } else if newPhase?.isWaitingForApproval == true {
+            hookSignal = .interaction
+        } else if newPhase == .compacting {
+            hookSignal = .compacting
+        } else if newPhase?.isActive == true {
+            hookSignal = .active
+        } else {
+            hookSignal = nil
+        }
+
+        let previousPhase = session.phase
+        var shouldApplyLifecycle = false
+        var isCurrentObservation: Bool
+        if let hookSignal {
+            let previous = SessionLifecycleSnapshot(session: session)
+            let observation = SessionLifecycleObservation(
+                sessionId: sessionId,
+                cwd: event.cwd,
+                source: eventSource,
+                origin: .hook,
+                evidence: .hook(hookSignal),
+                requestedPhase: newPhase,
+                observedAt: observedAt,
+                receivedAt: receivedAt
+            )
+            let transition = LifecycleReducer.reduce(
+                current: previous,
+                observation: observation,
+                allowCreation: false,
+                activeStaleInterval: codexActiveStaleInterval,
+                missingGracePeriod:
+                    SessionRetentionPolicy.missingCodexGracePeriod
+            )
+            appendLifecycleTrace(
+                observation: observation,
+                previous: previous,
+                transition: transition
+            )
+            shouldApplyLifecycle = transition.acceptsObservation
+            isCurrentObservation = shouldApplyLifecycle
+
+            switch transition.mutation {
+            case .create(let snapshot), .update(let snapshot):
+                snapshot.applying(to: &session)
+            case .remove:
+                sessions.removeValue(forKey: sessionId)
+                cancelPendingSync(sessionId: sessionId)
+                Self.logger.info(
+                    "Hook lifecycle \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
+                )
+                return
+            case .none:
+                break
+            }
+
+            if shouldApplyLifecycle {
+                Self.logger.debug(
+                    "Hook lifecycle \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
+                )
+            } else {
+                Self.logger.info(
+                    "Ignoring hook lifecycle \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
+                )
+            }
+        } else {
+            let latestBoundary = max(
+                session.lastHookEventAt ?? .distantPast,
+                session.completedAt ?? .distantPast
+            )
+            isCurrentObservation = observedAt >= latestBoundary
+        }
 
         if isCurrentObservation {
             let normalizedTTY = event.tty?.replacingOccurrences(
@@ -273,9 +353,6 @@ actor SessionStore {
                 session.tty = normalizedTTY
             }
             session.lastActivity = max(session.lastActivity, observedAt)
-            if newPhase != nil {
-                session.lastHookEventAt = observedAt
-            }
         } else {
             Self.logger.info(
                 "Ignoring stale phase event \(event.event, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
@@ -287,74 +364,11 @@ actor SessionStore {
                 sessions[sessionId] = session
                 return
             }
-            if event.event == "SessionExpired" ||
-                event.event == "SessionEnd" {
-                sessions.removeValue(forKey: sessionId)
-            } else {
-                session.phase = .ended
-                session.completedAt = session.completedAt ?? observedAt
-                session.pid = nil
-                finalizeDanglingTools(in: &session)
-                sessions[sessionId] = session
-            }
+            session.pid = nil
+            finalizeDanglingTools(in: &session)
+            sessions[sessionId] = session
             cancelPendingSync(sessionId: sessionId)
             return
-        }
-
-        // Any fresh active signal can recover a resumed conversation when
-        // UserPromptSubmit was dropped. SessionStart alone is intentionally
-        // excluded because opening a dormant session is not a new turn.
-        let startsNewTurn = shouldApplyLifecycle && (
-            newPhase?.isActive == true ||
-            newPhase?.isWaitingForApproval == true
-        )
-        if startsNewTurn &&
-           (session.phase == .ended || session.completedAt != nil) {
-            session.phase = .idle
-            session.completedAt = nil
-        }
-
-        let isDuplicateInteractiveObservation: Bool
-        if case .waitingForApproval(let permission) = session.phase {
-            isDuplicateInteractiveObservation = event.event == "PreToolUse"
-                && event.status != "waiting_for_approval"
-                && event.toolUseId == permission.toolUseId
-        } else {
-            isDuplicateInteractiveObservation = false
-        }
-
-        let previousPhase = session.phase
-        if !shouldApplyLifecycle {
-            // Tool tracking below still consumes the event. Only its lifecycle
-            // mutation is stale.
-        } else if isDuplicateInteractiveObservation {
-            Self.logger.debug(
-                "Keeping interactive approval state for duplicate PreToolUse observation"
-            )
-        } else if let newPhase,
-                  session.phase.canTransition(to: newPhase) {
-            session.phase = newPhase
-        } else if let newPhase {
-            Self.logger.debug("Invalid transition: \(String(describing: session.phase), privacy: .public) -> \(String(describing: newPhase), privacy: .public), ignoring")
-        }
-
-        let isCompletionSignal =
-            event.event == "Stop" ||
-            event.event == "StopFailure" ||
-            (event.event == "Notification" &&
-                event.notificationType == "idle_prompt")
-        if shouldApplyLifecycle && isCompletionSignal {
-            // Completion must be visible even when a missed start/tool hook
-            // left the session in idle. Relying only on canTransition used to
-            // set completedAt while leaving phase == idle, so the compact
-            // completion animation could never appear.
-            session.phase = .waitingForInput
-            session.completedAt = observedAt
-        } else if shouldApplyLifecycle && (
-                    newPhase?.isActive == true ||
-                    newPhase?.isWaitingForApproval == true
-                  ) {
-            session.completedAt = nil
         }
 
         // Older completion rows may still finish a known placeholder, but an
@@ -439,10 +453,7 @@ actor SessionStore {
                 lastUserMessageDate: nil
             ),
             lastActivity: observedAt,
-            createdAt: observedAt,
-            lastHookEventAt: event.determinePhase(
-                observedAt: observedAt
-            ) == nil ? nil : observedAt
+            createdAt: observedAt
         )
     }
 

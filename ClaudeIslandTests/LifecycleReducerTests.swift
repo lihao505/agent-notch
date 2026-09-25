@@ -15,7 +15,8 @@ final class LifecycleReducerTests: XCTestCase {
         _ evidence: LifecycleEvidence,
         observedAt: Date,
         receivedAt: Date,
-        origin: LifecycleObservationOrigin = .codexPolling
+        origin: LifecycleObservationOrigin = .codexPolling,
+        requestedPhase: SessionPhase? = nil
     ) -> SessionLifecycleObservation {
         SessionLifecycleObservation(
             sessionId: "codex-session",
@@ -23,6 +24,7 @@ final class LifecycleReducerTests: XCTestCase {
             source: .codex,
             origin: origin,
             evidence: evidence,
+            requestedPhase: requestedPhase,
             observedAt: observedAt,
             receivedAt: receivedAt
         )
@@ -336,5 +338,170 @@ final class LifecycleReducerTests: XCTestCase {
         XCTAssertTrue(trace.didMutate)
         XCTAssertEqual(trace.previousPhase, .processing)
         XCTAssertEqual(trace.nextPhase, .waitingForInput)
+    }
+
+    func testLateHookActivityCannotReviveNativeCompletion() {
+        let completedAt = Date(timeIntervalSince1970: 11_000)
+        let current = snapshot(
+            phase: .waitingForInput,
+            lastActivity: completedAt,
+            lastHookEventAt: completedAt.addingTimeInterval(-5),
+            turnStartedAt: completedAt.addingTimeInterval(-10),
+            completedAt: completedAt
+        )
+
+        for observedAt in [
+            completedAt.addingTimeInterval(-1),
+            completedAt
+        ] {
+            let transition = reduce(
+                current: current,
+                observation: observation(
+                    .hook(.active),
+                    observedAt: observedAt,
+                    receivedAt: completedAt.addingTimeInterval(1),
+                    origin: .hook,
+                    requestedPhase: .processing
+                )
+            )
+            XCTAssertEqual(transition.mutation, .none)
+            XCTAssertEqual(
+                transition.reason,
+                .activeWithoutNewGeneration
+            )
+            XCTAssertFalse(transition.acceptsObservation)
+        }
+    }
+
+    func testNewerHookActivityResumesCompletedSession() throws {
+        let completedAt = Date(timeIntervalSince1970: 12_000)
+        let resumedAt = completedAt.addingTimeInterval(1)
+        let current = snapshot(
+            phase: .waitingForInput,
+            lastActivity: completedAt,
+            lastHookEventAt: completedAt.addingTimeInterval(-5),
+            turnStartedAt: completedAt.addingTimeInterval(-10),
+            completedAt: completedAt
+        )
+        let transition = reduce(
+            current: current,
+            observation: observation(
+                .hook(.active),
+                observedAt: resumedAt,
+                receivedAt: resumedAt,
+                origin: .hook,
+                requestedPhase: .processing
+            )
+        )
+
+        XCTAssertEqual(transition.reason, .hookPhaseAdvanced)
+        XCTAssertTrue(transition.acceptsObservation)
+        guard case .update(let next) = transition.mutation else {
+            return XCTFail("Expected the fresh hook to resume processing")
+        }
+        XCTAssertEqual(next.phase, .processing)
+        XCTAssertEqual(next.lastHookEventAt, resumedAt)
+        XCTAssertNil(next.completedAt)
+    }
+
+    func testAuthoritativeHookCompletionClosesPendingInteraction() throws {
+        let requestAt = Date(timeIntervalSince1970: 13_000)
+        let completionAt = requestAt.addingTimeInterval(2)
+        let context = PermissionContext(
+            toolUseId: "approval",
+            toolName: "Bash",
+            toolInput: ["command": AnyCodable("secret command")],
+            receivedAt: requestAt
+        )
+        let transition = reduce(
+            current: snapshot(
+                phase: .waitingForApproval(context),
+                lastActivity: requestAt,
+                lastHookEventAt: requestAt,
+                turnStartedAt: requestAt.addingTimeInterval(-1)
+            ),
+            observation: observation(
+                .hook(.completed),
+                observedAt: completionAt,
+                receivedAt: completionAt,
+                origin: .hook,
+                requestedPhase: .waitingForInput
+            )
+        )
+
+        XCTAssertEqual(transition.reason, .hookCompletion)
+        guard case .update(let next) = transition.mutation else {
+            return XCTFail("Expected Stop to close the interaction")
+        }
+        XCTAssertEqual(next.phase, .waitingForInput)
+        XCTAssertEqual(next.completedAt, completionAt)
+    }
+
+    func testHookRemovalCannotCrossNewerLifecycleBoundary() {
+        let activeAt = Date(timeIntervalSince1970: 14_000)
+        let current = snapshot(
+            lastActivity: activeAt,
+            lastHookEventAt: activeAt,
+            turnStartedAt: activeAt
+        )
+        let staleRemoval = reduce(
+            current: current,
+            observation: observation(
+                .hook(.removed),
+                observedAt: activeAt.addingTimeInterval(-1),
+                receivedAt: activeAt,
+                origin: .hook,
+                requestedPhase: .ended
+            )
+        )
+        XCTAssertEqual(staleRemoval.mutation, .none)
+        XCTAssertEqual(staleRemoval.reason, .hookOlderThanBoundary)
+
+        let freshRemovalAt = activeAt.addingTimeInterval(1)
+        let freshRemoval = reduce(
+            current: current,
+            observation: observation(
+                .hook(.removed),
+                observedAt: freshRemovalAt,
+                receivedAt: freshRemovalAt,
+                origin: .hook,
+                requestedPhase: .ended
+            )
+        )
+        XCTAssertEqual(freshRemoval.mutation, .remove)
+        XCTAssertEqual(freshRemoval.reason, .hookSessionRemoved)
+    }
+
+    func testTraceRedactsPermissionContextAndToolInput() {
+        let now = Date(timeIntervalSince1970: 15_000)
+        let secret = "do-not-retain-this-command"
+        let context = PermissionContext(
+            toolUseId: "approval",
+            toolName: "Bash",
+            toolInput: ["command": AnyCodable(secret)],
+            receivedAt: now
+        )
+        let current = snapshot(
+            phase: .waitingForApproval(context),
+            lastActivity: now,
+            lastHookEventAt: now
+        )
+        let source = observation(
+            .hook(.active),
+            observedAt: now,
+            receivedAt: now,
+            origin: .hook,
+            requestedPhase: .processing
+        )
+        let transition = reduce(current: current, observation: source)
+        let trace = LifecycleTraceEntry(
+            observation: source,
+            previous: current,
+            transition: transition
+        )
+
+        XCTAssertEqual(trace.previousPhase, .waitingForApproval)
+        XCTAssertEqual(trace.nextPhase, .waitingForApproval)
+        XCTAssertFalse(String(reflecting: trace).contains(secret))
     }
 }

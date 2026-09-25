@@ -3,9 +3,9 @@
 //  LifecycleReducer.swift
 //  ClaudeIsland
 //
-//  Pure lifecycle arbitration shared by native agent observations. The first
-//  production caller is Codex; Claude and CodeBuddy can migrate incrementally
-//  without changing the reducer contract.
+//  Pure lifecycle arbitration shared by hook delivery and native agent
+//  observations. Codex polling and hook events use it today; the remaining
+//  native sources can migrate incrementally without changing its contract.
 //
 
 import Foundation
@@ -13,6 +13,18 @@ import Foundation
 nonisolated enum LifecycleObservationOrigin: String, Equatable, Sendable {
     case codexDiscovery
     case codexPolling
+    case hook
+}
+
+/// Redacted hook intent retained by the decision trace. The concrete target
+/// phase travels separately so permission inputs never enter the trace ring.
+nonisolated enum HookLifecycleSignal: String, Equatable, Sendable {
+    case active
+    case interaction
+    case compacting
+    case completed
+    case ended
+    case removed
 }
 
 nonisolated enum LifecycleEvidence: Equatable, Sendable {
@@ -20,6 +32,7 @@ nonisolated enum LifecycleEvidence: Equatable, Sendable {
     case completed(Date?)
     case missing
     case unknown
+    case hook(HookLifecycleSignal)
 
     init(codexLifecycle: CodexTaskLifecycle) {
         switch codexLifecycle {
@@ -44,10 +57,33 @@ nonisolated struct SessionLifecycleObservation: Equatable, Sendable {
     let source: AgentSource
     let origin: LifecycleObservationOrigin
     let evidence: LifecycleEvidence
+    /// Used only during arbitration. LifecycleTraceEntry deliberately stores a
+    /// redacted phase kind rather than this potentially sensitive value.
+    let requestedPhase: SessionPhase?
     /// The timestamp attached to the native source, such as rollout mtime.
     let observedAt: Date
     /// The time Agent Notch performed arbitration.
     let receivedAt: Date
+
+    init(
+        sessionId: String,
+        cwd: String,
+        source: AgentSource,
+        origin: LifecycleObservationOrigin,
+        evidence: LifecycleEvidence,
+        requestedPhase: SessionPhase? = nil,
+        observedAt: Date,
+        receivedAt: Date
+    ) {
+        self.sessionId = sessionId
+        self.cwd = cwd
+        self.source = source
+        self.origin = origin
+        self.evidence = evidence
+        self.requestedPhase = requestedPhase
+        self.observedAt = observedAt
+        self.receivedAt = receivedAt
+    }
 }
 
 /// Only the lifecycle-owned portion of SessionState. Keeping the reducer free
@@ -121,6 +157,12 @@ nonisolated enum LifecycleTransitionReason: String, Equatable, Sendable {
     case unknownWithinGrace
     case sessionNotFound
     case alreadyCurrent
+    case hookPhaseAdvanced
+    case hookCompletion
+    case hookSessionEnded
+    case hookSessionRemoved
+    case hookOlderThanBoundary
+    case invalidHookPhase
 }
 
 nonisolated enum LifecycleTransitionMutation: Equatable, Sendable {
@@ -151,6 +193,53 @@ nonisolated struct LifecycleTransition: Equatable, Sendable {
             return nil
         }
     }
+
+    /// Rejected observations must not update tool tracking, topology, or the
+    /// interaction queue. Accepted duplicates remain safe to consume because
+    /// those secondary operations are idempotent by tool-use identity.
+    var acceptsObservation: Bool {
+        switch reason {
+        case .creationNotAllowed,
+             .staleDiscovery,
+             .activeWithoutNewGeneration,
+             .completionOlderThanHook,
+             .completionOlderThanTurn,
+             .sessionNotFound,
+             .hookOlderThanBoundary,
+             .invalidHookPhase:
+            return false
+        default:
+            return true
+        }
+    }
+}
+
+/// Phase classification safe for diagnostics. Unlike SessionPhase this never
+/// retains a PermissionContext or its tool input.
+nonisolated enum LifecyclePhaseKind: String, Equatable, Sendable {
+    case idle
+    case processing
+    case waitingForInput
+    case waitingForApproval
+    case compacting
+    case ended
+
+    init(_ phase: SessionPhase) {
+        switch phase {
+        case .idle:
+            self = .idle
+        case .processing:
+            self = .processing
+        case .waitingForInput:
+            self = .waitingForInput
+        case .waitingForApproval:
+            self = .waitingForApproval
+        case .compacting:
+            self = .compacting
+        case .ended:
+            self = .ended
+        }
+    }
 }
 
 /// Privacy-minimized evidence explaining why a visible status changed or why
@@ -163,8 +252,8 @@ nonisolated struct LifecycleTraceEntry: Equatable, Sendable {
     let evidence: LifecycleEvidence
     let reason: LifecycleTransitionReason
     let didMutate: Bool
-    let previousPhase: SessionPhase?
-    let nextPhase: SessionPhase?
+    let previousPhase: LifecyclePhaseKind?
+    let nextPhase: LifecyclePhaseKind?
 
     init(
         observation: SessionLifecycleObservation,
@@ -177,14 +266,14 @@ nonisolated struct LifecycleTraceEntry: Equatable, Sendable {
         evidence = observation.evidence
         reason = transition.reason
         didMutate = transition.didMutate
-        previousPhase = previous?.phase
+        previousPhase = previous.map { LifecyclePhaseKind($0.phase) }
         switch transition.mutation {
         case .create(let snapshot), .update(let snapshot):
-            nextPhase = snapshot.phase
+            nextPhase = LifecyclePhaseKind(snapshot.phase)
         case .remove:
             nextPhase = nil
         case .none:
-            nextPhase = previous?.phase
+            nextPhase = previous.map { LifecyclePhaseKind($0.phase) }
         }
     }
 }
@@ -227,6 +316,13 @@ nonisolated enum LifecycleReducer {
                 current: current,
                 observation: observation,
                 activeStaleInterval: activeStaleInterval
+            )
+
+        case .hook(let signal):
+            return reduceHook(
+                current: current,
+                observation: observation,
+                signal: signal
             )
         }
     }
@@ -434,5 +530,163 @@ nonisolated enum LifecycleReducer {
             mutation: .update(next),
             reason: .unknownActiveTimedOut
         )
+    }
+
+    /// Hook delivery and native rollout polling share the same ordering
+    /// boundaries but have different authority. A fresh Stop is allowed to
+    /// close an outstanding interaction; passive Codex polling is not. Ties
+    /// favor completion so a delayed tool-start cannot revive the same turn.
+    private static func reduceHook(
+        current: SessionLifecycleSnapshot?,
+        observation: SessionLifecycleObservation,
+        signal: HookLifecycleSignal
+    ) -> LifecycleTransition {
+        guard var next = current else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .sessionNotFound
+            )
+        }
+
+        let observedAt = observation.observedAt
+        if let lastHookEventAt = next.lastHookEventAt,
+           observedAt < lastHookEventAt {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .hookOlderThanBoundary
+            )
+        }
+
+        switch signal {
+        case .active, .interaction, .compacting:
+            if let completedAt = next.completedAt,
+               observedAt <= completedAt {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .activeWithoutNewGeneration
+                )
+            }
+
+            guard let requestedPhase = observation.requestedPhase else {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .invalidHookPhase
+                )
+            }
+
+            let previous = next
+            let interactionHasPriority = next.phase.isWaitingForApproval &&
+                signal != .interaction
+            next.source = observation.source
+            next.lastActivity = max(next.lastActivity, observedAt)
+            next.lastHookEventAt = max(
+                next.lastHookEventAt ?? .distantPast,
+                observedAt
+            )
+            next.completedAt = nil
+
+            if !interactionHasPriority {
+                // A fresh hook is an authoritative resume boundary even if a
+                // persisted session had previously reached the terminal phase.
+                if signal == .interaction ||
+                   next.phase == .ended ||
+                   next.phase.canTransition(to: requestedPhase) {
+                    next.phase = requestedPhase
+                } else {
+                    return LifecycleTransition(
+                        mutation: .none,
+                        reason: .invalidHookPhase
+                    )
+                }
+            }
+
+            guard next != previous else {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: interactionHasPriority
+                        ? .interactionHasPriority
+                        : .alreadyCurrent
+                )
+            }
+            return LifecycleTransition(
+                mutation: .update(next),
+                reason: interactionHasPriority
+                    ? .interactionHasPriority
+                    : .hookPhaseAdvanced
+            )
+
+        case .completed:
+            if let turnStartedAt = next.turnStartedAt,
+               turnStartedAt > observedAt {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .completionOlderThanTurn
+                )
+            }
+
+            let previous = next
+            next.source = observation.source
+            next.phase = .waitingForInput
+            next.lastActivity = max(next.lastActivity, observedAt)
+            next.lastHookEventAt = max(
+                next.lastHookEventAt ?? .distantPast,
+                observedAt
+            )
+            next.completedAt = max(
+                next.completedAt ?? .distantPast,
+                observedAt
+            )
+            guard next != previous else {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .alreadyCurrent
+                )
+            }
+            return LifecycleTransition(
+                mutation: .update(next),
+                reason: .hookCompletion
+            )
+
+        case .ended, .removed:
+            let latestBoundary = max(
+                next.completedAt ?? .distantPast,
+                next.turnStartedAt ?? .distantPast
+            )
+            guard observedAt >= latestBoundary else {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .hookOlderThanBoundary
+                )
+            }
+            if signal == .removed {
+                return LifecycleTransition(
+                    mutation: .remove,
+                    reason: .hookSessionRemoved
+                )
+            }
+
+            let previous = next
+            next.source = observation.source
+            next.phase = .ended
+            next.lastActivity = max(next.lastActivity, observedAt)
+            next.lastHookEventAt = max(
+                next.lastHookEventAt ?? .distantPast,
+                observedAt
+            )
+            next.completedAt = max(
+                next.completedAt ?? .distantPast,
+                observedAt
+            )
+            guard next != previous else {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .alreadyCurrent
+                )
+            }
+            return LifecycleTransition(
+                mutation: .update(next),
+                reason: .hookSessionEnded
+            )
+        }
     }
 }
