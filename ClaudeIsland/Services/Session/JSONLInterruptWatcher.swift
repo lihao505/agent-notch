@@ -13,7 +13,7 @@ import os.log
 private let logger = Logger(subsystem: "com.claudeisland", category: "Interrupt")
 
 protocol JSONLInterruptWatcherDelegate: AnyObject {
-    func didDetectInterrupt(sessionId: String)
+    func didDetectInterrupt(sessionId: String, observedAt: Date)
 }
 
 /// Watches a session's JSONL file for interrupt patterns in real-time
@@ -30,7 +30,7 @@ class JSONLInterruptWatcher {
 
     /// Patterns that indicate an interrupt occurred
     /// We check for is_error:true combined with interrupt content
-    private static let interruptContentPatterns = [
+    nonisolated private static let interruptContentPatterns = [
         "Interrupted by user",
         "interrupted by user",
         "user doesn't want to proceed",
@@ -118,18 +118,50 @@ class JSONLInterruptWatcher {
 
         let lines = newContent.components(separatedBy: "\n")
         for line in lines where !line.isEmpty {
-            if isInterruptLine(line) {
+            let detectedAt = Date()
+            if let observedAt = Self.interruptObservedAt(
+                in: line,
+                detectedAt: detectedAt
+            ) {
                 logger.info("Detected interrupt in session: \(self.sessionId.prefix(8), privacy: .public)")
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
-                    self.delegate?.didDetectInterrupt(sessionId: self.sessionId)
+                    self.delegate?.didDetectInterrupt(
+                        sessionId: self.sessionId,
+                        observedAt: observedAt
+                    )
                 }
                 return
             }
         }
     }
 
-    private func isInterruptLine(_ line: String) -> Bool {
+    nonisolated static func interruptObservedAt(
+        in line: String,
+        detectedAt: Date
+    ) -> Date? {
+        guard isInterruptLine(line) else { return nil }
+
+        guard let data = line.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let value = json["timestamp"] as? String else {
+            return detectedAt
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let parsed = formatter.date(from: value) ?? {
+            formatter.formatOptions = [.withInternetDateTime]
+            return formatter.date(from: value)
+        }()
+        guard let parsed,
+              parsed <= detectedAt.addingTimeInterval(5 * 60) else {
+            return detectedAt
+        }
+        return parsed
+    }
+
+    nonisolated private static func isInterruptLine(_ line: String) -> Bool {
         if line.contains("\"type\":\"user\"") {
             if line.contains("[Request interrupted by user]") ||
                line.contains("[Request interrupted by user for tool use]") {

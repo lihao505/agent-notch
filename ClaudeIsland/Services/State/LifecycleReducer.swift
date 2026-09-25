@@ -3,9 +3,8 @@
 //  LifecycleReducer.swift
 //  ClaudeIsland
 //
-//  Pure lifecycle arbitration shared by hook delivery and native agent
-//  observations. Codex polling and hook events use it today; the remaining
-//  native sources can migrate incrementally without changing its contract.
+//  Pure lifecycle arbitration shared by native discovery, hooks, transcripts,
+//  local interaction callbacks, interrupts, bridge restore, and process exit.
 //
 
 import Foundation
@@ -16,6 +15,9 @@ nonisolated enum LifecycleObservationOrigin: String, Equatable, Sendable {
     case hook
     case localInteraction
     case transcript
+    case bridgeSnapshot
+    case interruptWatcher
+    case processMonitor
 }
 
 /// Redacted hook intent retained by the decision trace. The concrete target
@@ -29,13 +31,16 @@ nonisolated enum HookLifecycleSignal: String, Equatable, Sendable {
     case removed
 }
 
-/// Privacy-safe result of an interaction handled by Agent Notch itself. The
-/// permission context and response payload remain in SessionStore and never
-/// enter the lifecycle decision trace.
-nonisolated enum LocalInteractionSignal: String, Equatable, Sendable {
+/// Privacy-safe queue reconciliation signal. The permission context, tool
+/// result, and response payload remain in SessionStore and never enter the
+/// lifecycle decision trace.
+nonisolated enum InteractionResolutionSignal: String, Equatable, Sendable {
     case approved
     case denied
     case deliveryFailed
+    case hookCompleted
+    case transcriptCompleted
+    case queueReconciled
 }
 
 nonisolated enum LifecycleEvidence: Equatable, Sendable {
@@ -44,7 +49,9 @@ nonisolated enum LifecycleEvidence: Equatable, Sendable {
     case missing
     case unknown
     case hook(HookLifecycleSignal)
-    case localInteraction(LocalInteractionSignal)
+    case interactionResolution(InteractionResolutionSignal)
+    case interrupt
+    case processExited
 
     init(codexLifecycle: CodexTaskLifecycle) {
         switch codexLifecycle {
@@ -176,10 +183,14 @@ nonisolated enum LifecycleTransitionReason: String, Equatable, Sendable {
     case hookSessionRemoved
     case hookOlderThanBoundary
     case invalidHookPhase
-    case localInteractionResolved
+    case interactionResolved
     case localFailurePreservedNewerActivity
-    case localInteractionOlderThanCompletion
-    case invalidLocalInteractionPhase
+    case interactionOlderThanCompletion
+    case interactionOlderThanBoundary
+    case invalidInteractionPhase
+    case interruptAccepted
+    case interruptOlderThanBoundary
+    case processExitAccepted
 }
 
 nonisolated enum LifecycleTransitionMutation: Equatable, Sendable {
@@ -225,8 +236,10 @@ nonisolated struct LifecycleTransition: Equatable, Sendable {
              .sessionNotFound,
              .hookOlderThanBoundary,
              .invalidHookPhase,
-             .localInteractionOlderThanCompletion,
-             .invalidLocalInteractionPhase:
+             .interactionOlderThanCompletion,
+             .interactionOlderThanBoundary,
+             .invalidInteractionPhase,
+             .interruptOlderThanBoundary:
             return false
         default:
             return true
@@ -345,11 +358,23 @@ nonisolated enum LifecycleReducer {
                 signal: signal
             )
 
-        case .localInteraction(let signal):
-            return reduceLocalInteraction(
+        case .interactionResolution(let signal):
+            return reduceInteractionResolution(
                 current: current,
                 observation: observation,
                 signal: signal
+            )
+
+        case .interrupt:
+            return reduceInterrupt(
+                current: current,
+                observation: observation
+            )
+
+        case .processExited:
+            return reduceProcessExit(
+                current: current,
+                observation: observation
             )
         }
     }
@@ -730,13 +755,13 @@ nonisolated enum LifecycleReducer {
         }
     }
 
-    /// Local permission callbacks are authoritative for the exact interaction
-    /// removed by SessionStore, but they must not erase a newer completion or
-    /// let a late delivery failure idle work that resumed in the meantime.
-    private static func reduceLocalInteraction(
+    /// An exact queue item may be resolved locally, by a hook, or by a timed
+    /// transcript row. None may erase a newer completion; a late local socket
+    /// failure also cannot idle work that resumed in the meantime.
+    private static func reduceInteractionResolution(
         current: SessionLifecycleSnapshot?,
         observation: SessionLifecycleObservation,
-        signal: LocalInteractionSignal
+        signal: InteractionResolutionSignal
     ) -> LifecycleTransition {
         guard var next = current else {
             return LifecycleTransition(
@@ -750,7 +775,7 @@ nonisolated enum LifecycleReducer {
                 requestedPhase.isWaitingForApproval else {
             return LifecycleTransition(
                 mutation: .none,
-                reason: .invalidLocalInteractionPhase
+                reason: .invalidInteractionPhase
             )
         }
 
@@ -758,7 +783,16 @@ nonisolated enum LifecycleReducer {
         if let completedAt = next.completedAt, resolvedAt <= completedAt {
             return LifecycleTransition(
                 mutation: .none,
-                reason: .localInteractionOlderThanCompletion
+                reason: .interactionOlderThanCompletion
+            )
+        }
+
+        if signal == .hookCompleted || signal == .transcriptCompleted,
+           let lastHookEventAt = next.lastHookEventAt,
+           resolvedAt < lastHookEventAt {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .interactionOlderThanBoundary
             )
         }
 
@@ -787,7 +821,89 @@ nonisolated enum LifecycleReducer {
             mutation: .update(next),
             reason: preservesNewerActivity
                 ? .localFailurePreservedNewerActivity
-                : .localInteractionResolved
+                : .interactionResolved
+        )
+    }
+
+    /// Interrupt rows can be delivered after a newer hook because both file
+    /// and socket sources are asynchronous. Only an interrupt at or beyond the
+    /// latest lifecycle boundary may tear down the visible running state.
+    private static func reduceInterrupt(
+        current: SessionLifecycleSnapshot?,
+        observation: SessionLifecycleObservation
+    ) -> LifecycleTransition {
+        guard var next = current else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .sessionNotFound
+            )
+        }
+        let latestBoundary = max(
+            max(
+                next.lastHookEventAt ?? .distantPast,
+                next.completedAt ?? .distantPast
+            ),
+            next.turnStartedAt ?? .distantPast
+        )
+        guard observation.observedAt > latestBoundary else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .interruptOlderThanBoundary
+            )
+        }
+
+        let previous = next
+        next.phase = .idle
+        next.lastActivity = max(next.lastActivity, observation.observedAt)
+        next.lastHookEventAt = max(
+            next.lastHookEventAt ?? .distantPast,
+            observation.observedAt
+        )
+        next.completedAt = nil
+        guard next != previous else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .alreadyCurrent
+            )
+        }
+        return LifecycleTransition(
+            mutation: .update(next),
+            reason: .interruptAccepted
+        )
+    }
+
+    /// SessionStore validates the exact PID before sending this observation,
+    /// so a matching local process exit is an authoritative terminal boundary.
+    private static func reduceProcessExit(
+        current: SessionLifecycleSnapshot?,
+        observation: SessionLifecycleObservation
+    ) -> LifecycleTransition {
+        guard var next = current else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .sessionNotFound
+            )
+        }
+        let previous = next
+        next.phase = .ended
+        next.lastActivity = max(next.lastActivity, observation.observedAt)
+        next.lastHookEventAt = max(
+            next.lastHookEventAt ?? .distantPast,
+            observation.observedAt
+        )
+        next.completedAt = max(
+            next.completedAt ?? .distantPast,
+            observation.observedAt
+        )
+        guard next != previous else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .alreadyCurrent
+            )
+        }
+        return LifecycleTransition(
+            mutation: .update(next),
+            reason: .processExitAccepted
         )
     }
 }

@@ -247,12 +247,20 @@ actor ConversationParser {
         let stderr: String?
         let isError: Bool
         let isInterrupted: Bool
+        let observedAt: Date?
 
-        init(content: String?, stdout: String?, stderr: String?, isError: Bool) {
+        init(
+            content: String?,
+            stdout: String?,
+            stderr: String?,
+            isError: Bool,
+            observedAt: Date? = nil
+        ) {
             self.content = content
             self.stdout = stdout
             self.stderr = stderr
             self.isError = isError
+            self.observedAt = observedAt
             // Detect if this was an interrupt or rejection (various formats)
             self.isInterrupted = isError && (
                 content?.contains("Interrupted by user") == true ||
@@ -1624,7 +1632,9 @@ actor ConversationParser {
                                 content: content,
                                 stdout: stdout,
                                 stderr: stderr,
-                                isError: isError
+                                isError: isError,
+                                observedAt: (json["timestamp"] as? String)
+                                    .flatMap(Self.parseISO8601)
                             )
 
                             let toolName = topLevelToolName ?? state.toolIdToName[toolUseId]

@@ -571,7 +571,7 @@ final class LifecycleReducerTests: XCTestCase {
                 lastHookEventAt: newerHookAt
             ),
             observation: observation(
-                .localInteraction(.deliveryFailed),
+                .interactionResolution(.deliveryFailed),
                 observedAt: failureAt,
                 receivedAt: newerHookAt,
                 origin: .localInteraction,
@@ -603,7 +603,7 @@ final class LifecycleReducerTests: XCTestCase {
                 lastActivity: resolvedAt.addingTimeInterval(-1)
             ),
             observation: observation(
-                .localInteraction(.approved),
+                .interactionResolution(.approved),
                 observedAt: resolvedAt,
                 receivedAt: resolvedAt,
                 origin: .localInteraction,
@@ -611,7 +611,7 @@ final class LifecycleReducerTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(transition.reason, .localInteractionResolved)
+        XCTAssertEqual(transition.reason, .interactionResolved)
         let next = try XCTUnwrap(transition.nextSnapshot)
         XCTAssertEqual(next.phase, .waitingForApproval(nextPermission))
         XCTAssertEqual(next.lastActivity, resolvedAt)
@@ -629,7 +629,7 @@ final class LifecycleReducerTests: XCTestCase {
                 completedAt: completedAt
             ),
             observation: observation(
-                .localInteraction(.approved),
+                .interactionResolution(.approved),
                 observedAt: resolvedAt,
                 receivedAt: completedAt,
                 origin: .localInteraction,
@@ -640,8 +640,102 @@ final class LifecycleReducerTests: XCTestCase {
         XCTAssertEqual(transition.mutation, .none)
         XCTAssertEqual(
             transition.reason,
-            .localInteractionOlderThanCompletion
+            .interactionOlderThanCompletion
         )
         XCTAssertFalse(transition.acceptsObservation)
+    }
+
+    func testInterruptOlderThanHookBoundaryIsRejected() {
+        let hookAt = Date(timeIntervalSince1970: 21_000)
+        let transition = reduce(
+            current: snapshot(
+                lastActivity: hookAt,
+                lastHookEventAt: hookAt
+            ),
+            observation: observation(
+                .interrupt,
+                observedAt: hookAt.addingTimeInterval(-1),
+                receivedAt: hookAt,
+                origin: .interruptWatcher
+            )
+        )
+
+        XCTAssertEqual(transition.mutation, .none)
+        XCTAssertEqual(transition.reason, .interruptOlderThanBoundary)
+        XCTAssertFalse(transition.acceptsObservation)
+    }
+
+    func testInterruptOlderThanNativeTurnBoundaryIsRejected() {
+        let turnStartedAt = Date(timeIntervalSince1970: 21_500)
+        let transition = reduce(
+            current: snapshot(
+                lastActivity: turnStartedAt,
+                turnStartedAt: turnStartedAt
+            ),
+            observation: observation(
+                .interrupt,
+                observedAt: turnStartedAt.addingTimeInterval(-1),
+                receivedAt: turnStartedAt,
+                origin: .interruptWatcher
+            )
+        )
+
+        XCTAssertEqual(transition.mutation, .none)
+        XCTAssertEqual(transition.reason, .interruptOlderThanBoundary)
+        XCTAssertFalse(transition.acceptsObservation)
+    }
+
+    func testMatchingProcessExitEndsSession() throws {
+        let exitedAt = Date(timeIntervalSince1970: 22_000)
+        let transition = reduce(
+            current: snapshot(
+                lastActivity: exitedAt.addingTimeInterval(-1)
+            ),
+            observation: observation(
+                .processExited,
+                observedAt: exitedAt,
+                receivedAt: exitedAt,
+                origin: .processMonitor
+            )
+        )
+
+        XCTAssertEqual(transition.reason, .processExitAccepted)
+        let next = try XCTUnwrap(transition.nextSnapshot)
+        XCTAssertEqual(next.phase, .ended)
+        XCTAssertEqual(next.completedAt, exitedAt)
+    }
+
+    func testInterruptWatcherUsesSourceTimestamp() throws {
+        let detectedAt = Date(timeIntervalSince1970: 1_700_000_100)
+        let line = """
+        {"type":"user","timestamp":"2023-11-14T22:13:20.000Z","message":"[Request interrupted by user]"}
+        """
+        let observedAt = try XCTUnwrap(
+            JSONLInterruptWatcher.interruptObservedAt(
+                in: line,
+                detectedAt: detectedAt
+            )
+        )
+
+        XCTAssertEqual(
+            observedAt.timeIntervalSince1970,
+            1_700_000_000,
+            accuracy: 0.001
+        )
+    }
+
+    func testInterruptWatcherRejectsImplausibleFutureTimestamp() throws {
+        let detectedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let line = """
+        {"type":"user","timestamp":"2099-01-01T00:00:00.000Z","message":"[Request interrupted by user]"}
+        """
+        let observedAt = try XCTUnwrap(
+            JSONLInterruptWatcher.interruptObservedAt(
+                in: line,
+                detectedAt: detectedAt
+            )
+        )
+
+        XCTAssertEqual(observedAt, detectedAt)
     }
 }

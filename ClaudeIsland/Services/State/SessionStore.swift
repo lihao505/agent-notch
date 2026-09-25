@@ -165,8 +165,18 @@ actor SessionStore {
         case .fileUpdated(let payload):
             await processFileUpdate(payload)
 
-        case .interruptDetected(let sessionId):
-            await processInterrupt(sessionId: sessionId)
+        case .interruptDetected(let sessionId, let observedAt):
+            await processInterrupt(
+                sessionId: sessionId,
+                observedAt: observedAt
+            )
+
+        case .processExited(let sessionId, let pid, let observedAt):
+            processProcessExit(
+                sessionId: sessionId,
+                pid: pid,
+                observedAt: observedAt
+            )
 
         case .clearDetected(let sessionId):
             await processClearDetected(sessionId: sessionId)
@@ -394,12 +404,18 @@ actor SessionStore {
                         event.event == "PostToolUseFailure" ||
                         event.event == "PermissionDenied"),
                       let toolUseId = event.toolUseId {
-                if let resolvedPhase = resolvePendingInteraction(
+                if let resolution = pendingInteractionResolution(
                     toolUseId: toolUseId,
                     fallbackPhase: .processing,
-                    session: &session
+                    session: session
                 ) {
-                    session.phase = resolvedPhase
+                    applyInteractionResolution(
+                        .hookCompleted,
+                        origin: .hook,
+                        resolution: resolution,
+                        observedAt: observedAt,
+                        session: &session
+                    )
                 }
             }
         }
@@ -409,7 +425,17 @@ actor SessionStore {
         // until that exact request is answered, completed, or expires.
         if !isCompletionSignal,
            let currentInteraction = session.pendingInteractions.current {
-            session.phase = .waitingForApproval(currentInteraction)
+            let resolution = PendingInteractionResolution(
+                queue: session.pendingInteractions,
+                phase: .waitingForApproval(currentInteraction)
+            )
+            applyInteractionResolution(
+                .queueReconciled,
+                origin: .hook,
+                resolution: resolution,
+                observedAt: observedAt,
+                session: &session
+            )
         }
 
         if shouldApplyLifecycle && previousPhase != session.phase {
@@ -522,26 +548,42 @@ actor SessionStore {
         return result
     }
 
-    private func resolvePendingInteraction(
+    private struct PendingInteractionResolution {
+        let queue: PendingInteractionQueue
+        let phase: SessionPhase
+    }
+
+    /// Build the next queue without mutating live state. The queue is committed
+    /// only after the lifecycle reducer accepts the source timestamp.
+    private func pendingInteractionResolution(
         toolUseId: String,
         fallbackPhase: SessionPhase,
-        session: inout SessionState
-    ) -> SessionPhase? {
+        session: SessionState
+    ) -> PendingInteractionResolution? {
         let wasVisible: Bool
         if case .waitingForApproval(let context) = session.phase {
             wasVisible = context.toolUseId == toolUseId
         } else {
             wasVisible = false
         }
-        let removed = session.pendingInteractions.remove(toolUseId: toolUseId)
-        if let next = session.pendingInteractions.current {
-            return .waitingForApproval(next)
-        } else if wasVisible || removed != nil || session.phase.isWaitingForApproval {
-            if session.phase.canTransition(to: fallbackPhase) {
-                return fallbackPhase
-            }
+        var nextQueue = session.pendingInteractions
+        let removed = nextQueue.remove(toolUseId: toolUseId)
+        guard wasVisible || removed != nil else {
+            return nil
         }
-        return nil
+        if let next = nextQueue.current {
+            return PendingInteractionResolution(
+                queue: nextQueue,
+                phase: .waitingForApproval(next)
+            )
+        }
+        guard session.phase.canTransition(to: fallbackPhase) else {
+            return nil
+        }
+        return PendingInteractionResolution(
+            queue: nextQueue,
+            phase: fallbackPhase
+        )
     }
 
     private func processToolTracking(event: HookEvent, session: inout SessionState) {
@@ -753,15 +795,16 @@ actor SessionStore {
         // Update tool status in chat history first
         updateToolStatus(in: &session, toolId: toolUseId, status: .running)
 
-        let resolvedPhase = resolvePendingInteraction(
+        guard let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
-            session: &session
-        )
-        applyLocalInteractionResolution(
+            session: session
+        ) else { return }
+        applyInteractionResolution(
             .approved,
-            requestedPhase: resolvedPhase,
-            resolvedAt: resolvedAt,
+            origin: .localInteraction,
+            resolution: resolution,
+            observedAt: resolvedAt,
             session: &session
         )
 
@@ -776,43 +819,52 @@ actor SessionStore {
         guard var session = sessions[sessionId] else { return }
 
         // Check if this tool is already completed (avoid duplicate processing)
-        if let existingItem = session.chatItems.first(where: { $0.id == toolUseId }),
-           case .toolCall(let tool) = existingItem.type,
-           tool.status == .success || tool.status == .error || tool.status == .interrupted {
-            if let resolvedPhase = resolvePendingInteraction(
-                toolUseId: toolUseId,
-                fallbackPhase: .processing,
-                session: &session
-            ) {
-                session.phase = resolvedPhase
-            }
-            sessions[sessionId] = session
-            return
+        let isAlreadyCompleted: Bool
+        if let existingItem = session.chatItems.first(where: {
+            $0.id == toolUseId
+        }), case .toolCall(let tool) = existingItem.type {
+            isAlreadyCompleted = tool.status == .success ||
+                tool.status == .error ||
+                tool.status == .interrupted
+        } else {
+            isAlreadyCompleted = false
         }
 
         // Update the tool status
-        for i in 0..<session.chatItems.count {
-            if session.chatItems[i].id == toolUseId,
-               case .toolCall(var tool) = session.chatItems[i].type {
-                tool.status = result.status
-                tool.result = result.result
-                tool.structuredResult = result.structuredResult
-                session.chatItems[i] = ChatHistoryItem(
-                    id: toolUseId,
-                    type: .toolCall(tool),
-                    timestamp: session.chatItems[i].timestamp
-                )
-                Self.logger.debug("Tool \(toolUseId.prefix(12), privacy: .public) completed with status: \(String(describing: result.status), privacy: .public)")
-                break
+        if !isAlreadyCompleted {
+            for i in 0..<session.chatItems.count {
+                if session.chatItems[i].id == toolUseId,
+                   case .toolCall(var tool) = session.chatItems[i].type {
+                    tool.status = result.status
+                    tool.result = result.result
+                    tool.structuredResult = result.structuredResult
+                    session.chatItems[i] = ChatHistoryItem(
+                        id: toolUseId,
+                        type: .toolCall(tool),
+                        timestamp: session.chatItems[i].timestamp
+                    )
+                    Self.logger.debug("Tool \(toolUseId.prefix(12), privacy: .public) completed with status: \(String(describing: result.status), privacy: .public)")
+                    break
+                }
             }
         }
 
-        if let resolvedPhase = resolvePendingInteraction(
-            toolUseId: toolUseId,
-            fallbackPhase: .processing,
-            session: &session
-        ) {
-            session.phase = resolvedPhase
+        // A transcript row without a source timestamp is presentation data,
+        // not safe lifecycle evidence. It may finish the card, but it cannot
+        // dismiss a newer approval request.
+        if let observedAt = result.observedAt,
+           let resolution = pendingInteractionResolution(
+                toolUseId: toolUseId,
+                fallbackPhase: .processing,
+                session: session
+           ) {
+            applyInteractionResolution(
+                .transcriptCompleted,
+                origin: .transcript,
+                resolution: resolution,
+                observedAt: observedAt,
+                session: &session
+            )
         }
 
         sessions[sessionId] = session
@@ -832,15 +884,16 @@ actor SessionStore {
         // Update tool status in chat history first
         updateToolStatus(in: &session, toolId: toolUseId, status: .error)
 
-        let resolvedPhase = resolvePendingInteraction(
+        guard let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
-            session: &session
-        )
-        applyLocalInteractionResolution(
+            session: session
+        ) else { return }
+        applyInteractionResolution(
             .denied,
-            requestedPhase: resolvedPhase,
-            resolvedAt: resolvedAt,
+            origin: .localInteraction,
+            resolution: resolution,
+            observedAt: resolvedAt,
             session: &session
         )
 
@@ -860,41 +913,42 @@ actor SessionStore {
         // Mark the failed tool's status as error
         updateToolStatus(in: &session, toolId: toolUseId, status: .error)
 
-        let resolvedPhase = resolvePendingInteraction(
+        guard let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
             fallbackPhase: .idle,
-            session: &session
-        )
-        applyLocalInteractionResolution(
+            session: session
+        ) else { return }
+        applyInteractionResolution(
             .deliveryFailed,
-            requestedPhase: resolvedPhase,
-            resolvedAt: resolvedAt,
+            origin: .localInteraction,
+            resolution: resolution,
+            observedAt: resolvedAt,
             session: &session
         )
 
         sessions[sessionId] = session
     }
 
-    /// Delivering or expiring a held interaction is itself an authoritative
-    /// local lifecycle boundary. A Stop or duplicate PermissionRequest that
-    /// was observed before this response must not arrive late and overwrite
-    /// the resumed state or resurrect a dismissed question card.
-    private func applyLocalInteractionResolution(
-        _ signal: LocalInteractionSignal,
-        requestedPhase: SessionPhase?,
-        resolvedAt: Date,
+    /// Reconcile the visible interaction only after its source timestamp wins
+    /// lifecycle arbitration. A stale local callback, hook, or transcript row
+    /// cannot consume a newer queue item or resurrect a dismissed question.
+    @discardableResult
+    private func applyInteractionResolution(
+        _ signal: InteractionResolutionSignal,
+        origin: LifecycleObservationOrigin,
+        resolution: PendingInteractionResolution,
+        observedAt: Date,
         session: inout SessionState
-    ) {
-        guard let requestedPhase else { return }
+    ) -> Bool {
         let previous = SessionLifecycleSnapshot(session: session)
         let observation = SessionLifecycleObservation(
             sessionId: session.sessionId,
             cwd: session.cwd,
             source: session.source,
-            origin: .localInteraction,
-            evidence: .localInteraction(signal),
-            requestedPhase: requestedPhase,
-            observedAt: resolvedAt,
+            origin: origin,
+            evidence: .interactionResolution(signal),
+            requestedPhase: resolution.phase,
+            observedAt: observedAt,
             receivedAt: Date()
         )
         let transition = LifecycleReducer.reduce(
@@ -913,6 +967,9 @@ actor SessionStore {
         if case .update(let snapshot) = transition.mutation {
             snapshot.applying(to: &session)
         }
+        guard transition.acceptsObservation else { return false }
+        session.pendingInteractions = resolution.queue
+        return true
     }
 
     // MARK: - File Update Processing
@@ -1324,33 +1381,82 @@ actor SessionStore {
 
     // MARK: - Interrupt Processing
 
-    private func processInterrupt(sessionId: String) async {
+    private func processInterrupt(
+        sessionId: String,
+        observedAt: Date
+    ) async {
         guard var session = sessions[sessionId] else { return }
-
-        // Clear subagent state
-        session.subagentState = SubagentState()
-        session.pendingInteractions.removeAll()
-
-        // Mark running tools as interrupted
-        for i in 0..<session.chatItems.count {
-            if case .toolCall(var tool) = session.chatItems[i].type,
-               tool.status == .running {
-                tool.status = .interrupted
-                session.chatItems[i] = ChatHistoryItem(
-                    id: session.chatItems[i].id,
-                    type: .toolCall(tool),
-                    timestamp: session.chatItems[i].timestamp
-                )
-            }
+        let previous = SessionLifecycleSnapshot(session: session)
+        let observation = SessionLifecycleObservation(
+            sessionId: sessionId,
+            cwd: session.cwd,
+            source: session.source,
+            origin: .interruptWatcher,
+            evidence: .interrupt,
+            observedAt: observedAt,
+            receivedAt: Date()
+        )
+        let transition = LifecycleReducer.reduce(
+            current: previous,
+            observation: observation,
+            allowCreation: false,
+            activeStaleInterval: codexActiveStaleInterval,
+            missingGracePeriod:
+                SessionRetentionPolicy.missingCodexGracePeriod
+        )
+        appendLifecycleTrace(
+            observation: observation,
+            previous: previous,
+            transition: transition
+        )
+        guard transition.acceptsObservation,
+              case .update(let snapshot) = transition.mutation else {
+            return
         }
-
-        // Transition to idle
-        if session.phase.canTransition(to: .idle) {
-            session.phase = .idle
-        }
-
+        snapshot.applying(to: &session)
+        finalizeDanglingTools(in: &session)
         sessions[sessionId] = session
-        publishState()
+    }
+
+    private func processProcessExit(
+        sessionId: String,
+        pid: Int,
+        observedAt: Date
+    ) {
+        guard var session = sessions[sessionId], session.pid == pid else {
+            return
+        }
+        let previous = SessionLifecycleSnapshot(session: session)
+        let observation = SessionLifecycleObservation(
+            sessionId: sessionId,
+            cwd: session.cwd,
+            source: session.source,
+            origin: .processMonitor,
+            evidence: .processExited,
+            observedAt: observedAt,
+            receivedAt: Date()
+        )
+        let transition = LifecycleReducer.reduce(
+            current: previous,
+            observation: observation,
+            allowCreation: false,
+            activeStaleInterval: codexActiveStaleInterval,
+            missingGracePeriod:
+                SessionRetentionPolicy.missingCodexGracePeriod
+        )
+        appendLifecycleTrace(
+            observation: observation,
+            previous: previous,
+            transition: transition
+        )
+        guard case .update(let snapshot) = transition.mutation else {
+            return
+        }
+        snapshot.applying(to: &session)
+        session.pid = nil
+        finalizeDanglingTools(in: &session)
+        sessions[sessionId] = session
+        cancelPendingSync(sessionId: sessionId)
     }
 
     // MARK: - Clear Processing
@@ -1759,12 +1865,13 @@ actor SessionStore {
                 let isRunning = isProcessRunning(pid: pid)
                 if !isRunning {
                     Self.logger.info("Process \(pid) no longer running, ending session \(sessionId.prefix(8))")
-                    session.pid = nil
-                    session.phase = .ended
-                    session.completedAt = session.completedAt ?? now
-                    sessions[sessionId] = session
-                    cancelPendingSync(sessionId: sessionId)
-                    stateChanged = true
+                    processProcessExit(
+                        sessionId: sessionId,
+                        pid: pid,
+                        observedAt: now
+                    )
+                    stateChanged = sessions[sessionId]?.phase == .ended ||
+                        stateChanged
                     continue
                 }
             }
@@ -2281,6 +2388,39 @@ actor SessionStore {
                 ? .compacting
                 : .processing
             if var existing = sessions[snapshot.sessionId] {
+                let previous = SessionLifecycleSnapshot(session: existing)
+                let observation = SessionLifecycleObservation(
+                    sessionId: snapshot.sessionId,
+                    cwd: snapshot.cwd,
+                    source: source,
+                    origin: .bridgeSnapshot,
+                    evidence: .hook(
+                        snapshot.status == "compacting"
+                            ? .compacting
+                            : .active
+                    ),
+                    requestedPhase: restoredPhase,
+                    observedAt: observedAt,
+                    receivedAt: now
+                )
+                let transition = LifecycleReducer.reduce(
+                    current: previous,
+                    observation: observation,
+                    allowCreation: false,
+                    activeStaleInterval: codexActiveStaleInterval,
+                    missingGracePeriod:
+                        SessionRetentionPolicy.missingCodexGracePeriod
+                )
+                appendLifecycleTrace(
+                    observation: observation,
+                    previous: previous,
+                    transition: transition
+                )
+                guard transition.acceptsObservation,
+                      case .update(let lifecycle) = transition.mutation else {
+                    continue
+                }
+                lifecycle.applying(to: &existing)
                 existing.source = source
                 existing.pid = pid
                 existing.tty = snapshot.tty?.replacingOccurrences(
@@ -2291,10 +2431,6 @@ actor SessionStore {
                     pid: pid,
                     tree: processTree
                 )
-                existing.phase = restoredPhase
-                existing.lastActivity = observedAt
-                existing.lastHookEventAt = observedAt
-                existing.completedAt = nil
                 sessions[snapshot.sessionId] = existing
             } else {
                 let codexTitle = source == .codex

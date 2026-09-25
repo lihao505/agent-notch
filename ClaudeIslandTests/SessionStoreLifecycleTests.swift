@@ -11,7 +11,8 @@ final class SessionStoreLifecycleTests: XCTestCase {
         toolUseId: String? = nil,
         toolInput: [String: AnyCodable]? = nil,
         notificationType: String? = nil,
-        source: String? = "codex"
+        source: String? = "codex",
+        pid: Int? = nil
     ) -> HookEvent {
         HookEvent(
             sessionId: sessionId,
@@ -20,7 +21,7 @@ final class SessionStoreLifecycleTests: XCTestCase {
             status: status,
             observedAt: observedAt.timeIntervalSince1970,
             source: source,
-            pid: nil,
+            pid: pid,
             tty: nil,
             tool: tool,
             toolInput: toolInput,
@@ -400,7 +401,8 @@ final class SessionStoreLifecycleTests: XCTestCase {
             result: ToolCompletionResult(
                 status: .success,
                 result: nil,
-                structuredResult: nil
+                structuredResult: nil,
+                observedAt: now.addingTimeInterval(-1)
             )
         ))
         storedSession = await store.session(for: sessionId)
@@ -767,5 +769,178 @@ final class SessionStoreLifecycleTests: XCTestCase {
         let trace = await store.lifecycleTrace(for: sessionId)
         XCTAssertEqual(trace.last?.origin, .transcript)
         XCTAssertEqual(trace.last?.reason, .activeOlderThanHook)
+    }
+
+    func testUnrelatedToolCompletionKeepsCurrentApprovalVisible() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "unrelated-completion-\(UUID().uuidString)"
+        let now = Date()
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: now.addingTimeInterval(-2),
+            tool: "Bash",
+            toolUseId: "approval-a"
+        )))
+
+        await store.process(.toolCompleted(
+            sessionId: sessionId,
+            toolUseId: "different-tool",
+            result: ToolCompletionResult(
+                status: .success,
+                result: nil,
+                structuredResult: nil,
+                observedAt: now.addingTimeInterval(-1)
+            )
+        ))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.activePermission?.toolUseId, "approval-a")
+        XCTAssertEqual(session.pendingInteractions.toolUseIds, ["approval-a"])
+    }
+
+    func testStaleExactToolCompletionCannotDismissNewerApproval() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-exact-completion-\(UUID().uuidString)"
+        let now = Date()
+        let requestAt = now.addingTimeInterval(-1)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: requestAt,
+            tool: "Bash",
+            toolUseId: "approval-a"
+        )))
+
+        await store.process(.toolCompleted(
+            sessionId: sessionId,
+            toolUseId: "approval-a",
+            result: ToolCompletionResult(
+                status: .success,
+                result: nil,
+                structuredResult: nil,
+                observedAt: requestAt.addingTimeInterval(-1)
+            )
+        ))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.activePermission?.toolUseId, "approval-a")
+        XCTAssertEqual(session.pendingInteractions.toolUseIds, ["approval-a"])
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.reason, .interactionOlderThanBoundary)
+    }
+
+    func testStaleInterruptCannotStopNewerHookActivity() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "stale-interrupt-\(UUID().uuidString)"
+        let now = Date()
+        let hookAt = now.addingTimeInterval(-1)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PreToolUse",
+            status: "running_tool",
+            observedAt: hookAt,
+            tool: "Read",
+            toolUseId: "live-tool"
+        )))
+
+        await store.process(.interruptDetected(
+            sessionId: sessionId,
+            observedAt: hookAt.addingTimeInterval(-1)
+        ))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.reason, .interruptOlderThanBoundary)
+    }
+
+    func testFreshInterruptFinalizesRunningWork() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "fresh-interrupt-\(UUID().uuidString)"
+        let now = Date()
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PreToolUse",
+            status: "running_tool",
+            observedAt: now.addingTimeInterval(-2),
+            tool: "Read",
+            toolUseId: "live-tool"
+        )))
+
+        await store.process(.interruptDetected(
+            sessionId: sessionId,
+            observedAt: now.addingTimeInterval(-1)
+        ))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .idle)
+        guard let item = session.chatItems.first(where: {
+            $0.id == "live-tool"
+        }), case .toolCall(let tool) = item.type else {
+            return XCTFail("Expected tracked tool")
+        }
+        XCTAssertEqual(tool.status, .interrupted)
+    }
+
+    func testProcessExitRequiresMatchingCurrentPID() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "pid-fence-\(UUID().uuidString)"
+        let now = Date()
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now.addingTimeInterval(-2),
+            pid: 111
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now.addingTimeInterval(-1),
+            pid: 222
+        )))
+
+        await store.process(.processExited(
+            sessionId: sessionId,
+            pid: 111,
+            observedAt: now
+        ))
+        var storedSession = await store.session(for: sessionId)
+        var session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertEqual(session.pid, 222)
+
+        await store.process(.processExited(
+            sessionId: sessionId,
+            pid: 222,
+            observedAt: now
+        ))
+        storedSession = await store.session(for: sessionId)
+        session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .ended)
+        XCTAssertNil(session.pid)
     }
 }

@@ -343,9 +343,12 @@ class ClaudeSessionMonitor: ObservableObject {
 // MARK: - Interrupt Watcher Delegate
 
 extension ClaudeSessionMonitor: JSONLInterruptWatcherDelegate {
-    nonisolated func didDetectInterrupt(sessionId: String) {
+    nonisolated func didDetectInterrupt(sessionId: String, observedAt: Date) {
         Task {
-            await SessionStore.shared.process(.interruptDetected(sessionId: sessionId))
+            await SessionStore.shared.process(.interruptDetected(
+                sessionId: sessionId,
+                observedAt: observedAt
+            ))
         }
 
         Task { @MainActor in

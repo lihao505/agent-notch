@@ -55,7 +55,10 @@ enum SessionEvent: Sendable {
     // MARK: - Interrupt Events (from JSONLInterruptWatcher)
 
     /// User interrupted Claude (detected via JSONL)
-    case interruptDetected(sessionId: String)
+    case interruptDetected(sessionId: String, observedAt: Date)
+
+    /// The periodic process monitor confirmed that this exact PID exited.
+    case processExited(sessionId: String, pid: Int, observedAt: Date)
 
     // MARK: - Subagent Events (Task tool tracking)
 
@@ -110,6 +113,19 @@ struct ToolCompletionResult: Sendable {
     let status: ToolStatus
     let result: String?
     let structuredResult: ToolResultData?
+    let observedAt: Date?
+
+    nonisolated init(
+        status: ToolStatus,
+        result: String?,
+        structuredResult: ToolResultData?,
+        observedAt: Date? = nil
+    ) {
+        self.status = status
+        self.result = result
+        self.structuredResult = structuredResult
+        self.observedAt = observedAt
+    }
 
     nonisolated static func from(parserResult: ConversationParser.ToolResult?, structuredResult: ToolResultData?) -> ToolCompletionResult {
         let status: ToolStatus
@@ -134,7 +150,12 @@ struct ToolCompletionResult: Sendable {
             }
         }
 
-        return ToolCompletionResult(status: status, result: resultText, structuredResult: structuredResult)
+        return ToolCompletionResult(
+            status: status,
+            result: resultText,
+            structuredResult: structuredResult,
+            observedAt: parserResult?.observedAt
+        )
     }
 }
 
@@ -229,8 +250,10 @@ extension SessionEvent: CustomStringConvertible {
             return "permissionSocketFailed(session: \(sessionId.prefix(8)), tool: \(toolUseId.prefix(12)))"
         case .fileUpdated(let payload):
             return "fileUpdated(session: \(payload.sessionId.prefix(8)), messages: \(payload.messages.count))"
-        case .interruptDetected(let sessionId):
+        case .interruptDetected(let sessionId, _):
             return "interruptDetected(session: \(sessionId.prefix(8)))"
+        case .processExited(let sessionId, let pid, _):
+            return "processExited(session: \(sessionId.prefix(8)), pid: \(pid))"
         case .clearDetected(let sessionId):
             return "clearDetected(session: \(sessionId.prefix(8)))"
         case .sessionEnded(let sessionId):
