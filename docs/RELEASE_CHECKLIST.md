@@ -165,6 +165,17 @@ Claude／CodeBuddy 原生发现仍有直接状态写入，后续继续迁入统�
 当前活动摘要。真实 Claude／CodeBuddy 的乱序跨进程回合本轮未主动注入，自动化时序矩阵
 不替代该端到端验收；本地交互回调、interrupt 和进程退出仍待完全迁入统一 reducer。
 
+2026-09-25 状态内核第四阶段：Agent Notch 本地处理的批准、拒绝与 socket 发送失败
+不再直接修改 `phase`、`lastHookEventAt` 和 `completedAt`，而是以不含工具输入和回复内容的
+本地交互证据进入 `LifecycleReducer`。同会话多个请求仍按 FIFO 显示下一项；旧回调不能跨越
+较新的完成边界。修复一个实际竞态：发送失败的回调如果晚于新的活动 Hook 到达，只移除
+自己对应的旧请求并保持“工作中”，不再把已经恢复的任务错误降为“空闲”。新增 4 项
+reducer／SessionStore 回归测试，全套 205 项 Swift 测试、79 项 Bridge 测试及 5 项 verifier
+测试通过，Release 无签名构建通过。安装态检查只验证新 Release 能启动并从本条进行中的
+Codex 任务恢复“工作中”状态；本轮没有故意制造真实权限 socket 故障，因此乱序失败场景
+仍以确定性自动化测试为证。Hook／JSONL 工具完成后的队列收口、interrupt 与进程退出仍有
+直接状态写入，后续继续迁入统一 reducer。
+
 ## 可选：签名二进制发行
 
 以下项目不是公开源码仓库的前置条件；只有未来提供免 Gatekeeper 警告的官方安装包

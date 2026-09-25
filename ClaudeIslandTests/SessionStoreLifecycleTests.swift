@@ -490,6 +490,58 @@ final class SessionStoreLifecycleTests: XCTestCase {
         XCTAssertTrue(session.pendingInteractions.toolUseIds.isEmpty)
     }
 
+    func testLateSocketFailureCannotIdleNewerHookActivity() async throws {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "late-socket-failure-\(UUID().uuidString)"
+        let now = Date()
+        let requestAt = now.addingTimeInterval(-3)
+        let failureAt = now.addingTimeInterval(-2)
+        let resumedAt = now.addingTimeInterval(-1)
+
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "PermissionRequest",
+            status: "waiting_for_approval",
+            observedAt: requestAt,
+            tool: "Bash",
+            toolUseId: "late-failed-tool"
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: resumedAt
+        )))
+
+        // The socket callback was initiated before the newer prompt, but was
+        // delivered afterward. It may dismiss its exact interaction; it must
+        // not downgrade the resumed task to idle.
+        await store.process(.permissionSocketFailed(
+            sessionId: sessionId,
+            toolUseId: "late-failed-tool",
+            resolvedAt: failureAt
+        ))
+
+        let storedSession = await store.session(for: sessionId)
+        let session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertTrue(session.pendingInteractions.toolUseIds.isEmpty)
+        XCTAssertEqual(
+            try XCTUnwrap(session.lastHookEventAt).timeIntervalSince1970,
+            resumedAt.timeIntervalSince1970,
+            accuracy: 0.001
+        )
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.last?.origin, .localInteraction)
+        XCTAssertEqual(
+            trace.last?.reason,
+            .localFailurePreservedNewerActivity
+        )
+    }
+
     func testPermissionRequestInterruptsCompactionWithoutBeingDropped() async throws {
         let store = SessionStore(
             persistenceEnabled: false,

@@ -555,4 +555,93 @@ final class LifecycleReducerTests: XCTestCase {
         XCTAssertEqual(transition.reason, .activeOlderThanHook)
         XCTAssertFalse(transition.acceptsObservation)
     }
+
+    func testSocketFailurePreservesNewerHookActivity() throws {
+        let failureAt = Date(timeIntervalSince1970: 18_000)
+        let newerHookAt = failureAt.addingTimeInterval(1)
+        let transition = reduce(
+            current: snapshot(
+                phase: .waitingForApproval(PermissionContext(
+                    toolUseId: "failed-tool",
+                    toolName: "Bash",
+                    toolInput: nil,
+                    receivedAt: failureAt.addingTimeInterval(-1)
+                )),
+                lastActivity: newerHookAt,
+                lastHookEventAt: newerHookAt
+            ),
+            observation: observation(
+                .localInteraction(.deliveryFailed),
+                observedAt: failureAt,
+                receivedAt: newerHookAt,
+                origin: .localInteraction,
+                requestedPhase: .idle
+            )
+        )
+
+        XCTAssertEqual(
+            transition.reason,
+            .localFailurePreservedNewerActivity
+        )
+        let next = try XCTUnwrap(transition.nextSnapshot)
+        XCTAssertEqual(next.phase, .processing)
+        XCTAssertEqual(next.lastHookEventAt, newerHookAt)
+        XCTAssertNil(next.completedAt)
+    }
+
+    func testLocalResolutionCanAdvanceToNextQueuedInteraction() throws {
+        let resolvedAt = Date(timeIntervalSince1970: 19_000)
+        let nextPermission = PermissionContext(
+            toolUseId: "next-tool",
+            toolName: "Edit",
+            toolInput: nil,
+            receivedAt: resolvedAt
+        )
+        let transition = reduce(
+            current: snapshot(
+                phase: .processing,
+                lastActivity: resolvedAt.addingTimeInterval(-1)
+            ),
+            observation: observation(
+                .localInteraction(.approved),
+                observedAt: resolvedAt,
+                receivedAt: resolvedAt,
+                origin: .localInteraction,
+                requestedPhase: .waitingForApproval(nextPermission)
+            )
+        )
+
+        XCTAssertEqual(transition.reason, .localInteractionResolved)
+        let next = try XCTUnwrap(transition.nextSnapshot)
+        XCTAssertEqual(next.phase, .waitingForApproval(nextPermission))
+        XCTAssertEqual(next.lastActivity, resolvedAt)
+        XCTAssertEqual(next.lastHookEventAt, resolvedAt)
+    }
+
+    func testLocalResolutionCannotCrossNewerCompletion() {
+        let resolvedAt = Date(timeIntervalSince1970: 20_000)
+        let completedAt = resolvedAt.addingTimeInterval(1)
+        let transition = reduce(
+            current: snapshot(
+                phase: .waitingForInput,
+                lastActivity: completedAt,
+                lastHookEventAt: completedAt,
+                completedAt: completedAt
+            ),
+            observation: observation(
+                .localInteraction(.approved),
+                observedAt: resolvedAt,
+                receivedAt: completedAt,
+                origin: .localInteraction,
+                requestedPhase: .processing
+            )
+        )
+
+        XCTAssertEqual(transition.mutation, .none)
+        XCTAssertEqual(
+            transition.reason,
+            .localInteractionOlderThanCompletion
+        )
+        XCTAssertFalse(transition.acceptsObservation)
+    }
 }

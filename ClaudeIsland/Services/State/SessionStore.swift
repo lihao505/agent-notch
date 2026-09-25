@@ -394,11 +394,13 @@ actor SessionStore {
                         event.event == "PostToolUseFailure" ||
                         event.event == "PermissionDenied"),
                       let toolUseId = event.toolUseId {
-                resolvePendingInteraction(
+                if let resolvedPhase = resolvePendingInteraction(
                     toolUseId: toolUseId,
                     fallbackPhase: .processing,
                     session: &session
-                )
+                ) {
+                    session.phase = resolvedPhase
+                }
             }
         }
 
@@ -524,7 +526,7 @@ actor SessionStore {
         toolUseId: String,
         fallbackPhase: SessionPhase,
         session: inout SessionState
-    ) {
+    ) -> SessionPhase? {
         let wasVisible: Bool
         if case .waitingForApproval(let context) = session.phase {
             wasVisible = context.toolUseId == toolUseId
@@ -533,12 +535,13 @@ actor SessionStore {
         }
         let removed = session.pendingInteractions.remove(toolUseId: toolUseId)
         if let next = session.pendingInteractions.current {
-            session.phase = .waitingForApproval(next)
+            return .waitingForApproval(next)
         } else if wasVisible || removed != nil || session.phase.isWaitingForApproval {
             if session.phase.canTransition(to: fallbackPhase) {
-                session.phase = fallbackPhase
+                return fallbackPhase
             }
         }
+        return nil
     }
 
     private func processToolTracking(event: HookEvent, session: inout SessionState) {
@@ -750,15 +753,16 @@ actor SessionStore {
         // Update tool status in chat history first
         updateToolStatus(in: &session, toolId: toolUseId, status: .running)
 
-        resolvePendingInteraction(
+        let resolvedPhase = resolvePendingInteraction(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
             session: &session
         )
-
-        recordLocalInteractionBoundary(
-            in: &session,
-            resolvedAt: resolvedAt
+        applyLocalInteractionResolution(
+            .approved,
+            requestedPhase: resolvedPhase,
+            resolvedAt: resolvedAt,
+            session: &session
         )
 
         sessions[sessionId] = session
@@ -775,11 +779,13 @@ actor SessionStore {
         if let existingItem = session.chatItems.first(where: { $0.id == toolUseId }),
            case .toolCall(let tool) = existingItem.type,
            tool.status == .success || tool.status == .error || tool.status == .interrupted {
-            resolvePendingInteraction(
+            if let resolvedPhase = resolvePendingInteraction(
                 toolUseId: toolUseId,
                 fallbackPhase: .processing,
                 session: &session
-            )
+            ) {
+                session.phase = resolvedPhase
+            }
             sessions[sessionId] = session
             return
         }
@@ -801,11 +807,13 @@ actor SessionStore {
             }
         }
 
-        resolvePendingInteraction(
+        if let resolvedPhase = resolvePendingInteraction(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
             session: &session
-        )
+        ) {
+            session.phase = resolvedPhase
+        }
 
         sessions[sessionId] = session
     }
@@ -824,15 +832,16 @@ actor SessionStore {
         // Update tool status in chat history first
         updateToolStatus(in: &session, toolId: toolUseId, status: .error)
 
-        resolvePendingInteraction(
+        let resolvedPhase = resolvePendingInteraction(
             toolUseId: toolUseId,
             fallbackPhase: .processing,
             session: &session
         )
-
-        recordLocalInteractionBoundary(
-            in: &session,
-            resolvedAt: resolvedAt
+        applyLocalInteractionResolution(
+            .denied,
+            requestedPhase: resolvedPhase,
+            resolvedAt: resolvedAt,
+            session: &session
         )
 
         sessions[sessionId] = session
@@ -851,15 +860,16 @@ actor SessionStore {
         // Mark the failed tool's status as error
         updateToolStatus(in: &session, toolId: toolUseId, status: .error)
 
-        resolvePendingInteraction(
+        let resolvedPhase = resolvePendingInteraction(
             toolUseId: toolUseId,
             fallbackPhase: .idle,
             session: &session
         )
-
-        recordLocalInteractionBoundary(
-            in: &session,
-            resolvedAt: resolvedAt
+        applyLocalInteractionResolution(
+            .deliveryFailed,
+            requestedPhase: resolvedPhase,
+            resolvedAt: resolvedAt,
+            session: &session
         )
 
         sessions[sessionId] = session
@@ -869,16 +879,40 @@ actor SessionStore {
     /// local lifecycle boundary. A Stop or duplicate PermissionRequest that
     /// was observed before this response must not arrive late and overwrite
     /// the resumed state or resurrect a dismissed question card.
-    private func recordLocalInteractionBoundary(
-        in session: inout SessionState,
-        resolvedAt: Date
+    private func applyLocalInteractionResolution(
+        _ signal: LocalInteractionSignal,
+        requestedPhase: SessionPhase?,
+        resolvedAt: Date,
+        session: inout SessionState
     ) {
-        session.lastActivity = max(session.lastActivity, resolvedAt)
-        session.lastHookEventAt = max(
-            session.lastHookEventAt ?? .distantPast,
-            resolvedAt
+        guard let requestedPhase else { return }
+        let previous = SessionLifecycleSnapshot(session: session)
+        let observation = SessionLifecycleObservation(
+            sessionId: session.sessionId,
+            cwd: session.cwd,
+            source: session.source,
+            origin: .localInteraction,
+            evidence: .localInteraction(signal),
+            requestedPhase: requestedPhase,
+            observedAt: resolvedAt,
+            receivedAt: Date()
         )
-        session.completedAt = nil
+        let transition = LifecycleReducer.reduce(
+            current: previous,
+            observation: observation,
+            allowCreation: false,
+            activeStaleInterval: codexActiveStaleInterval,
+            missingGracePeriod:
+                SessionRetentionPolicy.missingCodexGracePeriod
+        )
+        appendLifecycleTrace(
+            observation: observation,
+            previous: previous,
+            transition: transition
+        )
+        if case .update(let snapshot) = transition.mutation {
+            snapshot.applying(to: &session)
+        }
     }
 
     // MARK: - File Update Processing

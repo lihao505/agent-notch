@@ -14,6 +14,7 @@ nonisolated enum LifecycleObservationOrigin: String, Equatable, Sendable {
     case codexDiscovery
     case codexPolling
     case hook
+    case localInteraction
     case transcript
 }
 
@@ -28,12 +29,22 @@ nonisolated enum HookLifecycleSignal: String, Equatable, Sendable {
     case removed
 }
 
+/// Privacy-safe result of an interaction handled by Agent Notch itself. The
+/// permission context and response payload remain in SessionStore and never
+/// enter the lifecycle decision trace.
+nonisolated enum LocalInteractionSignal: String, Equatable, Sendable {
+    case approved
+    case denied
+    case deliveryFailed
+}
+
 nonisolated enum LifecycleEvidence: Equatable, Sendable {
     case active(turnStartedAt: Date?, lastEvidenceAt: Date?)
     case completed(Date?)
     case missing
     case unknown
     case hook(HookLifecycleSignal)
+    case localInteraction(LocalInteractionSignal)
 
     init(codexLifecycle: CodexTaskLifecycle) {
         switch codexLifecycle {
@@ -165,6 +176,10 @@ nonisolated enum LifecycleTransitionReason: String, Equatable, Sendable {
     case hookSessionRemoved
     case hookOlderThanBoundary
     case invalidHookPhase
+    case localInteractionResolved
+    case localFailurePreservedNewerActivity
+    case localInteractionOlderThanCompletion
+    case invalidLocalInteractionPhase
 }
 
 nonisolated enum LifecycleTransitionMutation: Equatable, Sendable {
@@ -209,7 +224,9 @@ nonisolated struct LifecycleTransition: Equatable, Sendable {
              .completionOlderThanTurn,
              .sessionNotFound,
              .hookOlderThanBoundary,
-             .invalidHookPhase:
+             .invalidHookPhase,
+             .localInteractionOlderThanCompletion,
+             .invalidLocalInteractionPhase:
             return false
         default:
             return true
@@ -323,6 +340,13 @@ nonisolated enum LifecycleReducer {
 
         case .hook(let signal):
             return reduceHook(
+                current: current,
+                observation: observation,
+                signal: signal
+            )
+
+        case .localInteraction(let signal):
+            return reduceLocalInteraction(
                 current: current,
                 observation: observation,
                 signal: signal
@@ -704,5 +728,66 @@ nonisolated enum LifecycleReducer {
                 reason: .hookSessionEnded
             )
         }
+    }
+
+    /// Local permission callbacks are authoritative for the exact interaction
+    /// removed by SessionStore, but they must not erase a newer completion or
+    /// let a late delivery failure idle work that resumed in the meantime.
+    private static func reduceLocalInteraction(
+        current: SessionLifecycleSnapshot?,
+        observation: SessionLifecycleObservation,
+        signal: LocalInteractionSignal
+    ) -> LifecycleTransition {
+        guard var next = current else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .sessionNotFound
+            )
+        }
+        guard let requestedPhase = observation.requestedPhase,
+              requestedPhase == .processing ||
+                requestedPhase == .idle ||
+                requestedPhase.isWaitingForApproval else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .invalidLocalInteractionPhase
+            )
+        }
+
+        let resolvedAt = observation.observedAt
+        if let completedAt = next.completedAt, resolvedAt <= completedAt {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .localInteractionOlderThanCompletion
+            )
+        }
+
+        let previous = next
+        let newerHookExists = (next.lastHookEventAt ?? .distantPast) > resolvedAt
+        let preservesNewerActivity = signal == .deliveryFailed &&
+            requestedPhase == .idle &&
+            newerHookExists
+
+        next.source = observation.source
+        next.phase = preservesNewerActivity ? .processing : requestedPhase
+        next.lastActivity = max(next.lastActivity, resolvedAt)
+        next.lastHookEventAt = max(
+            next.lastHookEventAt ?? .distantPast,
+            resolvedAt
+        )
+        next.completedAt = nil
+
+        guard next != previous else {
+            return LifecycleTransition(
+                mutation: .none,
+                reason: .alreadyCurrent
+            )
+        }
+        return LifecycleTransition(
+            mutation: .update(next),
+            reason: preservesNewerActivity
+                ? .localFailurePreservedNewerActivity
+                : .localInteractionResolved
+        )
     }
 }
