@@ -9,6 +9,7 @@ private enum NotchStudioSection: String, CaseIterable, Identifiable {
     case notifications = "Notifications"
     case shortcuts = "Shortcuts"
     case usage = "Usage"
+    case diagnostics = "Diagnostics"
     case system = "System"
 
     var id: String { rawValue }
@@ -20,6 +21,7 @@ private enum NotchStudioSection: String, CaseIterable, Identifiable {
         case .notifications: return language.text("Notifications", "通知")
         case .shortcuts: return language.text("Shortcuts", "快捷键")
         case .usage: return language.text("Usage", "用量")
+        case .diagnostics: return language.text("Diagnostics", "诊断")
         case .system: return language.text("System", "系统")
         }
     }
@@ -31,6 +33,7 @@ private enum NotchStudioSection: String, CaseIterable, Identifiable {
         case .notifications: return "bell.badge"
         case .shortcuts: return "keyboard"
         case .usage: return "chart.bar.fill"
+        case .diagnostics: return "waveform.path.ecg.rectangle"
         case .system: return "point.3.connected.trianglepath.dotted"
         }
     }
@@ -91,6 +94,8 @@ struct NotchStudioSettingsView: View {
                             shortcutSettings
                         case .usage:
                             usageSettings
+                        case .diagnostics:
+                            LifecycleDiagnosticsView(language: preferences.language)
                         case .system:
                             systemSettings
                         }
@@ -207,6 +212,11 @@ struct NotchStudioSettingsView: View {
             return t(
                 "Keep subscription limits visible without leaving your task.",
                 "无需离开任务即可查看订阅用量。"
+            )
+        case .diagnostics:
+            return t(
+                "Understand why an agent state changed or stayed the same.",
+                "查看智能体状态为何变化，或为何保持不变。"
             )
         case .system:
             return t(

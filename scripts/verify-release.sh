@@ -26,6 +26,7 @@ required_files=(
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIsland/Services/State/LifecycleReducer.swift
     ClaudeIsland/Services/State/LifecycleDiagnostics.swift
+    ClaudeIsland/Services/State/LifecycleDiagnosticsCoordinator.swift
     ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
     ClaudeIsland/Services/Shared/NotchSilenceRuleStore.swift
     ClaudeIsland/Services/Shared/NotchQuietSceneMonitor.swift
@@ -35,6 +36,8 @@ required_files=(
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
     ClaudeIslandTests/LifecycleReducerTests.swift
     ClaudeIslandTests/LifecycleDiagnosticsTests.swift
+    ClaudeIslandTests/LifecycleDiagnosticsCoordinatorTests.swift
+    ClaudeIslandTests/LifecycleDiagnosticsRenderingTests.swift
     ClaudeIslandTests/PermissionRoutingTests.swift
     ClaudeIslandTests/ConversationParserIndexTests.swift
     ClaudeIslandTests/CodexNativeConversationTests.swift
@@ -46,6 +49,7 @@ required_files=(
     ClaudeIslandTests/NotchSilenceRuleTests.swift
     ClaudeIsland/Services/Shared/NotchShortcutController.swift
     ClaudeIslandTests/NotchShortcutTests.swift
+    ClaudeIsland/UI/Views/LifecycleDiagnosticsView.swift
     ClaudeIsland/Models/SessionNavigationPolicy.swift
     ClaudeIsland/UI/Components/NotchShortcutSettingsEditor.swift
     ClaudeIslandTests/SessionNavigationTests.swift
