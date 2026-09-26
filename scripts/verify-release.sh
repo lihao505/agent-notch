@@ -25,6 +25,7 @@ required_files=(
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIsland/Services/State/LifecycleReducer.swift
+    ClaudeIsland/Services/State/LifecycleDiagnostics.swift
     ClaudeIsland/Services/Shared/NotchAttentionSilencePolicy.swift
     ClaudeIsland/Services/Shared/NotchSilenceRuleStore.swift
     ClaudeIsland/Services/Shared/NotchQuietSceneMonitor.swift
@@ -33,6 +34,7 @@ required_files=(
     ClaudeIslandTests/AgentTransportTests.swift
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
     ClaudeIslandTests/LifecycleReducerTests.swift
+    ClaudeIslandTests/LifecycleDiagnosticsTests.swift
     ClaudeIslandTests/PermissionRoutingTests.swift
     ClaudeIslandTests/ConversationParserIndexTests.swift
     ClaudeIslandTests/CodexNativeConversationTests.swift

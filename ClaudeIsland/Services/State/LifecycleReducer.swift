@@ -284,6 +284,7 @@ nonisolated struct LifecycleTraceEntry: Equatable, Sendable {
     let origin: LifecycleObservationOrigin
     let evidence: LifecycleEvidence
     let reason: LifecycleTransitionReason
+    let accepted: Bool
     let didMutate: Bool
     let previousPhase: LifecyclePhaseKind?
     let nextPhase: LifecyclePhaseKind?
@@ -298,6 +299,7 @@ nonisolated struct LifecycleTraceEntry: Equatable, Sendable {
         origin = observation.origin
         evidence = observation.evidence
         reason = transition.reason
+        accepted = transition.acceptsObservation
         didMutate = transition.didMutate
         previousPhase = previous.map { LifecyclePhaseKind($0.phase) }
         switch transition.mutation {

@@ -2,7 +2,7 @@
 
 日期：2026-09-26
 
-状态：待用户审阅
+状态：实施中（第 1 切片：纯诊断模型与隐私测试）
 
 主题：真实回合验收与隐私安全的生命周期诊断
 
@@ -175,7 +175,7 @@ Agent Notch 已经将 Codex 原生发现、Hook、Transcript、本地审批回�
 ### 8.2 隔离集成测试
 
 - 使用临时 Unix socket 验证启动、事件接收、权限计数、超时和停止的健康快照。
-- 为 watcher 提供测试专用文件 URL，验证晚创建、半行 UTF-8、truncate、rename、delete、
+- 为 watcher 提供测试专用文件 URL，验证晚创建、半行 UTF-8、truncate、rename、delete
   后的状态序列与恢复；`revoke` 通过提取后的事件决策函数确定性验证，不依赖系统偶发事件，
   且所有测试都不读取用户真实 `~/.claude`。
 - 注入旧 interrupt 后确认 reducer 拒绝，watcher 状态仍为 `watching`。
