@@ -3,8 +3,26 @@
 //  Agent Notch
 //
 
+import Darwin
 import XCTest
 @testable import Agent_Notch
+
+private final class WatcherDiagnosticsRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [DiagnosticsWatcherInput] = []
+
+    func record(_ input: DiagnosticsWatcherInput) {
+        lock.lock()
+        values.append(input)
+        lock.unlock()
+    }
+
+    func latest(_ state: InterruptWatcherHealth) -> DiagnosticsWatcherInput? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values.last(where: { $0.state == state })
+    }
+}
 
 final class LifecycleDiagnosticsTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
@@ -174,5 +192,125 @@ final class LifecycleDiagnosticsTests: XCTestCase {
             isRunning: false, socketExists: false, ownsSocket: false,
             pendingPermissionSessionIds: [], lastEventAt: nil
         )).health, .unavailable)
+    }
+
+    func testSessionStoreExposesOnlyLifecycleDiagnosticInputs() async throws {
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false)
+        let secretSessionId = "raw-store-session-secret"
+        let event = HookEvent(
+            sessionId: secretSessionId,
+            cwd: "/Users/private/secret-project",
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: Date().timeIntervalSince1970,
+            source: "codex",
+            pid: 12345,
+            tty: "secret-tty",
+            tool: "Bash",
+            toolInput: ["command": AnyCodable("secret-command")],
+            toolUseId: "secret-tool-id",
+            notificationType: nil,
+            message: "secret-message"
+        )
+        await store.process(.hookReceived(event))
+
+        let input = await store.diagnosticsInput()
+        XCTAssertEqual(input.sessions.count, 1)
+        XCTAssertEqual(input.sessions.first?.phase, .processing)
+        XCTAssertEqual(input.sessions.first?.hasProcess, true)
+        XCTAssertFalse(input.decisions.isEmpty)
+
+        let report = try DiagnosticsReportFormatter.json(
+            LifecycleDiagnosticsAssembler.build(
+                at: Date(), appVersion: "1.2.3", macOSMajorVersion: 15,
+                sessions: input.sessions, decisions: input.decisions,
+                bridge: DiagnosticsBridgeInput(
+                    isRunning: false, socketExists: false, ownsSocket: false,
+                    pendingPermissionSessionIds: [], lastEventAt: nil
+                ), watchers: []
+            )
+        )
+        for secret in [secretSessionId, "secret-project", "secret-tty", "secret-command", "secret-tool-id", "secret-message", "12345"] {
+            XCTAssertFalse(report.contains(secret), "Report leaked: \(secret)")
+        }
+    }
+
+    func testWatcherReportsWaitingWatchingAndStoppedWithoutFilePath() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-notch-watcher-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fileURL = folder.appendingPathComponent("secret-transcript.jsonl")
+        let recorder = WatcherDiagnosticsRecorder()
+        let watcher = JSONLInterruptWatcher(
+            sessionId: "raw-watcher-session",
+            fileURL: fileURL,
+            onDiagnosticsChanged: { recorder.record($0) }
+        )
+
+        func waitFor(_ state: InterruptWatcherHealth) -> DiagnosticsWatcherInput? {
+            for _ in 0..<500 {
+                if let input = recorder.latest(state) { return input }
+                usleep(10_000)
+            }
+            return nil
+        }
+
+        watcher.start()
+        XCTAssertNotNil(waitFor(.waitingForFile))
+        try Data().write(to: fileURL)
+        let watching = try XCTUnwrap(waitFor(.watching))
+        XCTAssertNotNil(watching.lastOpenedAt)
+
+        watcher.stop()
+        XCTAssertNotNil(waitFor(.stopped))
+        let report = try DiagnosticsReportFormatter.json(snapshot(watchers: [watching]))
+        XCTAssertFalse(report.contains("raw-watcher-session"))
+        XCTAssertFalse(report.contains("secret-transcript.jsonl"))
+        XCTAssertFalse(report.contains(folder.path))
+    }
+
+    func testWatcherOpenFailureDistinguishesLateFileFromRecovery() {
+        XCTAssertEqual(
+            JSONLInterruptWatcher.openFailureState(fileExists: false, hasOpenedFile: false),
+            .waitingForFile
+        )
+        XCTAssertEqual(
+            JSONLInterruptWatcher.openFailureState(fileExists: true, hasOpenedFile: false),
+            .recovering
+        )
+        XCTAssertEqual(
+            JSONLInterruptWatcher.openFailureState(fileExists: false, hasOpenedFile: true),
+            .recovering
+        )
+    }
+
+    @MainActor
+    func testManagerCachesWatcherHealthAcrossStopAndRestart() async throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-notch-manager-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let manager = InterruptWatcherManager()
+        defer { manager.stopAll() }
+        let sessionId = "manager-raw-id"
+        let firstFile = folder.appendingPathComponent("first.jsonl")
+        let secondFile = folder.appendingPathComponent("second.jsonl")
+
+        manager.startWatching(sessionId: sessionId, fileURL: firstFile)
+        XCTAssertEqual(manager.diagnosticsInputs().first?.state, .waitingForFile)
+        try Data().write(to: firstFile)
+        let deadline = Date().addingTimeInterval(4)
+        while manager.diagnosticsInputs().first?.state != .watching && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(manager.diagnosticsInputs().first?.state, .watching)
+
+        manager.stopWatching(sessionId: sessionId)
+        XCTAssertEqual(manager.diagnosticsInputs().first?.state, .stopped)
+        manager.startWatching(sessionId: sessionId, fileURL: secondFile)
+        XCTAssertEqual(manager.diagnosticsInputs().first?.state, .waitingForFile)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(manager.diagnosticsInputs().first?.state, .waitingForFile)
     }
 }

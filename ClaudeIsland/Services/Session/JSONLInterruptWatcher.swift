@@ -81,8 +81,14 @@ final class JSONLInterruptWatcher {
     private var lineBuffer = JSONLLineBuffer()
     private var isRequested = false
     private var retryAttempt = 0
+    private var hasOpenedFile = false
+    private var healthState: InterruptWatcherHealth = .stopped
+    private var lastOpenedAt: Date?
+    private var lastEventAt: Date?
+    private var lastRetryAt: Date?
     private let sessionId: String
     private let filePath: String
+    private let onDiagnosticsChanged: (@Sendable (DiagnosticsWatcherInput) -> Void)?
     private let queue = DispatchQueue(label: "com.claudeisland.interruptwatcher", qos: .userInteractive)
 
     weak var delegate: JSONLInterruptWatcherDelegate?
@@ -96,11 +102,28 @@ final class JSONLInterruptWatcher {
         "[Request interrupted by user"
     ]
 
-    init(sessionId: String, cwd: String) {
+    init(
+        sessionId: String,
+        cwd: String,
+        onDiagnosticsChanged: (@Sendable (DiagnosticsWatcherInput) -> Void)? = nil
+    ) {
         self.sessionId = sessionId
         let projectDir = cwd.replacingOccurrences(of: "/", with: "-")
                             .replacingOccurrences(of: ".", with: "-")
         self.filePath = ClaudePaths.projectsDir.path + "/" + projectDir + "/" + sessionId + ".jsonl"
+        self.onDiagnosticsChanged = onDiagnosticsChanged
+    }
+
+    /// An isolated URL lets tests exercise real file events without opening
+    /// the user's Claude project directory.
+    init(
+        sessionId: String,
+        fileURL: URL,
+        onDiagnosticsChanged: (@Sendable (DiagnosticsWatcherInput) -> Void)? = nil
+    ) {
+        self.sessionId = sessionId
+        self.filePath = fileURL.path
+        self.onDiagnosticsChanged = onDiagnosticsChanged
     }
 
     /// Start watching the JSONL file for interrupts
@@ -109,6 +132,8 @@ final class JSONLInterruptWatcher {
             guard let self else { return }
             self.isRequested = true
             self.retryAttempt = 0
+            self.hasOpenedFile = false
+            self.publishDiagnostics(state: .waitingForFile)
             self.openWatcher(seekToEnd: true)
         }
     }
@@ -118,9 +143,14 @@ final class JSONLInterruptWatcher {
         retryWorkItem?.cancel()
         retryWorkItem = nil
 
-        guard FileManager.default.fileExists(atPath: filePath),
+        let fileExists = FileManager.default.fileExists(atPath: filePath)
+        guard fileExists,
               let handle = FileHandle(forReadingAtPath: filePath) else {
             logger.warning("Failed to open file: \(self.filePath, privacy: .public)")
+            publishDiagnostics(state: Self.openFailureState(
+                fileExists: fileExists,
+                hasOpenedFile: hasOpenedFile
+            ))
             scheduleOpenRetry()
             return
         }
@@ -138,6 +168,7 @@ final class JSONLInterruptWatcher {
             logger.error("Failed to seek to end: \(error.localizedDescription, privacy: .public)")
             try? handle.close()
             fileHandle = nil
+            publishDiagnostics(state: .recovering)
             scheduleOpenRetry()
             return
         }
@@ -151,13 +182,16 @@ final class JSONLInterruptWatcher {
 
         newSource.setEventHandler { [weak self, weak newSource] in
             guard let self, let newSource else { return }
+            self.lastEventAt = Date()
             let events = newSource.data
             if events.contains(.delete) ||
                 events.contains(.rename) ||
                 events.contains(.revoke) {
+                self.publishDiagnostics(state: .recovering)
                 self.closeCurrentSource()
                 self.scheduleOpenRetry()
             } else {
+                self.publishDiagnostics(state: .watching)
                 self.checkForInterrupt()
             }
         }
@@ -168,6 +202,9 @@ final class JSONLInterruptWatcher {
 
         source = newSource
         newSource.resume()
+        hasOpenedFile = true
+        lastOpenedAt = Date()
+        publishDiagnostics(state: .watching)
 
         logger.debug("Started watching: \(self.sessionId.prefix(8), privacy: .public)...")
     }
@@ -177,6 +214,8 @@ final class JSONLInterruptWatcher {
         let exponent = min(retryAttempt, 3)
         let delay = min(0.25 * pow(2.0, Double(exponent)), 2.0)
         retryAttempt += 1
+        lastRetryAt = Date()
+        publishDiagnostics(state: healthState)
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.retryWorkItem = nil
@@ -185,6 +224,13 @@ final class JSONLInterruptWatcher {
         }
         retryWorkItem = item
         queue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    nonisolated static func openFailureState(
+        fileExists: Bool,
+        hasOpenedFile: Bool
+    ) -> InterruptWatcherHealth {
+        fileExists || hasOpenedFile ? .recovering : .waitingForFile
     }
 
     private func checkForInterrupt() {
@@ -327,7 +373,20 @@ final class JSONLInterruptWatcher {
             self.retryWorkItem?.cancel()
             self.retryWorkItem = nil
             self.closeCurrentSource()
+            self.publishDiagnostics(state: .stopped)
         }
+    }
+
+    private func publishDiagnostics(state: InterruptWatcherHealth) {
+        healthState = state
+        onDiagnosticsChanged?(DiagnosticsWatcherInput(
+            sessionId: sessionId,
+            state: state,
+            retryCount: retryAttempt,
+            lastOpenedAt: lastOpenedAt,
+            lastEventAt: lastEventAt,
+            lastRetryAt: lastRetryAt
+        ))
     }
 
     private func closeCurrentSource() {
@@ -357,14 +416,58 @@ class InterruptWatcherManager {
     static let shared = InterruptWatcherManager()
 
     private var watchers: [String: JSONLInterruptWatcher] = [:]
+    private var generations: [String: UUID] = [:]
+    private var diagnostics: [String: DiagnosticsWatcherInput] = [:]
+    private var stoppedOrder: [String] = []
     weak var delegate: JSONLInterruptWatcherDelegate?
 
-    private init() {}
+    init() {}
 
     func startWatching(sessionId: String, cwd: String) {
+        installWatcher(sessionId: sessionId) { callback in
+            JSONLInterruptWatcher(
+                sessionId: sessionId,
+                cwd: cwd,
+                onDiagnosticsChanged: callback
+            )
+        }
+    }
+
+    /// Isolated file URL for integration tests; production uses the cwd path.
+    func startWatching(sessionId: String, fileURL: URL) {
+        installWatcher(sessionId: sessionId) { callback in
+            JSONLInterruptWatcher(
+                sessionId: sessionId,
+                fileURL: fileURL,
+                onDiagnosticsChanged: callback
+            )
+        }
+    }
+
+    private func installWatcher(
+        sessionId: String,
+        create: (@escaping @Sendable (DiagnosticsWatcherInput) -> Void) -> JSONLInterruptWatcher
+    ) {
         guard watchers[sessionId] == nil else { return }
 
-        let watcher = JSONLInterruptWatcher(sessionId: sessionId, cwd: cwd)
+        let generation = UUID()
+        generations[sessionId] = generation
+        stoppedOrder.removeAll { $0 == sessionId }
+        diagnostics[sessionId] = DiagnosticsWatcherInput(
+            sessionId: sessionId,
+            state: .waitingForFile,
+            retryCount: 0,
+            lastOpenedAt: nil,
+            lastEventAt: nil,
+            lastRetryAt: nil
+        )
+        let watcher = create { [weak self] input in
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.generations[input.sessionId] == generation else { return }
+                self.diagnostics[input.sessionId] = input
+            }
+        }
         watcher.delegate = delegate
         watcher.start()
         watchers[sessionId] = watcher
@@ -372,16 +475,35 @@ class InterruptWatcherManager {
 
     /// Stop watching a specific session
     func stopWatching(sessionId: String) {
-        watchers[sessionId]?.stop()
-        watchers.removeValue(forKey: sessionId)
+        guard let watcher = watchers.removeValue(forKey: sessionId) else { return }
+        generations.removeValue(forKey: sessionId)
+        watcher.stop()
+        let previous = diagnostics[sessionId]
+        diagnostics[sessionId] = DiagnosticsWatcherInput(
+            sessionId: sessionId,
+            state: .stopped,
+            retryCount: previous?.retryCount ?? 0,
+            lastOpenedAt: previous?.lastOpenedAt,
+            lastEventAt: previous?.lastEventAt,
+            lastRetryAt: previous?.lastRetryAt
+        )
+        stoppedOrder.append(sessionId)
+        if stoppedOrder.count > 100 {
+            let oldest = stoppedOrder.removeFirst()
+            diagnostics.removeValue(forKey: oldest)
+        }
     }
 
     /// Stop all watchers
     func stopAll() {
-        for (_, watcher) in watchers {
-            watcher.stop()
+        for sessionId in Array(watchers.keys) {
+            stopWatching(sessionId: sessionId)
         }
-        watchers.removeAll()
+    }
+
+    /// Main-actor cache; no synchronous call into a watcher's file queue.
+    func diagnosticsInputs() -> [DiagnosticsWatcherInput] {
+        Array(diagnostics.values)
     }
 
     /// Check if we're watching a session

@@ -2604,4 +2604,29 @@ actor SessionStore {
             $0.sessionId == sessionId ? $0.entry : nil
         }
     }
+
+    /// Read-only, short-lived diagnostics source. Never returns SessionState,
+    /// PermissionContext, transcript text, or tool input to the UI layer.
+    func diagnosticsInput() -> SessionStoreDiagnosticsInput {
+        let summaries = sessions.map { sessionId, session in
+            let waitingForPermission: Bool
+            if case .waitingForApproval = session.phase {
+                waitingForPermission = true
+            } else {
+                waitingForPermission = false
+            }
+            return DiagnosticsSessionInput(
+                sessionId: sessionId,
+                source: session.source,
+                phase: LifecyclePhaseKind(session.phase),
+                hasProcess: session.pid != nil,
+                waitingForPermission: waitingForPermission,
+                lastActivity: session.lastActivity
+            )
+        }
+        let decisions = lifecycleTraceEntries.map { item in
+            DiagnosticsDecisionInput(sessionId: item.sessionId, trace: item.entry)
+        }
+        return SessionStoreDiagnosticsInput(sessions: summaries, decisions: decisions)
+    }
 }

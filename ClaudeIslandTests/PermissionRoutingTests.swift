@@ -114,6 +114,14 @@ final class PermissionRoutingTests: XCTestCase {
             usleep(10_000)
         }
         XCTAssertEqual(access(socketPath, F_OK), 0)
+        for _ in 0..<100 where !server.diagnosticsInput().isRunning {
+            usleep(10_000)
+        }
+        let running = server.diagnosticsInput()
+        XCTAssertTrue(running.isRunning)
+        XCTAssertTrue(running.socketExists)
+        XCTAssertTrue(running.ownsSocket)
+        XCTAssertTrue(running.pendingPermissionSessionIds.isEmpty)
 
         let clientA1 = try connect(to: socketPath)
         let clientA2 = try connect(to: socketPath)
@@ -130,6 +138,11 @@ final class PermissionRoutingTests: XCTestCase {
         try sendPermission(client: clientA2, sessionId: "session-A", toolUseId: "tool-A2")
         try sendPermission(client: clientB1, sessionId: "session-B", toolUseId: "shared-tool")
         wait(for: [received], timeout: 3)
+        let pending = server.diagnosticsInput()
+        XCTAssertEqual(pending.pendingPermissionSessionIds.count, 3)
+        XCTAssertEqual(pending.pendingPermissionSessionIds.filter { $0 == "session-A" }.count, 2)
+        XCTAssertEqual(pending.pendingPermissionSessionIds.filter { $0 == "session-B" }.count, 1)
+        XCTAssertNotNil(pending.lastEventAt)
 
         let rejected = expectation(description: "cross-session response rejected")
         server.respondToPermission(
@@ -165,5 +178,11 @@ final class PermissionRoutingTests: XCTestCase {
         XCTAssertEqual(try readResponse(client: clientB1).decision, "allow")
         XCTAssertEqual(try readResponse(client: clientA2).decision, "deny")
         XCTAssertEqual(try readResponse(client: clientA1).decision, "allow")
+        XCTAssertTrue(server.diagnosticsInput().pendingPermissionSessionIds.isEmpty)
+        server.stop()
+        let stopped = server.diagnosticsInput()
+        XCTAssertFalse(stopped.isRunning)
+        XCTAssertFalse(stopped.socketExists)
+        XCTAssertFalse(stopped.ownsSocket)
     }
 }

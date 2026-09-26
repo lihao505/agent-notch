@@ -157,6 +157,15 @@ class HookSocketServer {
     private var pendingPermissions: [PendingPermissionKey: PendingPermission] = [:]
     private let permissionsLock = NSLock()
 
+    /// Diagnostics never synchronously dispatch onto the socket queue: a hook
+    /// may be waiting on the caller while the UI requests a snapshot.
+    private let diagnosticsLock = NSLock()
+    private var diagnosticsIsRunning = false
+    private var diagnosticsOwnsSocket = false
+    private var diagnosticsLastEventAt: Date?
+    private var diagnosticsSocketDevice: dev_t?
+    private var diagnosticsSocketInode: ino_t?
+
     /// Cache tool_use_id from PreToolUse to correlate with PermissionRequest
     /// Key: "sessionId:toolName:serializedInput" -> Queue of tool_use_ids (FIFO)
     /// PermissionRequest events don't include tool_use_id, so we cache from PreToolUse
@@ -256,12 +265,15 @@ class HookSocketServer {
                 close(fd)
                 self?.serverSocket = -1
             }
+            self?.recordSocketDiagnostics(isRunning: false, ownsSocket: false)
         }
         acceptSource?.resume()
+        recordSocketDiagnostics(isRunning: true, ownsSocket: true)
     }
 
     /// Stop the socket server
     func stop() {
+        recordSocketDiagnostics(isRunning: false, ownsSocket: false)
         acceptSource?.cancel()
         acceptSource = nil
         unlinkOwnedSocketPath()
@@ -272,6 +284,52 @@ class HookSocketServer {
         }
         pendingPermissions.removeAll()
         permissionsLock.unlock()
+    }
+
+    /// Only fixed health fields and raw identities needed for transient label
+    /// mapping leave this object. Event payloads and permission details stay here.
+    func diagnosticsInput() -> DiagnosticsBridgeInput {
+        diagnosticsLock.lock()
+        let isRunning = diagnosticsIsRunning
+        let ownsSocket = diagnosticsOwnsSocket
+        let lastEventAt = diagnosticsLastEventAt
+        let ownedDevice = diagnosticsSocketDevice
+        let ownedInode = diagnosticsSocketInode
+        diagnosticsLock.unlock()
+
+        permissionsLock.lock()
+        let pendingSessionIds = pendingPermissions.keys.map(\.sessionId)
+        permissionsLock.unlock()
+
+        var info = stat()
+        let socketExists = lstat(path, &info) == 0
+            && (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFSOCK)
+        return DiagnosticsBridgeInput(
+            isRunning: isRunning,
+            socketExists: socketExists,
+            ownsSocket: ownsSocket && socketExists
+                && ownedDevice == info.st_dev && ownedInode == info.st_ino,
+            pendingPermissionSessionIds: pendingSessionIds,
+            lastEventAt: lastEventAt
+        )
+    }
+
+    private func recordSocketDiagnostics(isRunning: Bool, ownsSocket: Bool) {
+        var info = stat()
+        let hasOwnedSocket = ownsSocket && lstat(path, &info) == 0
+            && (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFSOCK)
+        diagnosticsLock.lock()
+        diagnosticsIsRunning = isRunning
+        diagnosticsOwnsSocket = hasOwnedSocket
+        diagnosticsSocketDevice = hasOwnedSocket ? info.st_dev : nil
+        diagnosticsSocketInode = hasOwnedSocket ? info.st_ino : nil
+        diagnosticsLock.unlock()
+    }
+
+    private func recordReceivedEvent() {
+        diagnosticsLock.lock()
+        diagnosticsLastEventAt = Date()
+        diagnosticsLock.unlock()
     }
 
     /// Remove only a stale socket owned by this user. Never unlink another
@@ -553,6 +611,8 @@ class HookSocketServer {
             close(clientSocket)
             return
         }
+
+        recordReceivedEvent()
 
         logger.debug("Received: \(event.event, privacy: .public) for \(event.sessionId.prefix(8), privacy: .public)")
 

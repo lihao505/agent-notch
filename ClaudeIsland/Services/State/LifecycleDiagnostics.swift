@@ -35,6 +35,13 @@ nonisolated struct DiagnosticsDecisionInput: Sendable {
     let trace: LifecycleTraceEntry
 }
 
+/// Ephemeral actor result. The assembler replaces these identities with local
+/// labels before any value reaches the settings UI or report formatter.
+nonisolated struct SessionStoreDiagnosticsInput: Sendable {
+    let sessions: [DiagnosticsSessionInput]
+    let decisions: [DiagnosticsDecisionInput]
+}
+
 nonisolated struct DiagnosticsWatcherInput: Sendable {
     let sessionId: String
     let state: InterruptWatcherHealth
