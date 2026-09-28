@@ -31,7 +31,7 @@
 | 1. Codex 回合先运行、再启动 App | 部分通过 | 同一操作内退出重启仍看到“工作中”；仍需排除持久化快照和离线桥接快照，并实测长时工具与耗时 |
 | 2. Codex 快速连续两轮 | 未执行 | 旧完成/中断与新回合的真实时间线 |
 | 3. Codex 工具及子 Agent | 未执行 | 工具、子 Agent 与完成态的真实顺序 |
-| 4. Claude Code 正常回合 | 未执行 | Hook、Transcript、Stop 对齐 |
+| 4. Claude Code 正常回合 | 单会话常规工具回合通过 | 已观察 Hook、会话记录、Stop 与监听器清理；未覆盖权限、重启、并行和实际刘海展开动画 |
 | 5. Claude 回合中重启 App | 未执行 | 恢复任务及 watcher 状态 |
 | 6. Claude PermissionRequest | 未执行 | 允许、拒绝、超时的精确请求回写 |
 | 7. Claude 同会话双请求 | 未执行 | FIFO 展示与处理后的卡片一致性 |
@@ -50,3 +50,20 @@ Bridge 79 项、verifier 5 项和发布脚本再次通过。对应 Release 已�
 原生辅助功能树确认诊断页可访问，活动 Codex 会话及有意义的 Hook/发现裁决仍可见。
 本次观察操作自身会产生 Hook，无法从短时页面记录精确量化纯轮询的压缩率；
 60 秒采样上限由隔离计时测试证明。
+
+## Claude Code 单会话真实验收
+
+在本机已安装的同一 Release 上，用 Claude Code 2.1.195 从 `/tmp` 启动隔离的
+`--print` 回合，仅允许 Bash 执行 `sleep 12`，不读取或修改项目文件。
+`--include-hook-events` 的输出依次包含 `SessionStart`、`UserPromptSubmit`、
+`PreToolUse:Bash`、`PostToolUse:Bash` 和 `Stop`；第一轮工具结果与最终 `OK`
+均成功返回。另一次相同的 12 秒回合中，在 `sleep 12` 子进程仍存在时刷新
+Agent Notch 原生诊断页：Claude 会话为“工作中”，JSONL 监听器为“监听 1”，
+Hook 活动裁决已接受；约 8 秒后再次刷新仍为“工作中”。CLI 返回 `OK` 后，
+诊断页显示 Hook 完成裁决“工作中 → 等待输入”，会话记录完成裁决保持
+“等待输入”，监听器变为“监听 0”。这证明本机单会话常规工具回合的
+Hook／会话记录／Stop 边界与诊断状态一致。
+
+验收限制：原生诊断页提供状态证据，不是刘海展开动画的逐帧视觉验收；
+本轮没有重启 App、请求权限、并行会话或中断。另一个尝试用 `sleep 40`
+的回合被 Claude Code 工具层拦截并立即结束，不能算长时工具验收。
