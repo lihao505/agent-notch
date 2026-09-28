@@ -34,6 +34,7 @@ required_files=(
     ClaudeIslandTests/ProcessExecutorTests.swift
     ClaudeIslandTests/AgentTransportTests.swift
     ClaudeIslandTests/SessionStoreLifecycleTests.swift
+    ClaudeIslandTests/SessionStoreColdStartTests.swift
     ClaudeIslandTests/LifecycleReducerTests.swift
     ClaudeIslandTests/LifecycleDiagnosticsTests.swift
     ClaudeIslandTests/LifecycleDiagnosticsCoordinatorTests.swift

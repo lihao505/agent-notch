@@ -623,15 +623,24 @@ actor ConversationParser {
 
         var observations: [CodexTaskObservation] = []
         let indexedRollouts = codexRolloutPaths
-        for (sessionId, url) in indexedRollouts {
-            guard let attributes = try? FileManager.default.attributesOfItem(
+        for (sessionId, indexedURL) in indexedRollouts {
+            var url = indexedURL
+            var attributes = try? FileManager.default.attributesOfItem(
                 atPath: url.path
-            ),
-            let fileType = attributes[.type] as? FileAttributeType,
-            fileType == .typeRegular,
-            let modifiedAt = attributes[.modificationDate] as? Date,
-            modifiedAt >= modifiedAfter,
-            let metadata = codexSessionMetadata(at: url) else {
+            )
+            if attributes == nil,
+               let replacement = codexRolloutURL(sessionId: sessionId) {
+                url = replacement
+                attributes = try? FileManager.default.attributesOfItem(
+                    atPath: url.path
+                )
+            }
+            guard let attributes,
+                  let fileType = attributes[.type] as? FileAttributeType,
+                  fileType == .typeRegular,
+                  let modifiedAt = attributes[.modificationDate] as? Date,
+                  modifiedAt >= modifiedAfter,
+                  let metadata = codexSessionMetadata(at: url) else {
                 continue
             }
 
@@ -1234,11 +1243,22 @@ actor ConversationParser {
     }
 
     private func codexRolloutURL(sessionId: String) -> URL? {
-        if let cached = codexRolloutPaths[sessionId],
-           FileManager.default.fileExists(atPath: cached.path) {
-            return cached
+        if let cached = codexRolloutPaths[sessionId] {
+            if FileManager.default.fileExists(atPath: cached.path) {
+                return cached
+            }
+            // A removed rollout may be replaced in the same directory before
+            // its mtime visibly advances (notably on coarse timestamp file
+            // systems). Scan that one directory instead of trusting the
+            // recent-directory mtime cache or rewalking all history.
+            codexRolloutPaths.removeValue(forKey: sessionId)
+            indexCodexRollouts(
+                recursivelyUnder: cached.deletingLastPathComponent()
+            )
+            if let replacement = codexRolloutPaths[sessionId] {
+                return replacement
+            }
         }
-        codexRolloutPaths.removeValue(forKey: sessionId)
         ensureCodexRolloutIndex()
         refreshRecentCodexRolloutIndex()
         return codexRolloutPaths[sessionId]

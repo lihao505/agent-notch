@@ -2,12 +2,13 @@ import XCTest
 @testable import Agent_Notch
 
 final class ConversationParserIndexTests: XCTestCase {
+    @discardableResult
     private func writeRollout(
         root: URL,
         date: Date,
         sessionId: String,
         cwd: String
-    ) throws {
+    ) throws -> URL {
         let calendar = Calendar(identifier: .gregorian)
         let components = calendar.dateComponents([.year, .month, .day], from: date)
         let directory = root
@@ -38,11 +39,11 @@ final class ConversationParserIndexTests: XCTestCase {
             result.append(row)
             result.append(0x0A)
         }
-        try data.write(
-            to: directory.appendingPathComponent(
-                "rollout-test-\(sessionId).jsonl"
-            )
+        let url = directory.appendingPathComponent(
+            "rollout-test-\(sessionId).jsonl"
         )
+        try data.write(to: url)
+        return url
     }
 
     func testColdIndexAndRecentDirectoryRefresh() async throws {
@@ -80,5 +81,45 @@ final class ConversationParserIndexTests: XCTestCase {
         XCTAssertTrue(observations.contains {
             $0.sessionId == "new-session"
         })
+    }
+
+    func testDiscoveryRepairsRotatedPathWithUnchangedDirectoryTime() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-notch-rotated-index-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = "rotated-discovery"
+        let original = try writeRollout(
+            root: root,
+            date: Date(),
+            sessionId: sessionId,
+            cwd: root.path
+        )
+        let parser = ConversationParser(codexSessionsRoot: root)
+        let threshold = Date().addingTimeInterval(-60)
+        let before = await parser.discoverCodexTasks(modifiedAfter: threshold)
+        XCTAssertTrue(before.contains { $0.sessionId == sessionId })
+
+        let directory = original.deletingLastPathComponent()
+        let directoryModifiedAt = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: directory.path)[
+                .modificationDate
+            ] as? Date
+        )
+        let replacement = directory.appendingPathComponent(
+            "rollout-after-rotation-\(sessionId).jsonl"
+        )
+        try FileManager.default.moveItem(at: original, to: replacement)
+        try FileManager.default.setAttributes(
+            [.modificationDate: directoryModifiedAt],
+            ofItemAtPath: directory.path
+        )
+
+        let after = await parser.discoverCodexTasks(modifiedAfter: threshold)
+        XCTAssertTrue(after.contains { $0.sessionId == sessionId })
     }
 }

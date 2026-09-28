@@ -327,8 +327,14 @@ final class CodexNativeConversationTests: XCTestCase {
             cwd: cwd
         )
         XCTAssertEqual(initial.map(\.textContent), ["轮换前"])
+        let directory = originalURL.deletingLastPathComponent()
+        let directoryModifiedAt = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: directory.path)[
+                .modificationDate
+            ] as? Date
+        )
 
-        let rotatedURL = originalURL.deletingLastPathComponent()
+        let rotatedURL = directory
             .appendingPathComponent("rollout-rotated-\(sessionId).jsonl")
         try FileManager.default.removeItem(at: originalURL)
         try writeLines([
@@ -340,6 +346,12 @@ final class CodexNativeConversationTests: XCTestCase {
                 phase: "final_answer"
             ))
         ], to: rotatedURL)
+        // Reproduce a coarse timestamp filesystem: the containing directory
+        // appears unchanged even though the cached rollout path disappeared.
+        try FileManager.default.setAttributes(
+            [.modificationDate: directoryModifiedAt],
+            ofItemAtPath: directory.path
+        )
 
         let reparsed = await parser.parseFullConversation(
             sessionId: sessionId,

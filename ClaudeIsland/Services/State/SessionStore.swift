@@ -82,12 +82,12 @@ actor SessionStore {
     /// Sync debounce interval (100ms)
     private let syncDebounceNs: UInt64 = 100_000_000
 
-    /// Periodic status check task
+    /// Initial discovery and subsequent periodic status checks share one task.
     private var statusCheckTask: Task<Void, Never>?
 
     /// A one-second fallback keeps the UI responsive if an agent drops a hook
-    /// event. Normal hook delivery remains immediate.
-    private let statusCheckIntervalSeconds: UInt64 = 1
+    /// event. Normal hook delivery and the first discovery remain immediate.
+    private let statusCheckIntervalSeconds: UInt64
 
     /// Codex Desktop can occasionally miss the terminal hook/row (for example
     /// after a crash). Native rollout progress normally updates far more often;
@@ -112,6 +112,7 @@ actor SessionStore {
     private let persistenceEnabled: Bool
     private let fileSyncEnabled: Bool
     private let externalLifecycleEffectsEnabled: Bool
+    private let conversationParser: ConversationParser
 
     // MARK: - Published State (for UI)
 
@@ -130,11 +131,15 @@ actor SessionStore {
     init(
         persistenceEnabled: Bool,
         fileSyncEnabled: Bool,
-        externalLifecycleEffectsEnabled: Bool = false
+        externalLifecycleEffectsEnabled: Bool = false,
+        conversationParser: ConversationParser = .shared,
+        statusCheckIntervalSeconds: UInt64 = 1
     ) {
         self.persistenceEnabled = persistenceEnabled
         self.fileSyncEnabled = fileSyncEnabled
         self.externalLifecycleEffectsEnabled = externalLifecycleEffectsEnabled
+        self.conversationParser = conversationParser
+        self.statusCheckIntervalSeconds = statusCheckIntervalSeconds
     }
 
     // MARK: - Event Processing
@@ -1017,7 +1022,7 @@ actor SessionStore {
         // snapshot. For native transcripts this must not advance the shared
         // message cursor: rows appended after the payload was created belong
         // to the next incremental sync.
-        let conversationInfo = await ConversationParser.shared.parse(
+        let conversationInfo = await conversationParser.parse(
             sessionId: payload.sessionId,
             cwd: payload.cwd
         )
@@ -1235,7 +1240,7 @@ actor SessionStore {
                 taskToolId
             ]?.description ?? tool.input["description"]
 
-            let subagentToolInfos = await ConversationParser.shared.parseSubagentTools(
+            let subagentToolInfos = await conversationParser.parseSubagentTools(
                 sessionId: sessionId,
                 agentId: taskResult.agentId,
                 cwd: cwd
@@ -1565,18 +1570,18 @@ actor SessionStore {
 
     private func loadHistoryFromFile(sessionId: String, cwd: String) async {
         // Parse file asynchronously
-        let messages = await ConversationParser.shared.parseFullConversation(
+        let messages = await conversationParser.parseFullConversation(
             sessionId: sessionId,
             cwd: cwd
         )
-        let completedTools = await ConversationParser.shared.completedToolIds(for: sessionId)
-        let toolResults = await ConversationParser.shared.toolResults(for: sessionId)
-        let structuredResults = await ConversationParser.shared.structuredResults(for: sessionId)
+        let completedTools = await conversationParser.completedToolIds(for: sessionId)
+        let toolResults = await conversationParser.toolResults(for: sessionId)
+        let structuredResults = await conversationParser.structuredResults(for: sessionId)
 
         // Read metadata from the state populated above. Native metadata reads
         // deliberately do not advance the message cursor, so rows appended
         // between these calls remain available to the next incremental sync.
-        let conversationInfo = await ConversationParser.shared.parse(
+        let conversationInfo = await conversationParser.parse(
             sessionId: sessionId,
             cwd: cwd
         )
@@ -1661,7 +1666,7 @@ actor SessionStore {
             guard !Task.isCancelled else { return }
 
             // Parse incrementally - only get NEW messages since last call
-            let result = await ConversationParser.shared.parseIncremental(
+            let result = await conversationParser.parseIncremental(
                 sessionId: sessionId,
                 cwd: cwd
             )
@@ -1820,25 +1825,37 @@ actor SessionStore {
 
     // MARK: - Periodic Status Check
 
-    /// Start periodic status checking for all sessions
+    /// Join already-running native tasks before waiting for the first timer.
+    /// Restoration and polling live in one cancellable task so a later stop
+    /// cannot accidentally start a second discovery sweep.
     func startPeriodicStatusCheck() async {
+        guard statusCheckTask == nil else { return }
+        statusCheckTask = Task { [weak self] in
+            await self?.runPeriodicStatusChecks()
+        }
+        Self.logger.info("Started periodic status check (every \(self.statusCheckIntervalSeconds)s)")
+    }
+
+    private func runPeriodicStatusChecks() async {
+        guard !Task.isCancelled else { return }
         if !didRestorePersistedSessions {
             didRestorePersistedSessions = true
-            await restorePersistedSessions()
-            await restoreBridgeSessionSnapshots()
-        }
-
-        guard statusCheckTask == nil else { return }
-
-        let intervalSeconds = statusCheckIntervalSeconds
-        statusCheckTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: intervalSeconds * 1_000_000_000)
-                guard !Task.isCancelled else { break }
-                await self?.recheckAllSessions()
+            if persistenceEnabled {
+                await restorePersistedSessions()
+                await restoreBridgeSessionSnapshots()
             }
         }
-        Self.logger.info("Started periodic status check (every \(intervalSeconds)s)")
+        guard !Task.isCancelled else { return }
+        while !Task.isCancelled {
+            await recheckAllSessions()
+            do {
+                try await Task.sleep(
+                    nanoseconds: statusCheckIntervalSeconds * 1_000_000_000
+                )
+            } catch {
+                break
+            }
+        }
     }
 
     /// Stop periodic status checking
@@ -1856,8 +1873,9 @@ actor SessionStore {
         let discoveryStartedAt = Date()
         let discoveryThreshold = lastCodexDiscoverySweepAt ??
             now.addingTimeInterval(-codexActiveStaleInterval)
-        let discoveredCodexTasks = await ConversationParser.shared
+        let discoveredCodexTasks = await conversationParser
             .discoverCodexTasks(modifiedAfter: discoveryThreshold)
+        guard !Task.isCancelled else { return }
         lastCodexDiscoverySweepAt = discoveryStartedAt.addingTimeInterval(-2)
         for observation in discoveredCodexTasks {
             if reconcileCodexLifecycle(
@@ -1871,6 +1889,7 @@ actor SessionStore {
         }
 
         for sessionId in Array(sessions.keys) {
+            if Task.isCancelled { break }
             guard var session = sessions[sessionId] else {
                 continue
             }
@@ -1887,8 +1906,12 @@ actor SessionStore {
 
             if session.source == .codex {
                 let observedLastActivity = session.lastActivity
-                let lifecycle = await ConversationParser.shared
+                let lifecycle = await conversationParser
                     .codexTaskLifecycle(sessionId: sessionId)
+                if Task.isCancelled {
+                    if stateChanged { publishState() }
+                    return
+                }
                 // The actor is reentrant while the parser reads the rollout.
                 // A Stop/SessionExpired hook may have updated or removed this
                 // session during that await. Never resurrect the old snapshot
@@ -2280,7 +2303,7 @@ actor SessionStore {
                 ? ConversationParser.codexThreadTitle(sessionId: item.sessionId)
                 : nil
             let codexLifecycle = source == .codex
-                ? await ConversationParser.shared.codexTaskLifecycle(
+                ? await conversationParser.codexTaskLifecycle(
                     sessionId: item.sessionId
                 )
                 : .unknown
@@ -2450,7 +2473,7 @@ actor SessionStore {
             // Codex has an explicit native turn boundary. It wins over a stale
             // active hook snapshot left by a dropped Stop event.
             if source == .codex {
-                let lifecycle = await ConversationParser.shared
+                let lifecycle = await conversationParser
                     .codexTaskLifecycle(sessionId: snapshot.sessionId)
                 if case .completed = lifecycle {
                     continue
