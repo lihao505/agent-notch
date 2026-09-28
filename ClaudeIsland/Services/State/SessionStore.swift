@@ -75,6 +75,7 @@ actor SessionStore {
         entry: LifecycleTraceEntry
     )] = []
     private static let lifecycleTraceCapacity = 500
+    private static let repeatedNativeTraceInterval: TimeInterval = 60
 
     /// Pending file syncs (debounced)
     private var pendingSyncs: [String: Task<Void, Never>] = [:]
@@ -2097,18 +2098,66 @@ actor SessionStore {
         previous: SessionLifecycleSnapshot?,
         transition: LifecycleTransition
     ) {
-        lifecycleTraceEntries.append((
-            sessionId: observation.sessionId,
-            entry: LifecycleTraceEntry(
-                observation: observation,
-                previous: previous,
-                transition: transition
-            )
-        ))
+        let entry = LifecycleTraceEntry(
+            observation: observation,
+            previous: previous,
+            transition: transition
+        )
+        if !entry.didMutate,
+           Self.isNativePollingOrigin(entry.origin) {
+            // Native discovery and the one-second fallback often reach the
+            // same no-op decision repeatedly. Keep the first occurrence and
+            // sample it at most once per minute, but never hide a decision
+            // after a real transition or a Hook/local interaction.
+            let boundary = lifecycleTraceEntries.lastIndex {
+                $0.sessionId == observation.sessionId &&
+                    ($0.entry.didMutate ||
+                        !Self.isNativePollingOrigin($0.entry.origin))
+            }.map { $0 + 1 } ?? 0
+            let isRepeat = lifecycleTraceEntries[boundary...].contains { item in
+                guard item.sessionId == observation.sessionId else { return false }
+                let prior = item.entry
+                let elapsed = entry.receivedAt.timeIntervalSince(prior.receivedAt)
+                return elapsed >= 0 &&
+                    elapsed < Self.repeatedNativeTraceInterval &&
+                    prior.origin == entry.origin &&
+                    prior.reason == entry.reason &&
+                    prior.accepted == entry.accepted &&
+                    prior.previousPhase == entry.previousPhase &&
+                    prior.nextPhase == entry.nextPhase &&
+                    Self.sameEvidenceCategory(prior.evidence, entry.evidence)
+            }
+            if isRepeat { return }
+        }
+        lifecycleTraceEntries.append((sessionId: observation.sessionId, entry: entry))
         if lifecycleTraceEntries.count > Self.lifecycleTraceCapacity {
             lifecycleTraceEntries.removeFirst(
                 lifecycleTraceEntries.count - Self.lifecycleTraceCapacity
             )
+        }
+    }
+
+    private nonisolated static func isNativePollingOrigin(
+        _ origin: LifecycleObservationOrigin
+    ) -> Bool {
+        origin == .codexDiscovery || origin == .codexPolling
+    }
+
+    private nonisolated static func sameEvidenceCategory(
+        _ lhs: LifecycleEvidence,
+        _ rhs: LifecycleEvidence
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (.active, .active), (.completed, .completed),
+             (.missing, .missing), (.unknown, .unknown),
+             (.interrupt, .interrupt), (.processExited, .processExited):
+            return true
+        case let (.hook(left), .hook(right)):
+            return left == right
+        case let (.interactionResolution(left), .interactionResolution(right)):
+            return left == right
+        default:
+            return false
         }
     }
 

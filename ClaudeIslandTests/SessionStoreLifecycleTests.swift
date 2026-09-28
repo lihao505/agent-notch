@@ -1023,4 +1023,28 @@ final class SessionStoreLifecycleTests: XCTestCase {
         XCTAssertEqual(session.phase, .ended)
         XCTAssertNil(session.pid)
     }
+
+    func testNativeTraceSamplingDoesNotDiscardHookDecisions() async {
+        let store = SessionStore(
+            persistenceEnabled: false,
+            fileSyncEnabled: false
+        )
+        let sessionId = "hook-trace-\(UUID().uuidString)"
+        let now = Date()
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId,
+            event: "UserPromptSubmit",
+            status: "processing",
+            observedAt: now.addingTimeInterval(0.01)
+        )))
+
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.filter { $0.origin == .hook }.count, 2)
+    }
 }
