@@ -15,6 +15,21 @@ class NotchPanel: NSPanel {
     /// Mirrors the view model's opened state so a pass-through click can
     /// restore the correct hit-testing mode after it is re-posted.
     var shouldAcceptMouseEvents = false
+    private(set) var showsInFullScreen = true
+
+    /// AppKit owns Space membership, including separate full-screen Spaces
+    /// on external displays. Do not infer full screen from window dimensions.
+    func setShowsInFullScreen(_ shows: Bool) {
+        showsInFullScreen = shows
+        var behavior = collectionBehavior
+        behavior.remove([.fullScreenAuxiliary, .fullScreenNone])
+        behavior.insert(shows ? .fullScreenAuxiliary : .fullScreenNone)
+        collectionBehavior = behavior
+    }
+
+    var allowsPresentationOnCurrentSpace: Bool {
+        showsInFullScreen || isOnActiveSpace
+    }
 
     override init(
         contentRect: NSRect,

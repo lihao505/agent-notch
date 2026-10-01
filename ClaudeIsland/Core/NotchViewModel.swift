@@ -125,6 +125,9 @@ class NotchViewModel: ObservableObject {
     /// Read the monitor's latest UI snapshot at key-up, not a duplicated cache
     /// of sessions captured when a shortcut or window was first registered.
     var navigationSessions: @MainActor () -> [SessionState] = { [] }
+    /// Window eligibility also gates global hover/keyboard/notification opens:
+    /// an excluded full-screen Space must not be pulled back to the desktop.
+    var canPresentOnCurrentSpace: @MainActor () -> Bool = { true }
 
     // MARK: - Initialization
 
@@ -369,6 +372,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func notchOpen(reason: NotchOpenReason = .unknown) {
+        guard canPresentOnCurrentSpace() else { return }
         hoverTimer?.cancel()
         hoverTimer = nil
         presentationGeneration += 1

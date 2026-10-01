@@ -71,6 +71,30 @@ class NotchWindowController: NSWindowController {
 
         notchWindow.setFrame(windowFrame, display: true)
 
+        viewModel.canPresentOnCurrentSpace = { [weak notchWindow] in
+            notchWindow?.allowsPresentationOnCurrentSpace == true
+        }
+        viewModel.preferences.$showInFullScreen
+            .removeDuplicates()
+            .sink { [weak notchWindow, weak viewModel] shows in
+                notchWindow?.setShowsInFullScreen(shows)
+                if notchWindow?.allowsPresentationOnCurrentSpace == false {
+                    viewModel?.notchClose()
+                }
+            }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(
+            for: NSWorkspace.activeSpaceDidChangeNotification
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak notchWindow, weak viewModel] _ in
+            if notchWindow?.allowsPresentationOnCurrentSpace == false {
+                viewModel?.notchClose()
+            }
+        }
+        .store(in: &cancellables)
+
         // Dynamically toggle mouse event handling based on notch state:
         // - Closed: ignoresMouseEvents = true (clicks pass through to menu bar/apps)
         // - Opened: ignoresMouseEvents = false (buttons inside panel work)
@@ -80,6 +104,10 @@ class NotchWindowController: NSWindowController {
                 guard let viewModel, viewModel.status == status else { return }
                 switch status {
                 case .opened:
+                    guard notchWindow?.allowsPresentationOnCurrentSpace == true else {
+                        viewModel.notchClose()
+                        return
+                    }
                     // Accept mouse events when opened so buttons work
                     notchWindow?.shouldAcceptMouseEvents = true
                     notchWindow?.ignoresMouseEvents = false
@@ -97,6 +125,7 @@ class NotchWindowController: NSWindowController {
                     let generation = viewModel.presentationGeneration
                     let postInteractive = { [weak viewModel] in
                         guard notchWindow?.isVisible == true,
+                              notchWindow?.allowsPresentationOnCurrentSpace == true,
                               viewModel?.canDeliverDeferredFocus(
                                 generation: generation
                               ) == true else { return }

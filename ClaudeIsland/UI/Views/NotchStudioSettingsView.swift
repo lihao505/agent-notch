@@ -635,6 +635,17 @@ struct NotchStudioSettingsView: View {
 
             settingsCard {
                 settingToggle(
+                    t("Show notch in full screen", "全屏时显示刘海"),
+                    detail: t(
+                        "Keep the notch visible over full-screen apps. When off, it returns when you leave full screen; agent tasks keep running.",
+                        "在全屏应用上方显示刘海。关闭后，退出全屏即恢复显示，智能体任务仍会继续运行。"
+                    ),
+                    isOn: $preferences.showInFullScreen
+                )
+                .accessibilityIdentifier("settings.general.showInFullScreen")
+
+                Divider()
+                settingToggle(
                     t("Expand on hover", "悬停展开"),
                     detail: t(
                         "Reveal the panel without clicking.",

@@ -49,6 +49,30 @@ final class NotchPointerInteractionTests: XCTestCase {
         XCTAssertEqual(model.status, .closed)
     }
 
+    func testExcludedFullScreenSpaceRejectsOpensAndPreservesChatForReturn() async throws {
+        let events = EventMonitors(startMonitors: false)
+        let model = makeViewModel(events)
+        let session = SessionState(sessionId: "full-screen-return", cwd: "/tmp/test")
+        model.notchOpen(reason: .click)
+        model.contentType = .chat(session)
+        model.notchClose()
+        let generation = model.presentationGeneration
+
+        model.canPresentOnCurrentSpace = { false }
+        events.mouseDown.send(CGPoint(x: 756, y: 968))
+        try await drainEvents()
+        model.toggleFromKeyboard()
+        model.openFromAccessibility()
+        model.notchOpen(reason: .notification)
+        XCTAssertEqual(model.status, .closed)
+        XCTAssertEqual(model.presentationGeneration, generation)
+
+        model.canPresentOnCurrentSpace = { true }
+        model.openFromAccessibility()
+        XCTAssertEqual(model.status, .opened)
+        XCTAssertEqual(model.contentType, .chat(session))
+    }
+
     func testInsideClickClaimsHoverPreviewBeforePointerExit() async throws {
         let events = EventMonitors(startMonitors: false)
         let model = makeViewModel(events)

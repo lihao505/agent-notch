@@ -203,10 +203,11 @@ enum CompactNotchMetrics {
 /// immediately without restarting either the app or an active agent session.
 @MainActor
 final class NotchPreferences: ObservableObject {
-    static let shared = NotchPreferences()
+    static let shared = NotchPreferences(defaults: .standard)
 
     private enum Keys {
         static let idleBehavior = "notchIdleBehavior"
+        static let showInFullScreen = "notchShowInFullScreen"
         static let expandOnHover = "notchExpandOnHover"
         static let hoverDelay = "notchHoverDelay"
         static let collapseOnMouseLeave = "notchCollapseOnMouseLeave"
@@ -234,6 +235,10 @@ final class NotchPreferences: ObservableObject {
 
     @Published var idleBehavior: IdleNotchBehavior {
         didSet { defaults.set(idleBehavior.rawValue, forKey: Keys.idleBehavior) }
+    }
+
+    @Published var showInFullScreen: Bool {
+        didSet { defaults.set(showInFullScreen, forKey: Keys.showInFullScreen) }
     }
 
     @Published var expandOnHover: Bool {
@@ -406,12 +411,14 @@ final class NotchPreferences: ObservableObject {
         }
     }
 
-    private init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults) {
         self.defaults = defaults
 
         idleBehavior = IdleNotchBehavior(
             rawValue: defaults.string(forKey: Keys.idleBehavior) ?? ""
         ) ?? .alwaysVisible
+        showInFullScreen =
+            defaults.object(forKey: Keys.showInFullScreen) as? Bool ?? true
         expandOnHover = defaults.object(forKey: Keys.expandOnHover) as? Bool ?? true
         hoverDelay = defaults.object(forKey: Keys.hoverDelay) as? Double ?? 0.15
         collapseOnMouseLeave =
