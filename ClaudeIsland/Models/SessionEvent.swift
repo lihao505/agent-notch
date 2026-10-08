@@ -89,9 +89,12 @@ enum SessionEvent: Sendable {
 
     /// Request to load initial history from file
     case loadHistory(sessionId: String, cwd: String)
+    /// Full refresh uses the same guarded snapshot, retaining file-update
+    /// semantics for existing hook-created tool placeholders.
+    case syncHistory(sessionId: String, cwd: String)
 
     /// History load completed
-    case historyLoaded(sessionId: String, messages: [ChatMessage], completedTools: Set<String>, toolResults: [String: ConversationParser.ToolResult], structuredResults: [String: ToolResultData], conversationInfo: ConversationInfo)
+    case historyLoaded(sessionId: String, messages: [ChatMessage], completedTools: Set<String>, toolResults: [String: ConversationParser.ToolResult], structuredResults: [String: ToolResultData], conversationInfo: ConversationInfo, expectedGeneration: UUID? = nil)
 
     /// Lifecycle resources follow the final store state, regardless of which
     /// event path supplied it (including history loaded during restoration).
@@ -113,7 +116,8 @@ enum SessionEvent: Sendable {
              .clearDetected(let id),
              .sessionEnded(let id),
              .loadHistory(let id, _),
-             .historyLoaded(let id, _, _, _, _, _): return id
+             .syncHistory(let id, _),
+             .historyLoaded(let id, _, _, _, _, _, _): return id
         }
     }
 }
@@ -130,6 +134,8 @@ struct FileUpdatePayload: Sendable {
     let completedToolIds: Set<String>
     let toolResults: [String: ConversationParser.ToolResult]
     let structuredResults: [String: ToolResultData]
+    var expectedGeneration: UUID? = nil
+    var conversationInfoSnapshot: ConversationInfo? = nil
 }
 
 /// Result of a tool completion detected from JSONL
@@ -284,7 +290,9 @@ extension SessionEvent: CustomStringConvertible {
             return "sessionEnded(session: \(sessionId.prefix(8)))"
         case .loadHistory(let sessionId, _):
             return "loadHistory(session: \(sessionId.prefix(8)))"
-        case .historyLoaded(let sessionId, let messages, _, _, _, _):
+        case .syncHistory(let sessionId, _):
+            return "syncHistory(session: \(sessionId.prefix(8)))"
+        case .historyLoaded(let sessionId, let messages, _, _, _, _, _):
             return "historyLoaded(session: \(sessionId.prefix(8)), messages: \(messages.count))"
         case .toolCompleted(let sessionId, let toolUseId, let result):
             return "toolCompleted(session: \(sessionId.prefix(8)), tool: \(toolUseId.prefix(12)), status: \(result.status))"

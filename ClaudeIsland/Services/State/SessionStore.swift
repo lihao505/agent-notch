@@ -121,6 +121,7 @@ actor SessionStore {
     private let bridgeSnapshotDirectory: URL
     private let interruptWatcher: (any SessionInterruptWatching)?
     private let processTreeProvider: @Sendable (Bool) -> [Int: ProcessInfo]
+    private let historySnapshotProvider: (@Sendable (String, String) async -> ConversationParser.HistoryParseResult)?
 
     // MARK: - Published State (for UI)
 
@@ -147,7 +148,8 @@ actor SessionStore {
         interruptWatcher: (any SessionInterruptWatching)? = nil,
         processTreeProvider: @escaping @Sendable (Bool) -> [Int: ProcessInfo] = {
             ProcessTreeBuilder.shared.buildTree(forceRefresh: $0)
-        }
+        },
+        historySnapshotProvider: (@Sendable (String, String) async -> ConversationParser.HistoryParseResult)? = nil
     ) {
         self.persistenceEnabled = persistenceEnabled
         self.fileSyncEnabled = fileSyncEnabled
@@ -158,6 +160,7 @@ actor SessionStore {
         self.bridgeSnapshotDirectory = bridgeSnapshotDirectory ?? Self.defaultBridgeSnapshotDirectory
         self.interruptWatcher = interruptWatcher
         self.processTreeProvider = processTreeProvider
+        self.historySnapshotProvider = historySnapshotProvider
     }
 
     // MARK: - Event Processing
@@ -209,7 +212,7 @@ actor SessionStore {
             )
 
         case .clearDetected(let sessionId):
-            await processClearDetected(sessionId: sessionId)
+            processClearDetected(sessionId: sessionId)
 
         case .sessionEnded(let sessionId):
             await processSessionEnd(sessionId: sessionId)
@@ -217,14 +220,18 @@ actor SessionStore {
         case .loadHistory(let sessionId, let cwd):
             await loadHistoryFromFile(sessionId: sessionId, cwd: cwd)
 
-        case .historyLoaded(let sessionId, let messages, let completedTools, let toolResults, let structuredResults, let conversationInfo):
+        case .syncHistory(let sessionId, let cwd):
+            await loadHistoryFromFile(sessionId: sessionId, cwd: cwd, asFileUpdate: true)
+
+        case .historyLoaded(let sessionId, let messages, let completedTools, let toolResults, let structuredResults, let conversationInfo, let expectedGeneration):
             await processHistoryLoaded(
                 sessionId: sessionId,
                 messages: messages,
                 completedTools: completedTools,
                 toolResults: toolResults,
                 structuredResults: structuredResults,
-                conversationInfo: conversationInfo
+                conversationInfo: conversationInfo,
+                expectedGeneration: expectedGeneration
             )
 
         case .toolCompleted(let sessionId, let toolUseId, let result):
@@ -1040,54 +1047,32 @@ actor SessionStore {
     // MARK: - File Update Processing
 
     private func processFileUpdate(_ payload: FileUpdatePayload) async {
+        guard historyGenerationMatches(payload.expectedGeneration, sessionId: payload.sessionId) else { return }
         // Update summary/last-message metadata from the parser's current
         // snapshot. For native transcripts this must not advance the shared
         // message cursor: rows appended after the payload was created belong
         // to the next incremental sync.
-        let conversationInfo = await conversationParser.parse(
-            sessionId: payload.sessionId,
-            cwd: payload.cwd
-        )
+        let conversationInfo: ConversationInfo
+        if let snapshot = payload.conversationInfoSnapshot {
+            conversationInfo = snapshot
+        } else {
+            conversationInfo = await conversationParser.parse(
+                sessionId: payload.sessionId, cwd: payload.cwd
+            )
+        }
 
         // ConversationParser is another actor, so this actor may process a
         // Stop/PermissionRequest/SessionExpired while the file is being read.
         // Re-fetch after the await instead of mutating a snapshot that could
         // now be stale or whose session may already have been removed.
-        guard var session = sessions[payload.sessionId] else { return }
+        guard historyGenerationMatches(payload.expectedGeneration, sessionId: payload.sessionId),
+              var session = sessions[payload.sessionId] else { return }
         session.conversationInfo = conversationInfo
 
         // Handle /clear reconciliation - remove items that no longer exist in parser state
-        if session.needsClearReconciliation {
-            // Build set of valid IDs from the payload messages
-            var validIds = Set<String>()
-            for message in payload.messages {
-                for (blockIndex, block) in message.content.enumerated() {
-                    switch block {
-                    case .toolUse(let tool):
-                        validIds.insert(tool.id)
-                    case .text, .thinking, .image, .interrupted:
-                        let itemId = "\(message.id)-\(block.typePrefix)-\(blockIndex)"
-                        validIds.insert(itemId)
-                    }
-                }
-            }
-
-            // Filter chatItems to only keep valid items OR items that are very recent
-            // (within last 2 seconds - these are hook-created placeholders for post-clear tools)
-            let cutoffTime = Date().addingTimeInterval(-2)
-            let previousCount = session.chatItems.count
-            session.chatItems = session.chatItems.filter { item in
-                validIds.contains(item.id) || item.timestamp > cutoffTime
-            }
-
-            // Also reset tool tracker
-            session.toolTracker = ToolTracker(
-                terminalBoundaryAt: session.toolTracker.terminalBoundaryAt
-            )
-            session.subagentState = SubagentState()
-
-            session.needsClearReconciliation = false
-            Self.logger.debug("Clear reconciliation: kept \(session.chatItems.count) of \(previousCount) items")
+        if !payload.isIncremental {
+            reconcileClearedHistory(messages: payload.messages, session: &session)
+            session.needsFullHistorySync = false
         }
 
         if payload.isIncremental {
@@ -1200,7 +1185,8 @@ actor SessionStore {
             structuredResults: payload.structuredResults
         )
 
-        guard var latestSession = sessions[payload.sessionId] else {
+        guard historyGenerationMatches(payload.expectedGeneration, sessionId: payload.sessionId),
+              var latestSession = sessions[payload.sessionId] else {
             // SessionExpired/SessionEnd arrived while subagent files were read.
             // Never resurrect the removed session from the pre-await snapshot.
             return
@@ -1233,6 +1219,7 @@ actor SessionStore {
 
         await emitToolCompletionEvents(
             sessionId: payload.sessionId,
+            expectedGeneration: payload.expectedGeneration,
             session: latestSession,
             completedToolIds: payload.completedToolIds,
             toolResults: payload.toolResults,
@@ -1304,12 +1291,16 @@ actor SessionStore {
     /// Emit toolCompleted events for tools that have results in JSONL but aren't marked complete yet
     private func emitToolCompletionEvents(
         sessionId: String,
+        expectedGeneration: UUID?,
         session: SessionState,
         completedToolIds: Set<String>,
         toolResults: [String: ConversationParser.ToolResult],
         structuredResults: [String: ToolResultData]
     ) async {
         for item in session.chatItems {
+            // Processing an earlier completion can suspend this actor. A clear
+            // or replacement session invalidates the rest of the old batch.
+            guard historyGenerationMatches(expectedGeneration, sessionId: sessionId) else { return }
             guard case .toolCall(let tool) = item.type else { continue }
 
             // Only emit for tools that are running or waiting but have results in JSONL
@@ -1541,7 +1532,7 @@ actor SessionStore {
 
     // MARK: - Clear Processing
 
-    private func processClearDetected(sessionId: String) async {
+    private func processClearDetected(sessionId: String) {
         guard var session = sessions[sessionId] else { return }
 
         Self.logger.info("Processing /clear for session \(sessionId.prefix(8), privacy: .public)")
@@ -1549,6 +1540,8 @@ actor SessionStore {
         // Mark that a clear happened - the next fileUpdated will reconcile
         // by removing items that no longer exist in the parser's state
         session.needsClearReconciliation = true
+        session.needsFullHistorySync = true
+        session.historyGeneration = UUID()
         sessions[sessionId] = session
 
         Self.logger.info("/clear processed for session \(sessionId.prefix(8), privacy: .public) - marked for reconciliation")
@@ -1623,33 +1616,46 @@ actor SessionStore {
 
     // MARK: - History Loading
 
-    private func loadHistoryFromFile(sessionId: String, cwd: String) async {
-        // Parse file asynchronously
-        let messages = await conversationParser.parseFullConversation(
-            sessionId: sessionId,
-            cwd: cwd
-        )
-        let completedTools = await conversationParser.completedToolIds(for: sessionId)
-        let toolResults = await conversationParser.toolResults(for: sessionId)
-        let structuredResults = await conversationParser.structuredResults(for: sessionId)
+    /// Return the generation actually committed, including a clear found by
+    /// this read. A discarded result must not mark a newer session as loaded.
+    func loadHistoryResult(sessionId: String, cwd: String) async -> UUID? {
+        await loadHistoryFromFile(sessionId: sessionId, cwd: cwd)
+    }
 
-        // Read metadata from the state populated above. Native metadata reads
-        // deliberately do not advance the message cursor, so rows appended
-        // between these calls remain available to the next incremental sync.
-        let conversationInfo = await conversationParser.parse(
-            sessionId: sessionId,
-            cwd: cwd
-        )
+    @discardableResult
+    private func loadHistoryFromFile(sessionId: String, cwd: String, asFileUpdate: Bool = false) async -> UUID? {
+        guard let generation = sessions[sessionId]?.historyGeneration else { return nil }
+        let snapshot: ConversationParser.HistoryParseResult
+        if let historySnapshotProvider {
+            snapshot = await historySnapshotProvider(sessionId, cwd)
+        } else {
+            snapshot = await conversationParser.parseHistorySnapshot(sessionId: sessionId, cwd: cwd)
+        }
+        guard historyGenerationMatches(generation, sessionId: sessionId) else { return nil }
+        if snapshot.clearDetected { processClearDetected(sessionId: sessionId) }
+        guard let currentGeneration = sessions[sessionId]?.historyGeneration else { return nil }
+
+        if asFileUpdate {
+            await process(.fileUpdated(FileUpdatePayload(
+                sessionId: sessionId, cwd: cwd, messages: snapshot.messages, isIncremental: false,
+                completedToolIds: snapshot.completedTools, toolResults: snapshot.toolResults,
+                structuredResults: snapshot.structuredResults, expectedGeneration: currentGeneration,
+                conversationInfoSnapshot: snapshot.conversationInfo
+            )))
+            return historyGenerationMatches(currentGeneration, sessionId: sessionId) ? currentGeneration : nil
+        }
 
         // Process loaded history
         await process(.historyLoaded(
             sessionId: sessionId,
-            messages: messages,
-            completedTools: completedTools,
-            toolResults: toolResults,
-            structuredResults: structuredResults,
-            conversationInfo: conversationInfo
+            messages: snapshot.messages,
+            completedTools: snapshot.completedTools,
+            toolResults: snapshot.toolResults,
+            structuredResults: snapshot.structuredResults,
+            conversationInfo: snapshot.conversationInfo,
+            expectedGeneration: currentGeneration
         ))
+        return historyGenerationMatches(currentGeneration, sessionId: sessionId) ? currentGeneration : nil
     }
 
     private func processHistoryLoaded(
@@ -1658,9 +1664,13 @@ actor SessionStore {
         completedTools: Set<String>,
         toolResults: [String: ConversationParser.ToolResult],
         structuredResults: [String: ToolResultData],
-        conversationInfo: ConversationInfo
+        conversationInfo: ConversationInfo,
+        expectedGeneration: UUID?
     ) async {
-        guard var session = sessions[sessionId] else { return }
+        guard historyGenerationMatches(expectedGeneration, sessionId: sessionId),
+              var session = sessions[sessionId] else { return }
+        reconcileClearedHistory(messages: messages, session: &session)
+        session.needsFullHistorySync = false
 
         // Update conversationInfo (summary, lastMessage, etc.)
         session.conversationInfo = conversationInfo
@@ -1714,7 +1724,38 @@ actor SessionStore {
 
     // MARK: - File Sync Scheduling
 
+    private func historyGenerationMatches(_ expected: UUID?, sessionId: String) -> Bool {
+        guard let session = sessions[sessionId] else { return false }
+        return expected == nil || expected == session.historyGeneration
+    }
+
+    private func reconcileClearedHistory(messages: [ChatMessage], session: inout SessionState) {
+        guard session.needsClearReconciliation else { return }
+        var validIDs = Set<String>()
+        for message in messages {
+            for (index, block) in message.content.enumerated() {
+                if case .toolUse(let tool) = block {
+                    validIDs.insert(tool.id)
+                } else {
+                    validIDs.insert("\(message.id)-\(block.typePrefix)-\(index)")
+                }
+            }
+        }
+        let cutoff = Date().addingTimeInterval(-2)
+        session.chatItems = session.chatItems.filter { item in
+            if validIDs.contains(item.id) { return true }
+            // Only hook tool placeholders qualify for the short grace window;
+            // recent pre-clear text must not survive just because it is recent.
+            if case .toolCall = item.type { return item.timestamp > cutoff }
+            return false
+        }
+        session.toolTracker = ToolTracker(terminalBoundaryAt: session.toolTracker.terminalBoundaryAt)
+        session.subagentState = SubagentState()
+        session.needsClearReconciliation = false
+    }
+
     private func scheduleFileSync(sessionId: String, cwd: String) {
+        guard let generation = sessions[sessionId]?.historyGeneration else { return }
         // Cancel existing sync
         cancelPendingSync(sessionId: sessionId)
 
@@ -1723,38 +1764,27 @@ actor SessionStore {
             try? await Task.sleep(nanoseconds: syncDebounceNs)
             guard !Task.isCancelled else { return }
 
-            // Parse incrementally - only get NEW messages since last call
-            let result = await self?.conversationParser.parseIncremental(
-                sessionId: sessionId,
-                cwd: cwd
-            )
-            guard let result else { return }
-
-            if result.clearDetected {
-                await self?.process(.clearDetected(sessionId: sessionId))
-            }
-
-            // Metadata-only and tool-result rows still need reconciliation,
-            // but an unchanged Codex rollout must not trigger another title,
-            // policy-tail, or full transcript read every second.
-            guard !result.newMessages.isEmpty ||
-                    result.clearDetected ||
-                    result.fileAdvanced else {
-                return
-            }
-
-            let payload = FileUpdatePayload(
-                sessionId: sessionId,
-                cwd: cwd,
-                messages: result.newMessages,
-                isIncremental: !result.clearDetected,
-                completedToolIds: result.completedToolIds,
-                toolResults: result.toolResults,
-                structuredResults: result.structuredResults
-            )
-
-            await self?.process(.fileUpdated(payload))
+            await self?.performFileSync(sessionId: sessionId, cwd: cwd, generation: generation)
         }
+    }
+
+    private func performFileSync(sessionId: String, cwd: String, generation: UUID) async {
+        guard historyGenerationMatches(generation, sessionId: sessionId) else { return }
+        let result = await conversationParser.parseIncremental(sessionId: sessionId, cwd: cwd)
+        // Do not drop a consumed cursor merely because a later debounce task
+        // cancelled this one. Identity/clear generation decides validity.
+        guard historyGenerationMatches(generation, sessionId: sessionId) else { return }
+        if result.clearDetected { processClearDetected(sessionId: sessionId) }
+        guard let session = sessions[sessionId] else { return }
+        let fullSync = session.needsFullHistorySync
+        guard fullSync || !result.newMessages.isEmpty || result.fileAdvanced else { return }
+        await process(.fileUpdated(FileUpdatePayload(
+            sessionId: sessionId, cwd: cwd,
+            messages: fullSync ? result.allMessages : result.newMessages,
+            isIncremental: !fullSync, completedToolIds: result.completedToolIds,
+            toolResults: result.toolResults, structuredResults: result.structuredResults,
+            expectedGeneration: session.historyGeneration
+        )))
     }
 
     private func cancelPendingSync(sessionId: String) {
@@ -2716,6 +2746,10 @@ actor SessionStore {
     /// Get a specific session
     func session(for sessionId: String) -> SessionState? {
         sessions[sessionId]
+    }
+
+    func historyReadGeneration(for sessionId: String) -> UUID? {
+        sessions[sessionId]?.historyGeneration
     }
 
     /// Check if there's an active permission for a session

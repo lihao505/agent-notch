@@ -59,6 +59,10 @@ struct SessionState: Equatable, Identifiable, Sendable {
     /// When true, the next file update should reconcile chatItems with parser state
     /// This removes pre-/clear items that no longer exist in the JSONL
     var needsClearReconciliation: Bool
+    /// Identity of this in-memory history incarnation. Clear and recreation
+    /// invalidate asynchronous reads, but ordinary turns retain valid history.
+    var historyGeneration = UUID()
+    var needsFullHistorySync = true
 
     // MARK: - Timestamps
 

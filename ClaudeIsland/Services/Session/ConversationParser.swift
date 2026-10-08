@@ -219,7 +219,7 @@ actor ConversationParser {
         var completedToolIds: Set<String> = []  // Tools that have received results
         var toolResults: [String: ToolResult] = [:]  // Tool results keyed by tool_use_id
         var structuredResults: [String: ToolResultData] = [:]  // Structured results keyed by tool_use_id
-        var lastClearOffset: UInt64 = 0  // Offset of last /clear command (0 = none or at start)
+        var lastClearOffset: UInt64 = 0  // End of latest /clear row; zero means none
         var clearPending: Bool = false  // True if a /clear was just detected
         var nativeApprovalMode: ApprovalMode?
         var seenNativeMessageIDs: Set<String> = []
@@ -336,8 +336,7 @@ actor ConversationParser {
             )
         }
 
-        let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
-        let sessionFile = ClaudePaths.projectsDir.path + "/" + projectDir + "/" + sessionId + ".jsonl"
+        let sessionFile = sessionFilePath(sessionId: sessionId, cwd: cwd)
 
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: sessionFile),
@@ -347,7 +346,7 @@ actor ConversationParser {
         }
 
         if let cached = cache[sessionFile], cached.modificationDate == modDate {
-            return cached.info
+            return metadataAfterClear(cached.info, sessionId: sessionId)
         }
 
         guard let data = fileManager.contents(atPath: sessionFile),
@@ -371,7 +370,26 @@ actor ConversationParser {
         }
         cache[sessionFile] = CachedInfo(modificationDate: modDate, info: info)
 
-        return info
+        return metadataAfterClear(info, sessionId: sessionId)
+    }
+
+    private func metadataAfterClear(_ info: ConversationInfo, sessionId: String) -> ConversationInfo {
+        guard let state = incrementalState[sessionId], state.lastClearOffset > 0 else { return info }
+        let messages = state.messages
+        let last = messages.last(where: { !$0.textContent.isEmpty })
+        let lastTool = messages.reversed().lazy.compactMap { message in
+            message.content.compactMap { block -> String? in
+                if case .toolUse(let tool) = block { return tool.name }
+                return nil
+            }.last
+        }.first
+        return ConversationInfo(
+            summary: info.summary, lastMessage: Self.truncateMessage(last?.textContent),
+            lastMessageRole: last.map { $0.role.rawValue }, lastToolName: lastTool,
+            firstUserMessage: Self.truncateMessage(messages.first(where: { $0.role == .user })?.textContent),
+            lastUserMessageDate: messages.last(where: { $0.role == .user })?.timestamp,
+            usage: info.usage, nativeApprovalMode: info.nativeApprovalMode
+        )
     }
 
     /// Codex Desktop stores the user-visible task title in a small local index.
@@ -1514,6 +1532,29 @@ actor ConversationParser {
 
     // MARK: - Full Conversation Parsing
 
+    struct HistoryParseResult: Sendable {
+        let messages: [ChatMessage]
+        let completedTools: Set<String>
+        let toolResults: [String: ToolResult]
+        let structuredResults: [String: ToolResultData]
+        let conversationInfo: ConversationInfo
+        let clearDetected: Bool
+    }
+
+    /// One actor call keeps messages, result maps and the consumed clear flag
+    /// from different callers from being interleaved across separate awaits.
+    func parseHistorySnapshot(sessionId: String, cwd: String) -> HistoryParseResult {
+        let messages = parseFullConversation(sessionId: sessionId, cwd: cwd)
+        return HistoryParseResult(
+            messages: messages,
+            completedTools: completedToolIds(for: sessionId),
+            toolResults: toolResults(for: sessionId),
+            structuredResults: structuredResults(for: sessionId),
+            conversationInfo: parse(sessionId: sessionId, cwd: cwd),
+            clearDetected: checkAndConsumeClearDetected(for: sessionId)
+        )
+    }
+
     /// Parse full conversation history for chat view (returns ALL messages - use sparingly)
     func parseFullConversation(sessionId: String, cwd: String) -> [ChatMessage] {
         if let native = nativeConversationURL(sessionId: sessionId, cwd: cwd) {
@@ -1670,8 +1711,6 @@ actor ConversationParser {
             return []
         }
 
-        state.clearPending = false
-        let isIncrementalRead = readOffset > 0
         let lines = completePrefix.text.split(
             separator: "\n",
             omittingEmptySubsequences: false
@@ -1684,7 +1723,21 @@ actor ConversationParser {
             defer { lineOffset += lineLength }
             guard !line.isEmpty else { continue }
 
-            if line.contains("<command-name>/clear</command-name>") {
+            // Decode only candidate command rows. JSON may escape '/', and
+            // an assistant/tool quoting this tag must not clear the history.
+            let clearContent: String? = {
+                guard line.contains("command-name"),
+                      let data = line.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      json["type"] as? String == "user",
+                      let message = json["message"] as? [String: Any] else { return nil }
+                if let text = message["content"] as? String { return text }
+                return (message["content"] as? [[String: Any]])?.compactMap {
+                    $0["type"] as? String == "text" ? $0["text"] as? String : nil
+                }.joined(separator: "\n")
+            }()
+            if clearContent?.contains("<command-name>/clear</command-name>") == true {
+                newMessages.removeAll()
                 state.messages = []
                 state.seenToolIds = []
                 state.toolIdToName = [:]
@@ -1692,11 +1745,9 @@ actor ConversationParser {
                 state.toolResults = [:]
                 state.structuredResults = [:]
 
-                if isIncrementalRead {
-                    state.clearPending = true
-                    state.lastClearOffset = lineOffset
-                    Self.logger.debug("/clear detected (new), will notify UI")
-                }
+                state.clearPending = true
+                state.lastClearOffset = lineOffset + lineLength
+                Self.logger.debug("/clear detected (new), will notify UI")
                 continue
             }
 

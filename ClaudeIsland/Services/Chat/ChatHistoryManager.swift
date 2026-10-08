@@ -11,7 +11,8 @@ import Foundation
 class ChatHistoryManager: ObservableObject {
     private struct HistoryLoadTask {
         let id: UUID
-        let task: Task<Bool, Never>
+        let generation: UUID
+        let task: Task<UUID?, Never>
     }
 
     static let shared = ChatHistoryManager()
@@ -23,12 +24,16 @@ class ChatHistoryManager: ObservableObject {
     /// app session. Only populated by `loadFromFile` — NOT by session
     /// discovery via hooks. (Hook events only give tool calls, not the
     /// full user/assistant text conversation.)
-    private var jsonlParsedSessions: Set<String> = []
+    private var jsonlParsedSessions: [String: UUID] = [:]
     private var historyLoadTasks: [String: HistoryLoadTask] = [:]
     private var cancellables = Set<AnyCancellable>()
+    private let sessionStore: SessionStore
+    private let conversationParser: ConversationParser
 
-    private init() {
-        SessionStore.shared.sessionsPublisher
+    init(sessionStore: SessionStore = .shared, conversationParser: ConversationParser = .shared) {
+        self.sessionStore = sessionStore
+        self.conversationParser = conversationParser
+        sessionStore.sessionsPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] sessions in
                 self?.updateFromSessions(sessions)
@@ -46,72 +51,70 @@ class ChatHistoryManager: ObservableObject {
     /// Hook-driven session discovery does NOT mark a session as loaded —
     /// only an explicit `loadFromFile` call does.
     func isLoaded(sessionId: String) -> Bool {
-        jsonlParsedSessions.contains(sessionId)
+        jsonlParsedSessions[sessionId] != nil
     }
 
     /// Returns true only after a real source was parsed into a still-existing
     /// session. A missing file is deliberately not cached as success, so a
     /// native rollout discovered a moment later can be retried by the view.
     func loadFromFile(sessionId: String, cwd: String) async -> Bool {
-        if jsonlParsedSessions.contains(sessionId) {
+        guard let generation = await sessionStore.historyReadGeneration(for: sessionId) else { return false }
+        if jsonlParsedSessions[sessionId] == generation {
             return true
         }
         if let existing = historyLoadTasks[sessionId] {
-            return await existing.task.value
+            if existing.generation == generation {
+                guard let loadedGeneration = await existing.task.value,
+                      !existing.task.isCancelled else { return false }
+                let currentGeneration = await sessionStore.historyReadGeneration(for: sessionId)
+                return !existing.task.isCancelled && currentGeneration == loadedGeneration
+            }
+            existing.task.cancel()
         }
 
         let loadID = UUID()
-        let task = Task { @MainActor in
-            guard !Task.isCancelled else { return false }
-            guard await ConversationParser.shared.hasConversationSource(
+        let store = sessionStore
+        let parser = conversationParser
+        let task = Task<UUID?, Never> { @MainActor in
+            guard !Task.isCancelled else { return nil }
+            guard await parser.hasConversationSource(
                 sessionId: sessionId,
                 cwd: cwd
             ) else {
-                return false
+                return nil
             }
-            await SessionStore.shared.process(
-                .loadHistory(sessionId: sessionId, cwd: cwd)
-            )
-            guard !Task.isCancelled else { return false }
-            guard await SessionStore.shared.session(for: sessionId) != nil else {
-                return false
+            guard let loadedGeneration = await store.loadHistoryResult(sessionId: sessionId, cwd: cwd),
+                  !Task.isCancelled,
+                  await store.historyReadGeneration(for: sessionId) == loadedGeneration else {
+                return nil
             }
-            return await ConversationParser.shared.hasConversationSource(
+            let sourceExists = await parser.hasConversationSource(
                 sessionId: sessionId,
                 cwd: cwd
             )
+            guard !Task.isCancelled,
+                  await store.historyReadGeneration(for: sessionId) == loadedGeneration else { return nil }
+            return sourceExists ? loadedGeneration : nil
         }
-        historyLoadTasks[sessionId] = HistoryLoadTask(id: loadID, task: task)
-        let didLoad = await task.value
+        historyLoadTasks[sessionId] = HistoryLoadTask(id: loadID, generation: generation, task: task)
+        let loadedGeneration = await task.value
+        let didLoad: Bool
+        if let loadedGeneration, !task.isCancelled {
+            didLoad = await store.historyReadGeneration(for: sessionId) == loadedGeneration
+        } else {
+            didLoad = false
+        }
         if historyLoadTasks[sessionId]?.id == loadID {
             historyLoadTasks.removeValue(forKey: sessionId)
+            if didLoad && !task.isCancelled {
+                jsonlParsedSessions[sessionId] = loadedGeneration
+            }
         }
-        if didLoad && !task.isCancelled {
-            jsonlParsedSessions.insert(sessionId)
-        }
-        return didLoad
+        return didLoad && !task.isCancelled
     }
 
     func syncFromFile(sessionId: String, cwd: String) async {
-        let messages = await ConversationParser.shared.parseFullConversation(
-            sessionId: sessionId,
-            cwd: cwd
-        )
-        let completedTools = await ConversationParser.shared.completedToolIds(for: sessionId)
-        let toolResults = await ConversationParser.shared.toolResults(for: sessionId)
-        let structuredResults = await ConversationParser.shared.structuredResults(for: sessionId)
-
-        let payload = FileUpdatePayload(
-            sessionId: sessionId,
-            cwd: cwd,
-            messages: messages,
-            isIncremental: false,  // Full sync
-            completedToolIds: completedTools,
-            toolResults: toolResults,
-            structuredResults: structuredResults
-        )
-
-        await SessionStore.shared.process(.fileUpdated(payload))
+        await sessionStore.process(.syncHistory(sessionId: sessionId, cwd: cwd))
     }
 
     /// Native transcript rows eventually replace optimistic CLI rows. Keep an
@@ -143,16 +146,21 @@ class ChatHistoryManager: ObservableObject {
 
     func clearHistory(for sessionId: String) {
         historyLoadTasks.removeValue(forKey: sessionId)?.task.cancel()
-        jsonlParsedSessions.remove(sessionId)
+        jsonlParsedSessions.removeValue(forKey: sessionId)
         histories.removeValue(forKey: sessionId)
-        Task {
-            await SessionStore.shared.process(.sessionEnded(sessionId: sessionId))
+        Task { [sessionStore] in
+            await sessionStore.process(.sessionEnded(sessionId: sessionId))
         }
     }
 
     // MARK: - State Updates
 
     private func updateFromSessions(_ sessions: [SessionState]) {
+        let generations = Dictionary(uniqueKeysWithValues: sessions.map { ($0.sessionId, $0.historyGeneration) })
+        jsonlParsedSessions = jsonlParsedSessions.filter { generations[$0.key] == $0.value }
+        // Published snapshots can lag the actor query made by a new load.
+        // They may invalidate a cache, but must not cancel a newer task.
+        // The task's own generation checks and the next load own cancellation.
         var newHistories: [String: [ChatHistoryItem]] = [:]
         var newAgentDescriptions: [String: [String: String]] = [:]
         for session in sessions {
