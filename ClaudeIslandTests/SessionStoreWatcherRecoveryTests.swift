@@ -39,11 +39,16 @@ final class SessionStoreWatcherRecoveryTests: XCTestCase {
         XCTAssertEqual(watcher.watching, ["late-child-fixture"])
         let stop = start.addingTimeInterval(1)
         await store.process(lifecycleHook("Stop", at: stop))
+        let beforeChild = await store.session(for: "late-child-fixture")
+        XCTAssertNotNil(beforeChild?.completedAt)
         await store.process(lifecycleHook("SubagentStop", at: stop.addingTimeInterval(1)))
         let completed = await store.session(for: "late-child-fixture")
         XCTAssertEqual(completed?.phase, .waitingForInput)
-        XCTAssertEqual(completed?.completedAt, stop)
-        XCTAssertEqual(completed?.lastHookEventAt, stop)
+        // The wire carries seconds since 1970, whereas Foundation stores Date
+        // relative to its reference epoch. Compare the stored boundary before
+        // and after the callback, not an unconverted host timestamp.
+        XCTAssertEqual(completed?.completedAt, beforeChild?.completedAt)
+        XCTAssertEqual(completed?.lastHookEventAt, beforeChild?.lastHookEventAt)
         XCTAssertTrue(watcher.watching.isEmpty)
         let rejected = await store.lifecycleTrace(for: "late-child-fixture")
         XCTAssertEqual(rejected.last?.reason, .subagentCompletionCannotResume)
