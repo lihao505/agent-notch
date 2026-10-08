@@ -281,6 +281,11 @@ PermissionRequest 的普通模式；agent 自己的完全绕过模式没有事�
 认的格式回写。你若 90s 内不点,bridge `exit 0`,agent 回退到它自己的终端提示；
 Agent Notch 随后关闭过期 socket 并清除僵尸审批状态。
 
+Claude 2.1.195 的真实交互单会话允许 / 拒绝及精确回写已本机验收，
+见[原生审批证据与边界](../docs/specs/2026-10-08-permission-acceptance.md)。
+隔离验收日志可用 `scripts/verify-claude-permission.py` 只读核验请求 ID、决策、
+结果和执行标记；它不点击 UI，也不证明超时或并行请求已经验收。
+
 安装器的“owner”判断只覆盖本次编辑的用户配置文件。Codex 插件、项目级或托管配置，
 以及 Claude 的其他配置层，仍可能在运行时提供额外 PermissionRequest 钩子；安装输出
 不会再把用户配置文件内的 owner 表述成全局独占。发布验收应检查 agent 实际加载的全部层。

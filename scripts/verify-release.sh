@@ -231,8 +231,9 @@ python3 -m plistlib ClaudeIsland/Info.plist >/dev/null
 bash -n scripts/build.sh scripts/create-release.sh scripts/generate-keys.sh \
     AgentBridge/install.sh AgentBridge/uninstall.sh
 python3 -B -m unittest discover -s AgentBridge/tests -v
-# Parse the opt-in live fixture without loading an SDK or making model calls.
+# Parse acceptance tools without loading an SDK or making model calls.
 python3 -B scripts/verify-claude-question.py --help >/dev/null
+python3 -B scripts/verify-claude-permission.py --help >/dev/null
 python3 -B -m unittest discover -s scripts/tests -v
 
 echo "Release metadata and scripts verified."
