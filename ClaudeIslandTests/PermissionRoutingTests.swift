@@ -66,18 +66,21 @@ final class PermissionRoutingTests: XCTestCase {
         return client
     }
 
+    @discardableResult
     private func sendPermission(
         client: Int32,
         sessionId: String,
-        toolUseId: String
-    ) throws {
+        toolUseId: String,
+        observedAt: Date? = Date(),
+        source: String = "codex"
+    ) throws -> HookEvent {
         let event = HookEvent(
             sessionId: sessionId,
             cwd: "/tmp/agent-notch-permission-tests",
             event: "PermissionRequest",
             status: "waiting_for_approval",
-            observedAt: Date().timeIntervalSince1970,
-            source: "codex",
+            observedAt: observedAt?.timeIntervalSince1970,
+            source: source,
             pid: nil,
             tty: nil,
             tool: "Bash",
@@ -104,6 +107,7 @@ final class PermissionRoutingTests: XCTestCase {
             }
         }
         shutdown(client, SHUT_WR)
+        return event
     }
 
     private func readResponse(client: Int32) throws -> HookResponse {
@@ -218,5 +222,154 @@ final class PermissionRoutingTests: XCTestCase {
         XCTAssertFalse(stopped.isRunning)
         XCTAssertFalse(stopped.socketExists)
         XCTAssertFalse(stopped.ownsSocket)
+    }
+
+    private func startPrivateServer(_ server: HookSocketServer, path: String, received: XCTestExpectation) async {
+        server.start(onEvent: { event in if event.expectsResponse { received.fulfill() } })
+        let deadline = Date().addingTimeInterval(3)
+        while (access(path, F_OK) != 0 || !server.diagnosticsInput().isRunning) && Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(access(path, F_OK), 0)
+    }
+
+    private func assertEOF(client: Int32, file: StaticString = #filePath, line: UInt = #line) {
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var byte: UInt8 = 0
+        XCTAssertEqual(Darwin.read(client, &byte, 1), 0, "Completed request must reach EOF", file: file, line: line)
+    }
+
+    @MainActor
+    func testTranscriptResolutionClosesExactPrivateSocketAndPreservesNextRequest() async throws {
+        for mode in ["direct", "history", "incremental"] {
+            let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+            let server = HookSocketServer(socketPath: path)
+            defer { server.stop(); unlink(path) }
+            let received = expectation(description: "private requests registered: \(mode)")
+            received.expectedFulfillmentCount = 2
+            await startPrivateServer(server, path: path, received: received)
+            let first = try connect(to: path)
+            let second = try connect(to: path)
+            defer { close(first); close(second) }
+            let base = Date().addingTimeInterval(-30)
+            let eventA = try sendPermission(client: first, sessionId: "fixture", toolUseId: "first", observedAt: base, source: "claude")
+            let eventB = try sendPermission(client: second, sessionId: "fixture", toolUseId: "second", observedAt: base.addingTimeInterval(1), source: "claude")
+            await fulfillment(of: [received], timeout: 3)
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-notch-socket-result-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                     conversationParser: ConversationParser(codexSessionsRoot: root, claudeProjectsRoot: root),
+                                     permissionCanceller: HookPermissionCanceller(server: server), processTreeProvider: { _ in [:] })
+            await store.process(.hookReceived(eventA))
+            await store.process(.hookReceived(eventB))
+            let completedAt = base.addingTimeInterval(2)
+            let result = ConversationParser.ToolResult(content: "done", stdout: nil, stderr: nil, isError: false, observedAt: completedAt)
+            switch mode {
+            case "history":
+                await store.process(.historyLoaded(sessionId: "fixture", messages: [], completedTools: ["first"],
+                                                  toolResults: ["first": result], structuredResults: [:],
+                                                  conversationInfo: ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil,
+                                                                                     lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil)))
+            case "incremental":
+                await store.process(.fileUpdated(FileUpdatePayload(sessionId: "fixture", cwd: eventA.cwd, messages: [], isIncremental: true,
+                                                                  completedToolIds: ["first"], toolResults: ["first": result], structuredResults: [:])))
+            default:
+                await store.process(.toolCompleted(sessionId: "fixture", toolUseId: "first", result: .from(parserResult: result, structuredResult: nil)))
+            }
+            let state = await store.session(for: "fixture")
+            XCTAssertEqual(state?.pendingInteractions.toolUseIds, ["second"])
+            assertEOF(client: first)
+            let delivered = expectation(description: "next request remains deliverable")
+            server.respondToPermission(toolUseId: "second", sessionId: "fixture", decision: "deny") { success in
+                XCTAssertTrue(success)
+                delivered.fulfill()
+            }
+            await fulfillment(of: [delivered], timeout: 3)
+            XCTAssertEqual(try readResponse(client: second).decision, "deny")
+        }
+    }
+
+    @MainActor
+    func testOldCompletionCannotCancelReplacementSocketWithSameKey() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "old and replacement registered")
+        received.expectedFulfillmentCount = 2
+        await startPrivateServer(server, path: path, received: received)
+        let old = try connect(to: path)
+        let replacement = try connect(to: path)
+        defer { close(old); close(replacement) }
+        let base = Date().addingTimeInterval(-30)
+        try sendPermission(client: old, sessionId: "fixture", toolUseId: "same", observedAt: base)
+        try sendPermission(client: replacement, sessionId: "fixture", toolUseId: "same", observedAt: base.addingTimeInterval(4))
+        await fulfillment(of: [received], timeout: 3)
+        assertEOF(client: old)
+        server.cancelPendingPermission(sessionId: "fixture", toolUseId: "same", completedAt: base.addingTimeInterval(2))
+        let delivered = expectation(description: "replacement survives old completion")
+        server.respondToPermission(toolUseId: "same", sessionId: "fixture", decision: "deny") { success in
+            XCTAssertTrue(success)
+            delivered.fulfill()
+        }
+        await fulfillment(of: [delivered], timeout: 3)
+        XCTAssertEqual((try? readResponse(client: replacement))?.decision, "deny")
+    }
+
+    @MainActor
+    func testRejectedTranscriptResultsLeavePrivateRequestDeliverable() async throws {
+        for timestamped in [false, true] {
+            let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+            let server = HookSocketServer(socketPath: path)
+            defer { server.stop(); unlink(path) }
+            let received = expectation(description: "private request registered")
+            await startPrivateServer(server, path: path, received: received)
+            let client = try connect(to: path)
+            defer { close(client) }
+            let base = Date().addingTimeInterval(-30)
+            let event = try sendPermission(client: client, sessionId: "fixture", toolUseId: "pending", observedAt: base, source: "claude")
+            await fulfillment(of: [received], timeout: 3)
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-notch-socket-rejected-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                     conversationParser: ConversationParser(codexSessionsRoot: root, claudeProjectsRoot: root),
+                                     permissionCanceller: HookPermissionCanceller(server: server), processTreeProvider: { _ in [:] })
+            await store.process(.hookReceived(event))
+            await store.process(.toolCompleted(sessionId: "fixture", toolUseId: "pending", result: ToolCompletionResult(
+                status: .success, result: "stale", structuredResult: nil, observedAt: timestamped ? base.addingTimeInterval(-1) : nil)))
+            let state = await store.session(for: "fixture")
+            XCTAssertEqual(state?.pendingInteractions.toolUseIds, ["pending"])
+            let delivered = expectation(description: "rejected result leaves socket usable")
+            server.respondToPermission(toolUseId: "pending", sessionId: "fixture", decision: "deny") { success in
+                XCTAssertTrue(success)
+                delivered.fulfill()
+            }
+            await fulfillment(of: [delivered], timeout: 3)
+            XCTAssertEqual(try readResponse(client: client).decision, "deny")
+        }
+    }
+
+    @MainActor
+    func testUntimestampedRequestAndInvalidCompletionCannotBeCanceledByOldBoundary() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "untimestamped request registered")
+        await startPrivateServer(server, path: path, received: received)
+        let client = try connect(to: path)
+        defer { close(client) }
+        try sendPermission(client: client, sessionId: "fixture", toolUseId: "pending", observedAt: nil)
+        await fulfillment(of: [received], timeout: 3)
+        server.cancelPendingPermission(sessionId: "fixture", toolUseId: "pending", completedAt: Date().addingTimeInterval(-30))
+        server.cancelPendingPermission(sessionId: "fixture", toolUseId: "pending", completedAt: Date(timeIntervalSince1970: .nan))
+        let delivered = expectation(description: "request survives invalid boundaries")
+        server.respondToPermission(toolUseId: "pending", sessionId: "fixture", decision: "deny") { success in
+            XCTAssertTrue(success)
+            delivered.fulfill()
+        }
+        await fulfillment(of: [delivered], timeout: 3)
+        XCTAssertEqual(try readResponse(client: client).decision, "deny")
     }
 }

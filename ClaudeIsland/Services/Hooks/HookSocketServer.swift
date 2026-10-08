@@ -132,8 +132,27 @@ typealias HookEventHandler = @Sendable (HookEvent) -> Void
 /// Callback for permission response failures (socket died)
 typealias PermissionFailureHandler = @Sendable (_ sessionId: String, _ toolUseId: String) -> Void
 
-/// Unix domain socket server that receives events from Claude Code hooks
-/// Uses GCD DispatchSource for non-blocking I/O
+@MainActor
+protocol SessionPermissionCancelling: AnyObject {
+    func cancelPendingPermission(sessionId: String, toolUseId: String, completedAt: Date?)
+}
+
+/// Keep UI-facing injection on the main actor without making the GCD socket
+/// implementation main-actor isolated through protocol conformance.
+@MainActor
+final class HookPermissionCanceller: SessionPermissionCancelling {
+    static let shared = HookPermissionCanceller(server: .shared)
+    private let server: HookSocketServer
+
+    init(server: HookSocketServer) { self.server = server }
+
+    func cancelPendingPermission(sessionId: String, toolUseId: String, completedAt: Date?) {
+        server.cancelPendingPermission(sessionId: sessionId, toolUseId: toolUseId, completedAt: completedAt)
+    }
+}
+
+/// Unix domain socket server that receives events from Claude Code hooks.
+/// Uses GCD DispatchSource for non-blocking I/O.
 class HookSocketServer {
     static let shared = HookSocketServer()
     static let socketPath: String = {
@@ -445,25 +464,36 @@ class HookSocketServer {
     }
 
     /// Cancel one exact pending permission when its tool completes elsewhere.
-    func cancelPendingPermission(sessionId: String, toolUseId: String) {
+    func cancelPendingPermission(sessionId: String, toolUseId: String, completedAt: Date? = nil) {
         queue.async { [weak self] in
             self?.cleanupSpecificPermission(
                 sessionId: sessionId,
-                toolUseId: toolUseId
+                toolUseId: toolUseId,
+                completedAt: completedAt
             )
         }
     }
 
-    private func cleanupSpecificPermission(sessionId: String, toolUseId: String) {
+    private func cleanupSpecificPermission(sessionId: String, toolUseId: String, completedAt: Date?) {
         let key = PendingPermissionKey(
             sessionId: sessionId,
             toolUseId: toolUseId
         )
         permissionsLock.lock()
-        guard let pending = pendingPermissions.removeValue(forKey: key) else {
+        guard let pending = pendingPermissions[key] else {
             permissionsLock.unlock()
             return
         }
+        if let completedAt {
+            // Evaluate on the socket queue immediately before deletion, not
+            // before the actor hop. The same key may now hold a newer request.
+            let requestAt = pending.event.lifecycleObservedDate(receivedAt: pending.receivedAt)
+            guard completedAt.timeIntervalSince1970.isFinite, requestAt <= completedAt else {
+                permissionsLock.unlock()
+                return
+            }
+        }
+        pendingPermissions.removeValue(forKey: key)
         permissionsLock.unlock()
 
         logger.debug("Tool completed externally, closing socket for \(pending.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")

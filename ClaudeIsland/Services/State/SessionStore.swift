@@ -120,6 +120,7 @@ actor SessionStore {
     private let persistenceURL: URL
     private let bridgeSnapshotDirectory: URL
     private let interruptWatcher: (any SessionInterruptWatching)?
+    private let permissionCanceller: (any SessionPermissionCancelling)?
     private let processTreeProvider: @Sendable (Bool) -> [Int: ProcessInfo]
     private let historySnapshotProvider: (@Sendable (String, String) async -> ConversationParser.HistoryParseResult)?
 
@@ -146,6 +147,7 @@ actor SessionStore {
         persistenceURL: URL? = nil,
         bridgeSnapshotDirectory: URL? = nil,
         interruptWatcher: (any SessionInterruptWatching)? = nil,
+        permissionCanceller: (any SessionPermissionCancelling)? = nil,
         processTreeProvider: @escaping @Sendable (Bool) -> [Int: ProcessInfo] = {
             ProcessTreeBuilder.shared.buildTree(forceRefresh: $0)
         },
@@ -159,6 +161,7 @@ actor SessionStore {
         self.persistenceURL = persistenceURL ?? Self.defaultPersistenceURL
         self.bridgeSnapshotDirectory = bridgeSnapshotDirectory ?? Self.defaultBridgeSnapshotDirectory
         self.interruptWatcher = interruptWatcher
+        self.permissionCanceller = permissionCanceller
         self.processTreeProvider = processTreeProvider
         self.historySnapshotProvider = historySnapshotProvider
     }
@@ -521,7 +524,8 @@ actor SessionStore {
            let toolUseId = event.toolUseId {
             await cancelPendingPermission(
                 sessionId: sessionId,
-                toolUseId: toolUseId
+                toolUseId: toolUseId,
+                completedAt: observedAt
             )
         }
 
@@ -885,6 +889,7 @@ actor SessionStore {
     /// This is the authoritative handler for tool completions - ensures consistent state updates
     private func processToolCompleted(sessionId: String, toolUseId: String, result: ToolCompletionResult) async {
         guard var session = sessions[sessionId] else { return }
+        var didResolveRequest = false
 
         if let resolution = pendingInteractionResolution(
             toolUseId: toolUseId,
@@ -902,6 +907,7 @@ actor SessionStore {
                 sessions[sessionId] = session
                 return
             }
+            didResolveRequest = true
         }
 
         if let index = session.chatItems.firstIndex(where: { $0.id == toolUseId }) {
@@ -909,6 +915,11 @@ actor SessionStore {
         }
 
         sessions[sessionId] = session
+        if didResolveRequest, let completedAt = result.observedAt {
+            // Commit before crossing to the main actor, and never write the
+            // old snapshot back after cleanup has suspended this actor.
+            await cancelPendingPermission(sessionId: sessionId, toolUseId: toolUseId, completedAt: completedAt)
+        }
     }
 
     /// Merge concrete results without making presentation completion a new
@@ -1610,13 +1621,17 @@ actor SessionStore {
 
     private func cancelPendingPermission(
         sessionId: String,
-        toolUseId: String
+        toolUseId: String,
+        completedAt: Date
     ) async {
-        guard externalLifecycleEffectsEnabled else { return }
+        guard externalLifecycleEffectsEnabled || permissionCanceller != nil else { return }
+        let injectedCanceller = permissionCanceller
         await MainActor.run {
-            HookSocketServer.shared.cancelPendingPermission(
+            let canceller = injectedCanceller ?? HookPermissionCanceller.shared
+            canceller.cancelPendingPermission(
                 sessionId: sessionId,
-                toolUseId: toolUseId
+                toolUseId: toolUseId,
+                completedAt: completedAt
             )
         }
     }

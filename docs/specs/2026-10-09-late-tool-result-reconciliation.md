@@ -81,3 +81,6 @@ Bridge 88 项、permission verifier 30 项和发布闸门通过，日志
 工具行标记不持久化；离线恢复依赖现有历史结果和已知终止边界，不凭空恢复未知结果。
 本轮未改 transcript 完成后的 reply socket 清理，不把内存审批队列已更新外推为
 所有真实外部挂起请求均已关闭。
+
+后续精确工具完成的 socket 清理见
+[精确回复连接](2026-10-09-exact-reply-socket-completion.md)；其私有连接验证不替代真实 CLI 验收。
