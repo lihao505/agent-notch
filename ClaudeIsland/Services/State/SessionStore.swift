@@ -309,6 +309,7 @@ actor SessionStore {
                 origin: .hook,
                 evidence: .hook(hookSignal),
                 requestedPhase: newPhase,
+                hookEventName: event.event,
                 observedAt: observedAt,
                 receivedAt: receivedAt
             )

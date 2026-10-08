@@ -479,6 +479,7 @@ struct LifecycleDiagnosticsView: View {
         case "hookSessionEnded": return t("Hook ended the session", "Hook 结束了会话")
         case "hookSessionRemoved": return t("Hook removed the session", "Hook 移除了会话")
         case "hookOlderThanBoundary": return t("Hook predates current boundary", "Hook 早于当前边界")
+        case "subagentCompletionCannotResume": return t("Child completion cannot resume the parent", "子任务完成不能重启主回合")
         case "invalidHookPhase": return t("Hook phase is invalid", "Hook 状态无效")
         case "interactionResolved": return t("Interaction was resolved", "交互请求已处理")
         case "localFailurePreservedNewerActivity": return t("Newer activity preserved after local failure", "本地失败后保留了更新的活动")

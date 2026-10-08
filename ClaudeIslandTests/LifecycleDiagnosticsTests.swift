@@ -31,7 +31,8 @@ final class LifecycleDiagnosticsTests: XCTestCase {
         sessionId: String,
         receivedAt: Date,
         reason: LifecycleTransitionReason = .alreadyCurrent,
-        requestedPhase: SessionPhase? = nil
+        requestedPhase: SessionPhase? = nil,
+        hookEventName: String? = nil
     ) -> LifecycleTraceEntry {
         let observation = SessionLifecycleObservation(
             sessionId: sessionId,
@@ -40,6 +41,7 @@ final class LifecycleDiagnosticsTests: XCTestCase {
             origin: .hook,
             evidence: .hook(.active),
             requestedPhase: requestedPhase,
+            hookEventName: hookEventName,
             observedAt: receivedAt.addingTimeInterval(-0.25),
             receivedAt: receivedAt
         )
@@ -71,6 +73,45 @@ final class LifecycleDiagnosticsTests: XCTestCase {
             ),
             watchers: watchers
         )
+    }
+
+    func testKnownHookNamesSurviveRedactionWithoutChangingArbitration() throws {
+        for name in LifecycleHookEventName.allCases {
+            let diagnostics = snapshot(decisions: [DiagnosticsDecisionInput(
+                sessionId: "private-session",
+                trace: trace(sessionId: "private-session", receivedAt: now,
+                             hookEventName: name.rawValue)
+            )])
+            XCTAssertEqual(diagnostics.decisions.first?.evidence,
+                           "hook.active · " + name.rawValue)
+            XCTAssertFalse(try DiagnosticsReportFormatter.json(diagnostics)
+                .contains("private-session"))
+        }
+    }
+
+    func testUnknownHookNameCannotLeakIntoReport() throws {
+        let secret = "/Users/private/prompt-secret"
+        let diagnostics = snapshot(decisions: [DiagnosticsDecisionInput(
+            sessionId: "private-session",
+            trace: trace(sessionId: "private-session", receivedAt: now,
+                         hookEventName: secret)
+        )])
+        XCTAssertEqual(diagnostics.decisions.first?.evidence, "hook.active")
+        XCTAssertFalse(try DiagnosticsReportFormatter.json(diagnostics).contains(secret))
+    }
+
+    func testNonHookObservationCannotClaimAHookEventName() {
+        let observation = SessionLifecycleObservation(
+            sessionId: "fixture", cwd: "/tmp/fixture", source: .claude,
+            origin: .transcript, evidence: .completed(now),
+            hookEventName: "Stop", observedAt: now, receivedAt: now
+        )
+        XCTAssertNil(observation.hookEventName)
+        let entry = LifecycleTraceEntry(
+            observation: observation, previous: nil,
+            transition: LifecycleTransition(mutation: .none, reason: .alreadyCurrent)
+        )
+        XCTAssertNil(entry.hookEventName)
     }
 
     func testReportExcludesRawIdentityPathAndPermissionContent() throws {

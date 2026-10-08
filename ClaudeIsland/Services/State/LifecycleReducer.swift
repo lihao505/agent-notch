@@ -31,6 +31,27 @@ nonisolated enum HookLifecycleSignal: String, Equatable, Sendable {
     case removed
 }
 
+/// Only protocol event names may enter diagnostics; never retain an arbitrary
+/// socket string, which could contain a prompt, path, or other private value.
+nonisolated enum LifecycleHookEventName: String, CaseIterable, Sendable {
+    case sessionStart = "SessionStart"
+    case userPromptSubmit = "UserPromptSubmit"
+    case preToolUse = "PreToolUse"
+    case postToolUse = "PostToolUse"
+    case postToolUseFailure = "PostToolUseFailure"
+    case permissionRequest = "PermissionRequest"
+    case permissionDenied = "PermissionDenied"
+    case notification = "Notification"
+    case stop = "Stop"
+    case stopFailure = "StopFailure"
+    case subagentStart = "SubagentStart"
+    case subagentStop = "SubagentStop"
+    case sessionEnd = "SessionEnd"
+    case sessionExpired = "SessionExpired"
+    case preCompact = "PreCompact"
+    case postCompact = "PostCompact"
+}
+
 /// Privacy-safe queue reconciliation signal. The permission context, tool
 /// result, and response payload remain in SessionStore and never enter the
 /// lifecycle decision trace.
@@ -76,6 +97,7 @@ nonisolated struct SessionLifecycleObservation: Equatable, Sendable {
     let source: AgentSource
     let origin: LifecycleObservationOrigin
     let evidence: LifecycleEvidence
+    let hookEventName: LifecycleHookEventName?
     /// Used only during arbitration. LifecycleTraceEntry deliberately stores a
     /// redacted phase kind rather than this potentially sensitive value.
     let requestedPhase: SessionPhase?
@@ -91,6 +113,7 @@ nonisolated struct SessionLifecycleObservation: Equatable, Sendable {
         origin: LifecycleObservationOrigin,
         evidence: LifecycleEvidence,
         requestedPhase: SessionPhase? = nil,
+        hookEventName: String? = nil,
         observedAt: Date,
         receivedAt: Date
     ) {
@@ -99,6 +122,9 @@ nonisolated struct SessionLifecycleObservation: Equatable, Sendable {
         self.source = source
         self.origin = origin
         self.evidence = evidence
+        self.hookEventName = origin == .hook
+            ? hookEventName.flatMap(LifecycleHookEventName.init(rawValue:))
+            : nil
         self.requestedPhase = requestedPhase
         self.observedAt = observedAt
         self.receivedAt = receivedAt
@@ -182,6 +208,7 @@ nonisolated enum LifecycleTransitionReason: String, Equatable, Sendable {
     case hookSessionEnded
     case hookSessionRemoved
     case hookOlderThanBoundary
+    case subagentCompletionCannotResume
     case invalidHookPhase
     case interactionResolved
     case localFailurePreservedNewerActivity
@@ -235,6 +262,7 @@ nonisolated struct LifecycleTransition: Equatable, Sendable {
              .completionOlderThanTurn,
              .sessionNotFound,
              .hookOlderThanBoundary,
+             .subagentCompletionCannotResume,
              .invalidHookPhase,
              .interactionOlderThanCompletion,
              .interactionOlderThanBoundary,
@@ -283,6 +311,7 @@ nonisolated struct LifecycleTraceEntry: Equatable, Sendable {
     let receivedAt: Date
     let origin: LifecycleObservationOrigin
     let evidence: LifecycleEvidence
+    let hookEventName: LifecycleHookEventName?
     let reason: LifecycleTransitionReason
     let accepted: Bool
     let didMutate: Bool
@@ -298,6 +327,7 @@ nonisolated struct LifecycleTraceEntry: Equatable, Sendable {
         receivedAt = observation.receivedAt
         origin = observation.origin
         evidence = observation.evidence
+        hookEventName = observation.hookEventName
         reason = transition.reason
         accepted = transition.acceptsObservation
         didMutate = transition.didMutate
@@ -626,6 +656,16 @@ nonisolated enum LifecycleReducer {
 
         switch signal {
         case .active, .interaction, .compacting:
+            // Claude may finish an internal/background subagent after the
+            // parent's Stop (e.g. an interactive prompt-suggestion task). Its
+            // fresh delivery timestamp is not a new parent-turn boundary.
+            if observation.hookEventName == .subagentStop,
+               !next.phase.isActive && !next.phase.isWaitingForApproval {
+                return LifecycleTransition(
+                    mutation: .none,
+                    reason: .subagentCompletionCannotResume
+                )
+            }
             if let completedAt = next.completedAt,
                observedAt <= completedAt {
                 return LifecycleTransition(

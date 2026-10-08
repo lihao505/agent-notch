@@ -20,6 +20,62 @@ private final class RecoveryWatcher: SessionInterruptWatching {
 
 @MainActor
 final class SessionStoreWatcherRecoveryTests: XCTestCase {
+    private func lifecycleHook(_ event: String, at time: Date) -> SessionEvent {
+        .hookReceived(HookEvent(
+            sessionId: "late-child-fixture", cwd: "/tmp/late-child-fixture",
+            event: event, status: event == "Stop" ? "waiting_for_input" : "processing",
+            observedAt: time.timeIntervalSince1970, source: "claude",
+            pid: nil, tty: nil, tool: nil, toolInput: nil, toolUseId: nil,
+            notificationType: nil, message: nil
+        ))
+    }
+
+    func testLateSubagentStopCannotReviveCompletedParentOrReinstallWatcher() async throws {
+        let watcher = RecoveryWatcher()
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                 interruptWatcher: watcher)
+        let start = Date().addingTimeInterval(-10)
+        await store.process(lifecycleHook("UserPromptSubmit", at: start))
+        XCTAssertEqual(watcher.watching, ["late-child-fixture"])
+        let stop = start.addingTimeInterval(1)
+        await store.process(lifecycleHook("Stop", at: stop))
+        await store.process(lifecycleHook("SubagentStop", at: stop.addingTimeInterval(1)))
+        let completed = await store.session(for: "late-child-fixture")
+        XCTAssertEqual(completed?.phase, .waitingForInput)
+        XCTAssertEqual(completed?.completedAt, stop)
+        XCTAssertEqual(completed?.lastHookEventAt, stop)
+        XCTAssertTrue(watcher.watching.isEmpty)
+        let rejected = await store.lifecycleTrace(for: "late-child-fixture")
+        XCTAssertEqual(rejected.last?.reason, .subagentCompletionCannotResume)
+        XCTAssertEqual(rejected.last?.hookEventName, .subagentStop)
+        XCTAssertEqual(rejected.last?.accepted, false)
+
+        // A genuine new parent turn still resumes, and child completion while
+        // that turn is running must neither stop it nor uninstall its watcher.
+        await store.process(lifecycleHook("UserPromptSubmit", at: stop.addingTimeInterval(2)))
+        await store.process(lifecycleHook("SubagentStop", at: stop.addingTimeInterval(3)))
+        let resumed = await store.session(for: "late-child-fixture")
+        XCTAssertEqual(resumed?.phase, .processing)
+        XCTAssertNil(resumed?.completedAt)
+        XCTAssertEqual(watcher.watching, ["late-child-fixture"])
+        XCTAssertEqual(watcher.installationCount, 2)
+    }
+
+    func testLateSubagentStopCannotReviveInterruptedParent() async {
+        let watcher = RecoveryWatcher()
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                 interruptWatcher: watcher)
+        let start = Date().addingTimeInterval(-10)
+        await store.process(lifecycleHook("UserPromptSubmit", at: start))
+        await store.process(.interruptDetected(sessionId: "late-child-fixture",
+                                              observedAt: start.addingTimeInterval(1)))
+        await store.process(lifecycleHook("SubagentStop", at: start.addingTimeInterval(2)))
+        let interrupted = await store.session(for: "late-child-fixture")
+        XCTAssertEqual(interrupted?.phase, .idle)
+        XCTAssertTrue(watcher.watching.isEmpty)
+        XCTAssertEqual(watcher.installationCount, 1)
+    }
+
     private struct Fixture {
         let root: URL
         let id = UUID().uuidString

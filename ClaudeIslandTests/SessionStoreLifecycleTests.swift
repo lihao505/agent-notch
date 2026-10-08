@@ -2,6 +2,23 @@ import XCTest
 @testable import Agent_Notch
 
 final class SessionStoreLifecycleTests: XCTestCase {
+    func testHookTraceRetainsConcreteProtocolEventNames() async {
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                 externalLifecycleEffectsEnabled: false)
+        let now = Date()
+        let sessionId = "event-name-fixture"
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "UserPromptSubmit", status: "processing",
+            observedAt: now.addingTimeInterval(-2)
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "Stop", status: "waiting_for_input",
+            observedAt: now.addingTimeInterval(-1)
+        )))
+        let trace = await store.lifecycleTrace(for: sessionId)
+        XCTAssertEqual(trace.map(\.hookEventName), [.userPromptSubmit, .stop])
+    }
+
     private func hook(
         sessionId: String,
         event: String,

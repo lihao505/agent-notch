@@ -210,7 +210,8 @@ nonisolated enum LifecycleDiagnosticsAssembler {
             return LifecycleDecisionDiagnostics(
                 label: label,
                 origin: trace.origin.rawValue,
-                evidence: evidenceKind(trace.evidence),
+                evidence: evidenceKind(trace.evidence) +
+                    (trace.hookEventName.map { " · " + $0.rawValue } ?? ""),
                 reason: trace.reason.rawValue,
                 accepted: trace.accepted,
                 didMutate: trace.didMutate,
