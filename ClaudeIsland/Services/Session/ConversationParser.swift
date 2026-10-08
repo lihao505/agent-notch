@@ -7,6 +7,7 @@
 //  Optimized for incremental parsing - only reads new lines since last sync
 //
 
+import CryptoKit
 import Foundation
 import os.log
 
@@ -176,7 +177,7 @@ actor ConversationParser {
     private var incrementalState: [String: IncrementalParseState] = [:]
     private var codexRolloutPaths: [String: URL] = [:]
     private var codexLifecycleState: [String: CodexLifecycleParseState] = [:]
-    private var codexMetadataCache: [String: (sessionId: String, cwd: String)] = [:]
+    private var codexMetadataCache: [String: CachedCodexMetadata] = [:]
     private var codexRolloutIndexInitialized = false
     private var codexIndexedDirectoryModificationDates: [String: Date] = [:]
 
@@ -188,6 +189,25 @@ actor ConversationParser {
     private struct CachedInfo {
         let modificationDate: Date
         let info: ConversationInfo
+    }
+
+    private struct CodexMetadataSignature: Equatable {
+        let deviceNumber: UInt64?
+        let fileNumber: UInt64?
+        let modificationDate: Date
+        let fileSize: UInt64
+
+        func hasSameIdentity(as other: Self) -> Bool {
+            deviceNumber != nil && fileNumber != nil &&
+                deviceNumber == other.deviceNumber && fileNumber == other.fileNumber
+        }
+    }
+
+    private struct CachedCodexMetadata {
+        let signature: CodexMetadataSignature
+        let headerByteCount: Int
+        let headerDigest: SHA256.Digest
+        let metadata: (sessionId: String, cwd: String)
     }
 
     /// State for incremental JSONL parsing
@@ -642,15 +662,15 @@ actor ConversationParser {
                   fileType == .typeRegular,
                   let modifiedAt = attributes[.modificationDate] as? Date,
                   modifiedAt >= modifiedAfter,
-                  let metadata = codexSessionMetadata(at: url) else {
+                  let metadata = codexSessionMetadata(at: url, attributes: attributes) else {
                 continue
             }
 
             observations.append(CodexTaskObservation(
-                sessionId: sessionId,
+                sessionId: metadata.sessionId,
                 cwd: metadata.cwd,
                 lifecycle: codexTaskLifecycle(
-                    sessionId: sessionId
+                    sessionId: metadata.sessionId
                 ),
                 fileModifiedAt: modifiedAt
             ))
@@ -738,15 +758,47 @@ actor ConversationParser {
     }
 
     private func codexSessionMetadata(
-        at url: URL
+        at url: URL,
+        attributes suppliedAttributes: [FileAttributeKey: Any]? = nil
     ) -> (sessionId: String, cwd: String)? {
-        if let cached = codexMetadataCache[url.path] {
-            return cached
+        guard let attributes = suppliedAttributes ??
+                (try? FileManager.default.attributesOfItem(atPath: url.path)),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let modificationDate = attributes[.modificationDate] as? Date,
+              let fileSize = (attributes[.size] as? NSNumber)?.uint64Value else {
+            codexMetadataCache.removeValue(forKey: url.path)
+            return nil
+        }
+        let signature = CodexMetadataSignature(
+            deviceNumber: (attributes[.systemNumber] as? NSNumber)?.uint64Value,
+            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+            modificationDate: modificationDate,
+            fileSize: fileSize
+        )
+        let cached = codexMetadataCache[url.path]
+        if let cached, signature.hasSameIdentity(as: cached.signature),
+           signature == cached.signature {
+            return cached.metadata
         }
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             return nil
         }
         defer { try? handle.close() }
+
+        // Appends change size/mtime, not the session header. Validate only that
+        // cached row before reusing it, rather than decoding a 256 KiB prefix
+        // on every live status poll. Replacement files must be parsed afresh.
+        if let cached, signature.hasSameIdentity(as: cached.signature),
+           let header = try? handle.read(upToCount: cached.headerByteCount),
+           header.count == cached.headerByteCount,
+           SHA256.hash(data: header) == cached.headerDigest {
+            codexMetadataCache[url.path] = CachedCodexMetadata(
+                signature: signature, headerByteCount: cached.headerByteCount,
+                headerDigest: cached.headerDigest, metadata: cached.metadata
+            )
+            return cached.metadata
+        }
+        do { try handle.seek(toOffset: 0) } catch { return nil }
         guard let prefix = try? handle.read(upToCount: 256 * 1024),
               let newline = prefix.firstIndex(of: 0x0A),
               let row = try? JSONSerialization.jsonObject(
@@ -761,7 +813,21 @@ actor ConversationParser {
             return nil
         }
         let metadata = (sessionId: sessionId, cwd: cwd)
-        codexMetadataCache[url.path] = metadata
+        if let cached, cached.metadata.sessionId != sessionId {
+            let oldID = cached.metadata.sessionId
+            if codexRolloutPaths[oldID]?.path == url.path {
+                codexRolloutPaths.removeValue(forKey: oldID)
+                codexLifecycleState.removeValue(forKey: oldID)
+                if incrementalState[oldID]?.sourceFilePath == url.path {
+                    incrementalState.removeValue(forKey: oldID)
+                }
+            }
+            codexRolloutPaths[sessionId] = url
+        }
+        codexMetadataCache[url.path] = CachedCodexMetadata(
+            signature: signature, headerByteCount: newline + 1,
+            headerDigest: SHA256.hash(data: prefix[...newline]), metadata: metadata
+        )
         return metadata
     }
 
@@ -1246,10 +1312,11 @@ actor ConversationParser {
 
     private func codexRolloutURL(sessionId: String) -> URL? {
         if let cached = codexRolloutPaths[sessionId] {
-            if FileManager.default.fileExists(atPath: cached.path) {
+            if let metadata = codexSessionMetadata(at: cached),
+               metadata.sessionId == sessionId {
                 return cached
             }
-            // A removed rollout may be replaced in the same directory before
+            // A removed or identity-replaced rollout may change before
             // its mtime visibly advances (notably on coarse timestamp file
             // systems). Scan that one directory instead of trusting the
             // recent-directory mtime cache or rewalking all history.

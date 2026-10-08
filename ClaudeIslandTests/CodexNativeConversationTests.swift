@@ -362,4 +362,39 @@ final class CodexNativeConversationTests: XCTestCase {
             "轮换后只保留新文件内容"
         ])
     }
+
+    func testReusedPathDoesNotLeakTranscriptAcrossSessionIdentities() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = try rolloutURL(root: root, sessionId: "old-owner")
+        try writeLines([
+            try encoded(metadata(sessionId: "old-owner", cwd: "/tmp/old-owner")),
+            try encoded(itemCompleted(id: "old-message", type: "UserMessage", text: "原会话消息"))
+        ], to: url)
+        let parser = ConversationParser(
+            codexSessionsRoot: root,
+            claudeProjectsRoot: root.appendingPathComponent("isolated-claude")
+        )
+        let original = await parser.parseFullConversation(
+            sessionId: "old-owner", cwd: "/tmp/old-owner"
+        )
+        XCTAssertEqual(original.map(\.textContent), ["原会话消息"])
+
+        try writeLines([
+            try encoded(metadata(sessionId: "new-owner", cwd: "/tmp/new-owner")),
+            try encoded(itemCompleted(id: "new-message", type: "AgentMessage",
+                                      text: "替换文件属于新会话", phase: "final_answer"))
+        ], to: url, options: .atomic)
+        let discovered = await parser.discoverCodexTasks(modifiedAfter: .distantPast)
+        XCTAssertEqual(discovered.map(\.sessionId), ["new-owner"])
+        let oldMessages = await parser.parseFullConversation(
+            sessionId: "old-owner", cwd: "/tmp/old-owner"
+        )
+        XCTAssertTrue(oldMessages.isEmpty)
+        let newMessages = await parser.parseFullConversation(
+            sessionId: "new-owner", cwd: "/tmp/new-owner"
+        )
+        XCTAssertEqual(newMessages.map(\.id), ["native-item-new-message"])
+        XCTAssertEqual(newMessages.map(\.textContent), ["替换文件属于新会话"])
+    }
 }
