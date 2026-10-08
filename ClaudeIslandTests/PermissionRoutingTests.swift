@@ -3,6 +3,40 @@ import XCTest
 @testable import Agent_Notch
 
 final class PermissionRoutingTests: XCTestCase {
+    @MainActor
+    func testRenderedButtonBindingsDoNotRetargetWhenQueueAdvances() {
+        var displayed = PermissionContext(
+            toolUseId: "first", toolName: "Bash", toolInput: nil, receivedAt: Date()
+        )
+        var actions: [String] = []
+        let approve = displayed.bindAction { actions.append("approve:\($0)") }
+        let auto = displayed.bindAction { actions.append("auto:\($0)") }
+        let deny = displayed.bindAction { actions.append("deny:\($0)") }
+
+        displayed = PermissionContext(
+            toolUseId: "second", toolName: "Read", toolInput: nil, receivedAt: Date()
+        )
+        let nextApprove = displayed.bindAction { actions.append("approve:\($0)") }
+        approve()
+        auto()
+        deny()
+        nextApprove()
+        XCTAssertEqual(actions, ["approve:first", "auto:first", "deny:first", "approve:second"])
+    }
+
+    @MainActor
+    func testStructuredRejectBindingKeepsRenderedRequestAfterDismissal() {
+        var displayed: PermissionContext? = PermissionContext(
+            toolUseId: "question", toolName: "AskUserQuestion", toolInput: nil, receivedAt: Date()
+        )
+        var rejected: [String] = []
+        let reject = displayed!.bindAction { rejected.append($0) }
+        displayed = nil
+        reject()
+        XCTAssertNil(displayed)
+        XCTAssertEqual(rejected, ["question"])
+    }
+
     private func connect(to path: String) throws -> Int32 {
         let client = socket(AF_UNIX, SOCK_STREAM, 0)
         guard client >= 0 else { throw POSIXError(.ENOTSOCK) }

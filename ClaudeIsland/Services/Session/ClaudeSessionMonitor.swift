@@ -92,7 +92,8 @@ class ClaudeSessionMonitor: ObservableObject {
 
     func approvePermission(
         sessionId: String,
-        expectedToolUseId: String
+        expectedToolUseId: String,
+        enableAutoApproval: Bool = false
     ) {
         let resolvedAt = Date()
         Task {
@@ -102,6 +103,13 @@ class ClaudeSessionMonitor: ObservableObject {
             }
             if permission.toolUseId != expectedToolUseId {
                 return
+            }
+            // An expired/outgoing card must not enable auto for its successor.
+            // Structured question/plan interactions never use this shortcut.
+            if enableAutoApproval {
+                guard permission.toolName != "AskUserQuestion",
+                      permission.toolName != "ExitPlanMode" else { return }
+                NotchPreferences.shared.setApprovalMode(.auto, for: sessionId)
             }
             let toolUseId = permission.toolUseId
 

@@ -340,6 +340,45 @@ final class SessionStoreLifecycleTests: XCTestCase {
         XCTAssertNil(session.activePermission)
     }
 
+    func testExpiredHeadAndLateActionsCannotConsumeSuccessor() async throws {
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false)
+        let sessionId = "expired-head-\(UUID().uuidString)"
+        let now = Date().addingTimeInterval(-10)
+        for (offset, identity, path) in [(0, "first", "alpha.txt"), (1, "second", "beta.txt")] {
+            await store.process(.hookReceived(hook(
+                sessionId: sessionId,
+                event: "PermissionRequest",
+                status: "waiting_for_approval",
+                observedAt: now.addingTimeInterval(Double(offset)),
+                tool: "Read",
+                toolUseId: identity,
+                toolInput: ["file_path": AnyCodable(path)]
+            )))
+        }
+        await store.process(.permissionSocketFailed(
+            sessionId: sessionId, toolUseId: "first", resolvedAt: now.addingTimeInterval(2)
+        ))
+        for lateEvent in [
+            SessionEvent.permissionApproved(
+                sessionId: sessionId, toolUseId: "first", resolvedAt: now.addingTimeInterval(3)
+            ),
+            .permissionDenied(
+                sessionId: sessionId, toolUseId: "first", reason: nil,
+                resolvedAt: now.addingTimeInterval(4)
+            ),
+            .permissionSocketFailed(
+                sessionId: sessionId, toolUseId: "first", resolvedAt: now.addingTimeInterval(5)
+            )
+        ] {
+            await store.process(lateEvent)
+            let snapshot = await store.session(for: sessionId)
+            let session = try XCTUnwrap(snapshot)
+            XCTAssertEqual(session.pendingInteractions.toolUseIds, ["second"])
+            XCTAssertEqual(session.activePermission?.toolUseId, "second")
+            XCTAssertEqual(session.activePermission?.formattedInput, "beta.txt")
+        }
+    }
+
     func testParallelInteractionsRemainFIFOAndSurviveToolActivity() async throws {
         let store = SessionStore(
             persistenceEnabled: false,

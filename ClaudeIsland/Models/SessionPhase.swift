@@ -16,6 +16,13 @@ struct PermissionContext: Sendable {
     let toolInput: [String: AnyCodable]?
     let receivedAt: Date
 
+    /// Bind a rendered button to this request, not to mutable SwiftUI State.
+    /// An outgoing card can remain clickable while its removal animates.
+    func bindAction(_ action: @escaping (String) -> Void) -> () -> Void {
+        let renderedToolUseId = toolUseId
+        return { action(renderedToolUseId) }
+    }
+
     /// Format tool input for display
     var formattedInput: String? {
         guard let input = toolInput else { return nil }

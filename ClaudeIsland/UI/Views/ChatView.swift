@@ -219,11 +219,6 @@ struct ChatView: View {
         session.phase.isWaitingForApproval
     }
 
-    /// Extract the tool name if waiting for approval
-    private var approvalTool: String? {
-        session.phase.approvalToolName
-    }
-
     /// Codex's native rollout is authoritative for desktop-backed sessions.
     /// In full-access mode it records `approval_policy: never`, meaning no
     /// PermissionRequest is expected and the chip must not say "Once".
@@ -258,7 +253,8 @@ struct ChatView: View {
                 }
 
                 // Approval bar, interactive prompt, or Input bar
-                if let tool = approvalTool {
+                if let permission = session.activePermission {
+                    let tool = permission.toolName
                     if tool == "AskUserQuestion" || tool == "ExitPlanMode" {
                         // Interactive tools - answer or review directly in the notch
                         interactivePromptBar
@@ -267,8 +263,8 @@ struct ChatView: View {
                                 removal: .opacity
                             ))
                     } else {
-                        approvalBar(tool: tool)
-                            .id(session.pendingToolId)
+                        approvalBar(permission: permission)
+                            .id(permission.toolUseId)
                             .transition(.asymmetric(
                                 insertion: .opacity.combined(with: .move(edge: .bottom)),
                                 removal: .opacity
@@ -864,13 +860,13 @@ struct ChatView: View {
 
     // MARK: - Approval Bar
 
-    private func approvalBar(tool: String) -> some View {
+    private func approvalBar(permission: PermissionContext) -> some View {
         ChatApprovalBar(
-            tool: tool,
-            toolInput: session.pendingToolInput,
-            onApproveOnce: { approvePermission() },
-            onAutoApprove: { autoApprovePermission() },
-            onDeny: { denyPermission() }
+            tool: permission.toolName,
+            toolInput: permission.formattedInput,
+            onApproveOnce: permission.bindAction { approvePermission(expectedToolUseId: $0) },
+            onAutoApprove: permission.bindAction { autoApprovePermission(expectedToolUseId: $0) },
+            onDeny: permission.bindAction { denyPermission(expectedToolUseId: $0) }
         )
     }
 
@@ -899,7 +895,7 @@ struct ChatView: View {
                         expectedToolUseId: permission.toolUseId
                     )
                 },
-                onDeny: { denyPermission() },
+                onDeny: permission.bindAction { denyPermission(expectedToolUseId: $0) },
                 onGoToTerminal: { focusTerminal() }
             )
         }
@@ -940,24 +936,25 @@ struct ChatView: View {
         }
     }
 
-    private func approvePermission() {
-        guard let toolUseId = session.pendingToolId else { return }
+    private func approvePermission(expectedToolUseId: String) {
         sessionMonitor.approvePermission(
             sessionId: sessionId,
-            expectedToolUseId: toolUseId
+            expectedToolUseId: expectedToolUseId
         )
     }
 
-    private func autoApprovePermission() {
-        preferences.setApprovalMode(.auto, for: sessionId)
-        approvePermission()
+    private func autoApprovePermission(expectedToolUseId: String) {
+        sessionMonitor.approvePermission(
+            sessionId: sessionId,
+            expectedToolUseId: expectedToolUseId,
+            enableAutoApproval: true
+        )
     }
 
-    private func denyPermission() {
-        guard let toolUseId = session.pendingToolId else { return }
+    private func denyPermission(expectedToolUseId: String) {
         sessionMonitor.denyPermission(
             sessionId: sessionId,
-            expectedToolUseId: toolUseId,
+            expectedToolUseId: expectedToolUseId,
             reason: nil
         )
     }
