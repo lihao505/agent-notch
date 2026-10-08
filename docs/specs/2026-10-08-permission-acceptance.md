@@ -63,3 +63,7 @@ python3 -B scripts/verify-claude-permission.py \
 
 本轮没有覆盖审批超时、同会话同时挂起的两个请求、双会话并行、重启中挂起审批、
 CodeBuddy 或刘海动画逐帧表现。验收矩阵仍保留这些待验证项。
+
+后续补充已覆盖双会话同时待审批并分别允许/拒绝，以及应用侧无人应答超时清理。
+原生审批回退可操作性、同会话 FIFO 和其他限制仍未确认。
+新增并行模式与 11 项测试，verifier 总数变为 28；详见[并行与超时验收](2026-10-08-parallel-permission-acceptance.md)。

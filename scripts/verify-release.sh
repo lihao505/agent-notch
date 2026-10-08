@@ -22,6 +22,7 @@ required_files=(
     AgentBridge/bin/notch-bridge.py AgentBridge/bin/codex-relay.py
     AgentBridge/tests/test_socket_responses.py scripts/verify-claude-question.py
     scripts/tests/test_live_question_verifier.py
+    scripts/verify-claude-permission.py scripts/tests/test_permission_verifier.py
     ClaudeIsland/Models/PendingInteractionQueue.swift
     ClaudeIsland/Services/Chat/AgentTransport.swift
     ClaudeIsland/Services/State/LifecycleReducer.swift
