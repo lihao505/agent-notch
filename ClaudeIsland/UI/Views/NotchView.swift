@@ -1144,59 +1144,28 @@ struct NotchView: View {
                 return
             }
 
-            var eligibleTargets: Set<NotchFollowUpTarget> = []
-            for target in targets.sorted(by: {
-                $0.sessionId < $1.sessionId
-            }) {
-                guard followUpReminderCoordinator.isCurrent(target),
-                      let session = sessionMonitor.instances.first(where: {
-                          $0.sessionId == target.sessionId
-                      }),
-                      !isSessionSilenced(session) else {
-                    continue
-                }
-
-                let isFocused: Bool
-                if let pid = session.pid {
-                    isFocused = await TerminalVisibilityDetector
-                        .isSessionFocused(sessionPid: pid)
-                } else {
-                    isFocused = false
-                }
-
-                guard !Task.isCancelled,
-                      viewModel.status != .opened,
-                      !isFocused,
-                      followUpReminderCoordinator.isCurrent(target),
-                      let currentSession = sessionMonitor.instances.first(
-                        where: { $0.sessionId == target.sessionId }
-                      ),
-                      !isSessionSilenced(currentSession) else {
-                    if isFocused {
-                        attentionLogger.info(
-                            "Suppressed focused follow-up for \(target.sessionId.prefix(8), privacy: .public)"
-                        )
+            let resolvedTargets = await followUpReminderCoordinator
+                .eligibleTargetsForDelivery(
+                    targets,
+                    trackingStartedAt: attentionTrackingStartedAt,
+                    sessions: { sessionMonitor.instances },
+                    isPanelOpen: { viewModel.status == .opened },
+                    isSilenced: { isSessionSilenced($0) },
+                    isFocused: { pid in
+                        await TerminalVisibilityDetector.isSessionFocused(sessionPid: pid)
                     }
-                    continue
-                }
-                eligibleTargets.insert(target)
-            }
-
+                )
             guard !Task.isCancelled else { return }
-            // Later focus probes can yield after an earlier target qualified.
-            // Recheck the whole batch immediately before any visible effect.
-            eligibleTargets = eligibleTargets.filter { target in
-                followUpReminderCoordinator.isCurrent(target) &&
-                    sessionMonitor.instances.contains { session in
-                        session.sessionId == target.sessionId &&
-                            !isSessionSilenced(session) &&
-                            NotchAttentionPolicy.isStillCurrent(
-                                target,
-                                in: [session],
-                                completionTrackingStartedAt: attentionTrackingStartedAt
-                            )
-                    }
-            }
+            // Re-read presentation ownership after the async call, immediately
+            // before any timestamp, bounce or sound mutation. Opening the
+            // panel during a later focus probe suppresses earlier targets too.
+            let eligibleTargets = followUpReminderCoordinator.currentDeliveryTargets(
+                resolvedTargets,
+                trackingStartedAt: attentionTrackingStartedAt,
+                sessions: sessionMonitor.instances,
+                isPanelOpen: viewModel.status == .opened,
+                isSilenced: { isSessionSilenced($0) }
+            )
             let reminderAt = Date()
             for target in eligibleTargets {
                 guard case .completion = target else { continue }

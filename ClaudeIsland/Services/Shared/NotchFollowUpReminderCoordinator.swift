@@ -116,6 +116,84 @@ final class NotchFollowUpReminderCoordinator: ObservableObject {
         currentCandidates[target] != nil
     }
 
+    /// Resolve focus asynchronously, then revalidate the entire batch before
+    /// the view performs any visual or audible effect. Providers deliberately
+    /// read current state rather than snapshots captured before a focus probe.
+    func eligibleTargetsForDelivery(
+        _ targets: Set<NotchFollowUpTarget>,
+        trackingStartedAt: Date,
+        sessions: @MainActor () -> [SessionState],
+        isPanelOpen: @MainActor () -> Bool,
+        isSilenced: @MainActor (SessionState) -> Bool,
+        isFocused: @MainActor (Int) async -> Bool
+    ) async -> Set<NotchFollowUpTarget> {
+        guard !Task.isCancelled, isEnabled, !isPanelOpen() else { return [] }
+        var eligibleTargets: Set<NotchFollowUpTarget> = []
+        for target in targets.sorted(by: { $0.sessionId < $1.sessionId }) {
+            guard !Task.isCancelled, isEnabled, !isPanelOpen() else { return [] }
+            guard isCurrent(target),
+                  let session = sessions().first(where: {
+                      $0.sessionId == target.sessionId
+                  }),
+                  !isSilenced(session) else {
+                continue
+            }
+            let focused: Bool
+            if let pid = session.pid {
+                focused = await isFocused(pid)
+            } else {
+                focused = false
+            }
+            // Opening the panel acknowledges this whole delivery attempt,
+            // not just the target whose focus probe happened to be running.
+            guard !Task.isCancelled, isEnabled, !isPanelOpen() else { return [] }
+            guard !focused,
+                  isCurrent(target),
+                  let currentSession = sessions().first(where: {
+                      $0.sessionId == target.sessionId
+                  }),
+                  !isSilenced(currentSession) else {
+                if focused {
+                    Self.logger.info(
+                        "Suppressed focused follow-up for \(target.sessionId.prefix(8), privacy: .public)"
+                    )
+                }
+                continue
+            }
+            eligibleTargets.insert(target)
+        }
+        guard !Task.isCancelled else { return [] }
+        return currentDeliveryTargets(
+            eligibleTargets, trackingStartedAt: trackingStartedAt,
+            sessions: sessions(), isPanelOpen: isPanelOpen(),
+            isSilenced: isSilenced
+        )
+    }
+
+    /// Also used by the view immediately after the async resolver returns.
+    /// There must be no await between this check and presentation effects.
+    func currentDeliveryTargets(
+        _ targets: Set<NotchFollowUpTarget>,
+        trackingStartedAt: Date,
+        sessions: [SessionState],
+        isPanelOpen: Bool,
+        isSilenced: (SessionState) -> Bool
+    ) -> Set<NotchFollowUpTarget> {
+        guard isEnabled, !isPanelOpen else { return [] }
+        return targets.filter { target in
+            isCurrent(target) &&
+                !acknowledgedCompletions.contains(target) &&
+                sessions.contains { session in
+                    session.sessionId == target.sessionId &&
+                        !isSilenced(session) &&
+                        NotchAttentionPolicy.isStillCurrent(
+                            target, in: [session],
+                            completionTrackingStartedAt: trackingStartedAt
+                        )
+                }
+        }
+    }
+
     func consume(_ targets: Set<NotchFollowUpTarget>) {
         pendingTargets.subtract(targets)
     }

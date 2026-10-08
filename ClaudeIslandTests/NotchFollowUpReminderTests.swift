@@ -68,6 +68,191 @@ final class NotchFollowUpReminderTests: XCTestCase {
         })
     }
 
+    func testPanelOpenedDuringLaterFocusProbeSuppressesEntireBatch() async {
+        let coordinator = NotchFollowUpReminderCoordinator()
+        defer { coordinator.cancelAll() }
+        let now = Date()
+        var first = interactionSession(sessionId: "a", receivedAt: now)
+        first.pid = 101
+        var second = interactionSession(sessionId: "b", receivedAt: now)
+        second.pid = 102
+        var third = interactionSession(sessionId: "c", receivedAt: now)
+        third.pid = 103
+        let sessions = [first, second, third]
+        coordinator.reconcile(sessions: sessions, enabled: true, delay: 60,
+                              trackingStartedAt: now, now: now)
+        let targets = Set(NotchAttentionPolicy.followUpCandidates(
+            in: sessions, completionTrackingStartedAt: now
+        ).map(\.target))
+        var panelOpen = false
+        var probes: [Int] = []
+        let eligible = await coordinator.eligibleTargetsForDelivery(
+            targets, trackingStartedAt: now, sessions: { sessions },
+            isPanelOpen: { panelOpen }, isSilenced: { _ in false },
+            isFocused: { pid in
+                probes.append(pid)
+                await Task.yield()
+                if pid == 102 { panelOpen = true }
+                return false
+            }
+        )
+        XCTAssertEqual(probes, [101, 102])
+        XCTAssertTrue(eligible.isEmpty)
+    }
+
+    private func deliveryFixture(
+        now: Date,
+        firstIsCompletion: Bool = false
+    ) -> (NotchFollowUpReminderCoordinator, [SessionState], Set<NotchFollowUpTarget>) {
+        let coordinator = NotchFollowUpReminderCoordinator()
+        var first = firstIsCompletion
+            ? completionSession(sessionId: "a", completedAt: now)
+            : interactionSession(sessionId: "a", receivedAt: now)
+        first.pid = 101
+        var second = interactionSession(sessionId: "b", receivedAt: now)
+        second.pid = 102
+        let sessions = [first, second]
+        coordinator.reconcile(sessions: sessions, enabled: true, delay: 60,
+                              trackingStartedAt: now, now: now)
+        let targets = Set(NotchAttentionPolicy.followUpCandidates(
+            in: sessions, completionTrackingStartedAt: now
+        ).map(\.target))
+        return (coordinator, sessions, targets)
+    }
+
+    func testDeliveryKeepsUnfocusedTargetsAndSkipsOpenPanelWithoutProbing() async {
+        let now = Date()
+        let (coordinator, sessions, targets) = deliveryFixture(now: now)
+        defer { coordinator.cancelAll() }
+        var probes: [Int] = []
+        let eligible = await coordinator.eligibleTargetsForDelivery(
+            targets, trackingStartedAt: now, sessions: { sessions },
+            isPanelOpen: { false }, isSilenced: { _ in false },
+            isFocused: { pid in
+                probes.append(pid)
+                await Task.yield()
+                return pid == 101
+            }
+        )
+        XCTAssertEqual(probes, [101, 102])
+        XCTAssertEqual(Set(eligible.map(\.sessionId)), ["b"])
+        probes.removeAll()
+        let suppressed = await coordinator.eligibleTargetsForDelivery(
+            targets, trackingStartedAt: now, sessions: { sessions },
+            isPanelOpen: { true }, isSilenced: { _ in false },
+            isFocused: { pid in probes.append(pid); return false }
+        )
+        XCTAssertTrue(suppressed.isEmpty)
+        XCTAssertTrue(probes.isEmpty)
+    }
+
+    func testLaterProbeRevalidatesEarlierTargetStateAndSilence() async {
+        for silencing in [false, true] {
+            let now = Date()
+            let (coordinator, initial, targets) = deliveryFixture(now: now)
+            var sessions = initial
+            var silencedIds: Set<String> = []
+            let eligible = await coordinator.eligibleTargetsForDelivery(
+                targets, trackingStartedAt: now, sessions: { sessions },
+                isPanelOpen: { false },
+                isSilenced: { silencedIds.contains($0.sessionId) },
+                isFocused: { pid in
+                    await Task.yield()
+                    if pid == 102 {
+                        if silencing {
+                            silencedIds.insert("a")
+                        } else {
+                            // The provider may advance before the coordinator
+                            // receives the next reconciliation publication.
+                            sessions[0].phase = .processing
+                        }
+                    }
+                    return false
+                }
+            )
+            XCTAssertEqual(Set(eligible.map(\.sessionId)), ["b"])
+            coordinator.cancelAll()
+        }
+    }
+
+    func testAcknowledgingEarlierCompletionDuringLaterProbeSuppressesIt() async throws {
+        let now = Date()
+        let (coordinator, sessions, targets) = deliveryFixture(now: now, firstIsCompletion: true)
+        defer { coordinator.cancelAll() }
+        let token = try XCTUnwrap(NotchAttentionPolicy.completionToken(for: sessions[0]))
+        let eligible = await coordinator.eligibleTargetsForDelivery(
+            targets, trackingStartedAt: now, sessions: { sessions },
+            isPanelOpen: { false }, isSilenced: { _ in false },
+            isFocused: { pid in
+                await Task.yield()
+                if pid == 102 { coordinator.acknowledgeCompletions([token]) }
+                return false
+            }
+        )
+        XCTAssertEqual(Set(eligible.map(\.sessionId)), ["b"])
+    }
+
+    func testDisableDuringLaterProbeSuppressesEntireBatch() async {
+        let now = Date()
+        let (coordinator, sessions, targets) = deliveryFixture(now: now)
+        defer { coordinator.cancelAll() }
+        let eligible = await coordinator.eligibleTargetsForDelivery(
+            targets, trackingStartedAt: now, sessions: { sessions },
+            isPanelOpen: { false }, isSilenced: { _ in false },
+            isFocused: { pid in
+                await Task.yield()
+                if pid == 102 {
+                    coordinator.reconcile(sessions: sessions, enabled: false, delay: 60,
+                                          trackingStartedAt: now)
+                }
+                return false
+            }
+        )
+        XCTAssertTrue(eligible.isEmpty)
+    }
+
+    func testCancelledLaterProbeDiscardsEarlierQualifiedTargets() async {
+        let now = Date()
+        let (coordinator, sessions, targets) = deliveryFixture(now: now)
+        defer { coordinator.cancelAll() }
+        let task = Task { @MainActor in
+            await coordinator.eligibleTargetsForDelivery(
+                targets, trackingStartedAt: now, sessions: { sessions },
+                isPanelOpen: { false }, isSilenced: { _ in false },
+                isFocused: { pid in
+                    await Task.yield()
+                    if pid == 102 {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                    }
+                    return false
+                }
+            )
+        }
+        let eligible = await task.value
+        XCTAssertTrue(task.isCancelled)
+        XCTAssertTrue(eligible.isEmpty)
+    }
+
+    func testFinalSynchronousCheckRejectsPanelOpenedAfterResolution() async {
+        let now = Date()
+        let (coordinator, sessions, targets) = deliveryFixture(now: now)
+        defer { coordinator.cancelAll() }
+        let resolved = await coordinator.eligibleTargetsForDelivery(
+            targets, trackingStartedAt: now, sessions: { sessions },
+            isPanelOpen: { false }, isSilenced: { _ in false },
+            isFocused: { _ in false }
+        )
+        XCTAssertEqual(resolved, targets)
+        XCTAssertTrue(coordinator.currentDeliveryTargets(
+            resolved, trackingStartedAt: now, sessions: sessions,
+            isPanelOpen: true, isSilenced: { _ in false }
+        ).isEmpty)
+        XCTAssertEqual(coordinator.currentDeliveryTargets(
+            resolved, trackingStartedAt: now, sessions: sessions,
+            isPanelOpen: false, isSilenced: { _ in false }
+        ), targets)
+    }
+
     func testEnablingStartsFullDelayInsteadOfBurstingOldRequest() async throws {
         let coordinator = NotchFollowUpReminderCoordinator()
         let now = Date()
