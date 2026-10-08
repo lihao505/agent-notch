@@ -92,6 +92,30 @@ enum SessionEvent: Sendable {
 
     /// History load completed
     case historyLoaded(sessionId: String, messages: [ChatMessage], completedTools: Set<String>, toolResults: [String: ConversationParser.ToolResult], structuredResults: [String: ToolResultData], conversationInfo: ConversationInfo)
+
+    /// Lifecycle resources follow the final store state, regardless of which
+    /// event path supplied it (including history loaded during restoration).
+    nonisolated var sessionId: String {
+        switch self {
+        case .hookReceived(let event): return event.sessionId
+        case .fileUpdated(let payload): return payload.sessionId
+        case .permissionApproved(let id, _, _),
+             .permissionDenied(let id, _, _, _),
+             .permissionSocketFailed(let id, _, _),
+             .toolCompleted(let id, _, _),
+             .interruptDetected(let id, _),
+             .processExited(let id, _, _),
+             .subagentStarted(let id, _),
+             .subagentToolExecuted(let id, _),
+             .subagentToolCompleted(let id, _, _),
+             .subagentStopped(let id, _),
+             .agentFileUpdated(let id, _, _),
+             .clearDetected(let id),
+             .sessionEnded(let id),
+             .loadHistory(let id, _),
+             .historyLoaded(let id, _, _, _, _, _): return id
+        }
+    }
 }
 
 /// Payload for file update events

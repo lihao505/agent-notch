@@ -114,6 +114,9 @@ actor SessionStore {
     private let fileSyncEnabled: Bool
     private let externalLifecycleEffectsEnabled: Bool
     private let conversationParser: ConversationParser
+    private let persistenceURL: URL
+    private let bridgeSnapshotDirectory: URL
+    private let interruptWatcher: (any SessionInterruptWatching)?
 
     // MARK: - Published State (for UI)
 
@@ -134,13 +137,19 @@ actor SessionStore {
         fileSyncEnabled: Bool,
         externalLifecycleEffectsEnabled: Bool = false,
         conversationParser: ConversationParser = .shared,
-        statusCheckIntervalSeconds: UInt64 = 1
+        statusCheckIntervalSeconds: UInt64 = 1,
+        persistenceURL: URL? = nil,
+        bridgeSnapshotDirectory: URL? = nil,
+        interruptWatcher: (any SessionInterruptWatching)? = nil
     ) {
         self.persistenceEnabled = persistenceEnabled
         self.fileSyncEnabled = fileSyncEnabled
         self.externalLifecycleEffectsEnabled = externalLifecycleEffectsEnabled
         self.conversationParser = conversationParser
         self.statusCheckIntervalSeconds = statusCheckIntervalSeconds
+        self.persistenceURL = persistenceURL ?? Self.defaultPersistenceURL
+        self.bridgeSnapshotDirectory = bridgeSnapshotDirectory ?? Self.defaultBridgeSnapshotDirectory
+        self.interruptWatcher = interruptWatcher
     }
 
     // MARK: - Event Processing
@@ -232,6 +241,7 @@ actor SessionStore {
             break
         }
 
+        await synchronizeInterruptWatcher(sessionId: event.sessionId)
         publishState()
     }
 
@@ -476,13 +486,6 @@ actor SessionStore {
 
         if shouldApplyLifecycle && isCompletionSignal {
             await cleanupExternalLifecycle(sessionId: sessionId)
-        } else if shouldApplyLifecycle,
-                  newPhase == .processing,
-                  session.source == .claude {
-            await startInterruptWatcher(
-                sessionId: sessionId,
-                cwd: session.cwd
-            )
         }
 
         if shouldApplyLifecycle,
@@ -1532,26 +1535,46 @@ actor SessionStore {
     // only be changed after the same reducer decision that updates the card;
     // otherwise a delayed row can tear down a newer active turn.
     private func cleanupExternalLifecycle(sessionId: String) async {
-        guard externalLifecycleEffectsEnabled else { return }
-        await MainActor.run {
-            HookSocketServer.shared.cancelPendingPermissions(
-                sessionId: sessionId
-            )
-            InterruptWatcherManager.shared.stopWatching(sessionId: sessionId)
+        if externalLifecycleEffectsEnabled {
+            await MainActor.run {
+                HookSocketServer.shared.cancelPendingPermissions(
+                    sessionId: sessionId
+                )
+            }
+        }
+        await synchronizeInterruptWatcher(sessionId: sessionId)
+    }
+
+    /// Restoration, transcript fallback, and hooks must own the same listener
+    /// lifecycle. Re-read after crossing to the main actor: a Stop or new turn
+    /// can arrive while a resource change is waiting to run.
+    private func synchronizeInterruptWatcher(sessionId: String) async {
+        guard externalLifecycleEffectsEnabled || interruptWatcher != nil else { return }
+        let injectedWatcher = interruptWatcher
+        while true {
+            let requestedCwd = interruptWatcherCwd(sessionId: sessionId)
+            await MainActor.run {
+                let watcher = injectedWatcher ?? InterruptWatcherManager.shared
+                if let cwd = requestedCwd {
+                    watcher.startWatching(sessionId: sessionId, cwd: cwd)
+                } else {
+                    watcher.stopWatching(sessionId: sessionId)
+                }
+            }
+            if requestedCwd == interruptWatcherCwd(sessionId: sessionId) {
+                return
+            }
         }
     }
 
-    private func startInterruptWatcher(
-        sessionId: String,
-        cwd: String
-    ) async {
-        guard externalLifecycleEffectsEnabled else { return }
-        await MainActor.run {
-            InterruptWatcherManager.shared.startWatching(
-                sessionId: sessionId,
-                cwd: cwd
-            )
+    private func interruptWatcherCwd(sessionId: String) -> String? {
+        guard let session = sessions[sessionId],
+              session.source == .claude,
+              session.completedAt == nil,
+              session.phase.isActive || session.phase.isWaitingForApproval else {
+            return nil
         }
+        return session.cwd
     }
 
     private func cancelPendingPermission(
@@ -1667,10 +1690,11 @@ actor SessionStore {
             guard !Task.isCancelled else { return }
 
             // Parse incrementally - only get NEW messages since last call
-            let result = await conversationParser.parseIncremental(
+            let result = await self?.conversationParser.parseIncremental(
                 sessionId: sessionId,
                 cwd: cwd
             )
+            guard let result else { return }
 
             if result.clearDetected {
                 await self?.process(.clearDetected(sessionId: sessionId))
@@ -2198,7 +2222,7 @@ actor SessionStore {
 
     // MARK: - Active Session Persistence
 
-    private static var persistenceURL: URL {
+    private static var defaultPersistenceURL: URL {
         let baseURL = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -2210,7 +2234,7 @@ actor SessionStore {
             .appendingPathComponent("active-sessions.json", isDirectory: false)
     }
 
-    private static var bridgeSnapshotDirectory: URL {
+    private static var defaultBridgeSnapshotDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".multiagent-notch", isDirectory: true)
             .appendingPathComponent("session-state", isDirectory: true)
@@ -2259,7 +2283,7 @@ actor SessionStore {
             )
         }
 
-        let url = Self.persistenceURL
+        let url = persistenceURL
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -2286,9 +2310,10 @@ actor SessionStore {
 
     /// Restore cards only when their original process is still alive. A
     /// permission request cannot safely survive an app/socket restart, so
-    /// restored sessions always begin idle and are refreshed from their JSONL.
+    /// only processing/compacting phases are retained; interaction sockets
+    /// cannot be restored. JSONL reconciliation owns the subsequent phase.
     private func restorePersistedSessions() async {
-        let url = Self.persistenceURL
+        let url = persistenceURL
         guard let data = try? Data(contentsOf: url) else {
             return
         }
@@ -2453,7 +2478,7 @@ actor SessionStore {
     /// normal app snapshot already owns completion retention, and an approval
     /// socket cannot be reconstructed after restart.
     private func restoreBridgeSessionSnapshots() async {
-        let directory = Self.bridgeSnapshotDirectory
+        let directory = bridgeSnapshotDirectory
         guard Self.isOwnedDirectory(directory) else { return }
 
         let resourceKeys: Set<URLResourceKey> = [

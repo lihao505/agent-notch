@@ -149,12 +149,14 @@ actor ConversationParser {
     static let shared = ConversationParser()
 
     private let codexSessionsRootOverride: URL?
+    private let claudeProjectsRootOverride: URL?
 
     /// Tests inject an isolated Codex sessions root instead of mutating the
     /// process environment, which can race with other parser tests. Production
     /// keeps honoring the existing environment override for diagnostics.
-    init(codexSessionsRoot: URL? = nil) {
+    init(codexSessionsRoot: URL? = nil, claudeProjectsRoot: URL? = nil) {
         codexSessionsRootOverride = codexSessionsRoot
+        claudeProjectsRootOverride = claudeProjectsRoot
     }
 
     /// Logger for conversation parser (nonisolated static for cross-context access)
@@ -1461,7 +1463,7 @@ actor ConversationParser {
             return state.messages
         }
 
-        let sessionFile = Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
+        let sessionFile = sessionFilePath(sessionId: sessionId, cwd: cwd)
 
         guard FileManager.default.fileExists(atPath: sessionFile) else {
             return []
@@ -1482,7 +1484,7 @@ actor ConversationParser {
             return true
         }
         return FileManager.default.fileExists(
-            atPath: Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
+            atPath: sessionFilePath(sessionId: sessionId, cwd: cwd)
         )
     }
 
@@ -1521,7 +1523,7 @@ actor ConversationParser {
             )
         }
 
-        let sessionFile = Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
+        let sessionFile = sessionFilePath(sessionId: sessionId, cwd: cwd)
 
         guard FileManager.default.fileExists(atPath: sessionFile) else {
             return IncrementalParseResult(
@@ -1722,9 +1724,10 @@ actor ConversationParser {
     }
 
     /// Build session file path
-    private static func sessionFilePath(sessionId: String, cwd: String) -> String {
+    private func sessionFilePath(sessionId: String, cwd: String) -> String {
         let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
-        return ClaudePaths.projectsDir.path + "/" + projectDir + "/" + sessionId + ".jsonl"
+        let root = claudeProjectsRootOverride ?? ClaudePaths.projectsDir
+        return root.path + "/" + projectDir + "/" + sessionId + ".jsonl"
     }
 
     /// Locate an agent's native transcript. Codex stores rollouts under

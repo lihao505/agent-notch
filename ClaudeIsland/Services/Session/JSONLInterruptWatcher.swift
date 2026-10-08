@@ -412,7 +412,13 @@ final class JSONLInterruptWatcher {
 
 /// Manages interrupt watchers for all active sessions
 @MainActor
-class InterruptWatcherManager {
+protocol SessionInterruptWatching: AnyObject {
+    func startWatching(sessionId: String, cwd: String)
+    func stopWatching(sessionId: String)
+}
+
+@MainActor
+class InterruptWatcherManager: SessionInterruptWatching {
     static let shared = InterruptWatcherManager()
 
     private var watchers: [String: JSONLInterruptWatcher] = [:]
