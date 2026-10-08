@@ -585,6 +585,7 @@ actor SessionStore {
             $0.id == toolUseId
         }), case .toolCall(var tool) = session.chatItems[index].type {
             tool.status = .waitingForApproval
+            tool.isTerminalPlaceholder = false
             session.chatItems[index] = ChatHistoryItem(
                 id: toolUseId,
                 type: .toolCall(tool),
@@ -713,20 +714,13 @@ actor SessionStore {
                     id: toolUseId,
                     success: succeeded
                 )
-                // Update chatItem status - tool completed (possibly approved via terminal)
-                // Only update if still waiting for approval or running
-                for i in 0..<session.chatItems.count {
-                    if session.chatItems[i].id == toolUseId,
-                       case .toolCall(var tool) = session.chatItems[i].type,
-                       tool.status == .waitingForApproval || tool.status == .running {
-                        tool.status = succeeded ? .success : .error
-                        session.chatItems[i] = ChatHistoryItem(
-                            id: toolUseId,
-                            type: .toolCall(tool),
-                            timestamp: session.chatItems[i].timestamp
-                        )
-                        break
-                    }
+                // Exact late hooks can correct a provisional closure without
+                // changing the independently arbitrated session phase.
+                if let index = session.chatItems.firstIndex(where: { $0.id == toolUseId }) {
+                    applyToolCompletion(ToolCompletionResult(
+                        status: succeeded ? .success : .error,
+                        result: nil, structuredResult: nil
+                    ), at: index, in: &session)
                 }
             }
 
@@ -910,38 +904,54 @@ actor SessionStore {
             }
         }
 
-        // Check if this tool is already completed (avoid duplicate processing)
-        let isAlreadyCompleted: Bool
-        if let existingItem = session.chatItems.first(where: {
-            $0.id == toolUseId
-        }), case .toolCall(let tool) = existingItem.type {
-            isAlreadyCompleted = tool.status == .success ||
-                tool.status == .error ||
-                tool.status == .interrupted
-        } else {
-            isAlreadyCompleted = false
-        }
-
-        // Update the tool status
-        if !isAlreadyCompleted {
-            for i in 0..<session.chatItems.count {
-                if session.chatItems[i].id == toolUseId,
-                   case .toolCall(var tool) = session.chatItems[i].type {
-                    tool.status = result.status
-                    tool.result = result.result
-                    tool.structuredResult = result.structuredResult
-                    session.chatItems[i] = ChatHistoryItem(
-                        id: toolUseId,
-                        type: .toolCall(tool),
-                        timestamp: session.chatItems[i].timestamp
-                    )
-                    Self.logger.debug("Tool \(toolUseId.prefix(12), privacy: .public) completed with status: \(String(describing: result.status), privacy: .public)")
-                    break
-                }
-            }
+        if let index = session.chatItems.firstIndex(where: { $0.id == toolUseId }) {
+            applyToolCompletion(result, at: index, in: &session)
         }
 
         sessions[sessionId] = session
+    }
+
+    /// Merge concrete results without making presentation completion a new
+    /// lifecycle signal. Existing facts are stable; missing details can arrive
+    /// after a hook. Only boundary-inferred closure may change terminal status.
+    private func applyToolCompletion(
+        _ result: ToolCompletionResult, at index: Int, in session: inout SessionState
+    ) {
+        guard result.status == .success || result.status == .error || result.status == .interrupted,
+              case .toolCall(var tool) = session.chatItems[index].type else { return }
+        let mayReplaceStatus = tool.isTerminalPlaceholder ||
+            tool.status == .running || tool.status == .waitingForApproval
+        guard mayReplaceStatus || tool.status == result.status else { return }
+        if mayReplaceStatus { tool.status = result.status }
+        tool.isTerminalPlaceholder = false
+        tool.result = tool.result ?? result.result
+        tool.structuredResult = tool.structuredResult ?? result.structuredResult
+        let item = session.chatItems[index]
+        session.chatItems[index] = ChatHistoryItem(id: item.id, type: .toolCall(tool), timestamp: item.timestamp)
+        session.toolTracker.completeTool(id: item.id, success: tool.status == .success)
+    }
+
+    /// Full history and result-only increments must enrich existing rows too.
+    /// Pending requests are handled by the timestamp-arbitrated event path,
+    /// never by this synchronous history merge.
+    private func reconcileToolResults(
+        in session: inout SessionState, completedTools: Set<String>,
+        toolResults: [String: ConversationParser.ToolResult], structuredResults: [String: ToolResultData]
+    ) {
+        let visibleRequestID: String?
+        if case .waitingForApproval(let context) = session.phase {
+            visibleRequestID = context.toolUseId
+        } else {
+            visibleRequestID = nil
+        }
+        for index in session.chatItems.indices {
+            let id = session.chatItems[index].id
+            guard completedTools.contains(id),
+                  !session.pendingInteractions.contains(toolUseId: id),
+                  visibleRequestID != id else { continue }
+            applyToolCompletion(.from(parserResult: toolResults[id], structuredResult: structuredResults[id]),
+                                at: index, in: &session)
+        }
     }
 
     private func processPermissionDenied(
@@ -1091,7 +1101,8 @@ actor SessionStore {
                                         status: existingTool.status,
                                         result: existingTool.result,
                                         structuredResult: existingTool.structuredResult,
-                                        subagentTools: existingTool.subagentTools
+                                        subagentTools: existingTool.subagentTools,
+                                        isTerminalPlaceholder: existingTool.isTerminalPlaceholder
                                     )),
                                     timestamp: message.timestamp
                                 )
@@ -1132,7 +1143,8 @@ actor SessionStore {
                                         status: existingTool.status,
                                         result: existingTool.result,
                                         structuredResult: existingTool.structuredResult,
-                                        subagentTools: existingTool.subagentTools
+                                        subagentTools: existingTool.subagentTools,
+                                        isTerminalPlaceholder: existingTool.isTerminalPlaceholder
                                     )),
                                     timestamp: message.timestamp
                                 )
@@ -1161,6 +1173,8 @@ actor SessionStore {
             session.chatItems.sort { $0.timestamp < $1.timestamp }
         }
 
+        reconcileToolResults(in: &session, completedTools: payload.completedToolIds,
+                             toolResults: payload.toolResults, structuredResults: payload.structuredResults)
         session.toolTracker.lastSyncTime = Date()
 
         reconcilePhaseFromTranscript(
@@ -1352,20 +1366,10 @@ actor SessionStore {
             let belongsToClosedTurn = toolTracker.terminalBoundaryAt.map {
                 message.timestamp <= $0
             } ?? false
-            let status: ToolStatus = isCompleted ? .success :
+            let completion = ToolCompletionResult.from(parserResult: toolResults[tool.id],
+                                                       structuredResult: structuredResults[tool.id])
+            let status: ToolStatus = isCompleted ? completion.status :
                 (belongsToClosedTurn ? .interrupted : .running)
-
-            // Extract result text for completed tools
-            var resultText: String? = nil
-            if isCompleted, let parserResult = toolResults[tool.id] {
-                if let stdout = parserResult.stdout, !stdout.isEmpty {
-                    resultText = stdout
-                } else if let stderr = parserResult.stderr, !stderr.isEmpty {
-                    resultText = stderr
-                } else if let content = parserResult.content, !content.isEmpty {
-                    resultText = content
-                }
-            }
 
             return ChatHistoryItem(
                 id: tool.id,
@@ -1373,9 +1377,10 @@ actor SessionStore {
                     name: tool.name,
                     input: tool.input,
                     status: status,
-                    result: resultText,
+                    result: isCompleted ? completion.result : nil,
                     structuredResult: structuredResults[tool.id],
-                    subagentTools: []
+                    subagentTools: [],
+                    isTerminalPlaceholder: !isCompleted && belongsToClosedTurn
                 )),
                 timestamp: message.timestamp
             )
@@ -1410,6 +1415,7 @@ actor SessionStore {
             if session.chatItems[i].id == toolId,
                case .toolCall(var tool) = session.chatItems[i].type {
                 tool.status = status
+                tool.isTerminalPlaceholder = false
                 session.chatItems[i] = ChatHistoryItem(
                     id: toolId,
                     type: .toolCall(tool),
@@ -1437,6 +1443,7 @@ actor SessionStore {
                 continue
             }
             tool.status = .interrupted
+            tool.isTerminalPlaceholder = true
             session.chatItems[index] = ChatHistoryItem(
                 id: session.chatItems[index].id,
                 type: .toolCall(tool),
@@ -1697,6 +1704,9 @@ actor SessionStore {
             }
         }
 
+        reconcileToolResults(in: &session, completedTools: completedTools,
+                             toolResults: toolResults, structuredResults: structuredResults)
+
         // Sort by timestamp
         session.chatItems.sort { $0.timestamp < $1.timestamp }
 
@@ -1720,6 +1730,14 @@ actor SessionStore {
         }
 
         sessions[sessionId] = session
+        // Initial/restored history can contain the exact result of a live
+        // request too. Use the same timestamp-arbitrated completion path as
+        // file refreshes, after committing synchronous history changes.
+        await emitToolCompletionEvents(
+            sessionId: sessionId, expectedGeneration: expectedGeneration,
+            session: session, completedToolIds: completedTools,
+            toolResults: toolResults, structuredResults: structuredResults
+        )
     }
 
     // MARK: - File Sync Scheduling

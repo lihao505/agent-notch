@@ -252,6 +252,10 @@ struct ToolCallItem: Equatable, Sendable {
     /// For Task tools: nested subagent tool calls
     var subagentTools: [SubagentToolCall]
 
+    /// Closed by a turn boundary without a concrete tool result. This is not
+    /// proof that the tool failed or was actually interrupted in the CLI.
+    var isTerminalPlaceholder = false
+
     /// Whether this tool is the subagent-container tool. "Task" is the
     /// legacy name; Claude Code now uses "Agent".
     nonisolated var isSubagentContainer: Bool {
