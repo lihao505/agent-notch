@@ -25,6 +25,7 @@ def default_socket_path():
 SOCKET_PATH = default_socket_path()
 PERMISSION_TIMEOUT_SECONDS = 90
 SEND_TIMEOUT_SECONDS = 5
+MAX_RESPONSE_BYTES = 1024 * 1024
 APPROVAL_POLICY_FILE = os.path.join(
     os.path.expanduser("~"), ".multiagent-notch", "approval-policy.json"
 )
@@ -96,6 +97,29 @@ def get_tty():
     return None
 
 
+def read_socket_response(connection, deadline):
+    """Use the same bounded, EOF-framed exchange as AgentBridge.
+
+    A stream read is not a message boundary. Decode only after the app closes
+    the socket, and never renew the whole approval budget on incoming bytes.
+    """
+    response = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        connection.settimeout(remaining)
+        chunk = connection.recv(min(65536, MAX_RESPONSE_BYTES + 1 - len(response)))
+        if not chunk:
+            if not response:
+                return None
+            decoded = json.loads(response.decode("utf-8"))
+            return decoded if isinstance(decoded, dict) else None
+        response.extend(chunk)
+        if len(response) > MAX_RESPONSE_BYTES:
+            return None
+
+
 def send_event(state):
     """Send event to app, return response if any"""
     is_permission = state.get("status") == "waiting_for_approval"
@@ -106,9 +130,9 @@ def send_event(state):
             return False if not is_permission else None
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(
-            PERMISSION_TIMEOUT_SECONDS if is_permission else SEND_TIMEOUT_SECONDS
-        )
+        budget = PERMISSION_TIMEOUT_SECONDS if is_permission else SEND_TIMEOUT_SECONDS
+        deadline = time.monotonic() + budget
+        sock.settimeout(budget)
         sock.connect(SOCKET_PATH)
 
         after = _private_socket_info(SOCKET_PATH)
@@ -117,29 +141,26 @@ def send_event(state):
             or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
             or _peer_uid(sock) != os.getuid()
         ):
-            sock.close()
             return False if not is_permission else None
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False if not is_permission else None
+        sock.settimeout(remaining)
         sock.sendall(json.dumps(state).encode())
 
         # For permission requests, wait for response
         if is_permission:
-            response = sock.recv(4096)
-            sock.close()
-            if response:
-                return json.loads(response.decode())
-        else:
-            sock.close()
-            return True
-
-        return None
-    except (socket.error, OSError, ValueError, json.JSONDecodeError):
+            return read_socket_response(sock, deadline)
+        return True
+    except (socket.error, OSError, ValueError, RecursionError):
+        return False if not is_permission else None
+    finally:
         if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
-        return False if not is_permission else None
 
 
 def _private_socket_info(sock_path):

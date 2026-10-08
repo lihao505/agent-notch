@@ -55,15 +55,28 @@ def collect(rows, session_id, fixture):
 def verify(rows, session_id, fixture):
     fixture = Path(fixture).resolve()
     tools, decisions, results, replies = collect(rows, session_id, fixture)
-    if not (len(tools) == len(decisions) == len(results) == len(replies) == 2):
-        raise ValueError("expected exactly two tools, decisions, results and final replies")
+    if not (len(tools) == len(decisions) == len(results) == 2):
+        raise ValueError("expected exactly two tools, decisions and results")
     seen = set()
+    previous_reply_at = -1
     for ordinal, (stage, decision, reply) in enumerate((
             ("allow", "allow", "ALLOWED"), ("deny", "deny", "DENIED"))):
         tool_at, tool = tools[ordinal]
         decision_at, evidence = decisions[ordinal]
         result_at, result = results[ordinal]
-        reply_at, final_reply = replies[ordinal]
+        # A real assistant may explain the upcoming call before tool_use.
+        # Only a reply after this result and before the next prompt/tool can
+        # complete this acceptance turn; never borrow a later turn's reply.
+        next_tool_at = tools[ordinal + 1][0] if ordinal + 1 < len(tools) else len(rows)
+        next_prompt_at = next((index for index in range(result_at + 1, len(rows))
+                               if rows[index].get("type") == "user"
+                               and isinstance((rows[index].get("message") or {}).get("content"), str)),
+                              len(rows))
+        finals = [(index, reply) for index, reply in replies
+                  if result_at < index < min(next_tool_at, next_prompt_at)]
+        if len(finals) != 1:
+            raise ValueError("expected exactly one final reply within each result's prompt turn")
+        reply_at, final_reply = finals[0]
         identity = tool.get("id")
         if not isinstance(identity, str) or not identity or identity in seen:
             raise ValueError("missing or reused tool identity")
@@ -80,8 +93,9 @@ def verify(rows, session_id, fixture):
             raise ValueError("decision/result does not match its exact request")
         if not tool_at < decision_at < result_at < reply_at:
             raise ValueError("request/decision/result/reply order is invalid")
-        if ordinal == 1 and tool_at <= replies[0][0]:
+        if tool_at <= previous_reply_at:
             raise ValueError("requests are not two sequential acceptance turns")
+        previous_reply_at = reply_at
         if final_reply != reply:
             raise ValueError("unexpected final reply")
         if result.get("is_error") is not (stage == "deny"):

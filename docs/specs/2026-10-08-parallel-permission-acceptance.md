@@ -80,3 +80,7 @@ python3 -B scripts/verify-claude-permission.py \
 
 剩余边界：同会话双请求 FIFO、一个请求超时同时另一个仍待审批、审批中重启、
 Claude 原生回退可操作性、CodeBuddy、真实刘海动画逐帧表现。
+
+后续对照与在线真实 90 秒等待补齐了原生提示可见及超时后 No 可操作的证据，
+未证明超时后原生允许或混合并行超时；旧记录保留为当时的验收结论。
+详见[原生响应与回退](2026-10-08-native-hook-response.md)。

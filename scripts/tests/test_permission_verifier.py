@@ -138,6 +138,21 @@ class PermissionVerifierTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.check()
 
+    def test_pre_tool_commentary_is_not_a_final_reply(self):
+        prelude = self.row("assistant", message={"content": [{
+            "type": "text", "text": "I'll run that single command."}]})
+        prompt = self.row("user", message={"content": "Next isolated acceptance turn"})
+        rows = [prelude] + self.rows[:4] + [prompt, prelude] + self.rows[4:]
+        self.assertTrue(self.check(rows)["passed"])
+        # A prelude cannot substitute for a missing final after the result.
+        with self.assertRaises(ValueError):
+            self.check([prelude] + self.rows[:3] + self.rows[4:])
+
+    def test_final_reply_cannot_be_borrowed_from_a_later_prompt(self):
+        rows = self.rows[:3] + [self.row("user", message={"content": "New prompt"})] + self.rows[3:]
+        with self.assertRaises(ValueError):
+            self.check(rows)
+
 
 class ParallelPermissionVerifierTests(unittest.TestCase):
     def setUp(self):

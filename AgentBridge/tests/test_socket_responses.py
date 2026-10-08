@@ -16,9 +16,22 @@ SPEC = importlib.util.spec_from_file_location(
 )
 BRIDGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BRIDGE)
+NATIVE_SPEC = importlib.util.spec_from_file_location(
+    "native_socket_bridge", Path(__file__).parents[2]
+    / "ClaudeIsland/Resources/claude-island-state.py"
+)
+NATIVE = importlib.util.module_from_spec(NATIVE_SPEC)
+NATIVE_SPEC.loader.exec_module(NATIVE)
 
 
 class SocketResponseTests(unittest.TestCase):
+    HOOK = BRIDGE
+    TIMEOUT_CONSTANT = "PERMISSION_TIMEOUT"
+    EVENT = {"event": "PreToolUse"}
+
+    def send(self, path):
+        return self.HOOK.send_event(path, self.EVENT, expect_reply=True)
+
     def exchange(self, chunks, delay=0, budget=1):
         """Use the real transport/peer check, never the user's app socket."""
         errors = []
@@ -37,7 +50,7 @@ class SocketResponseTests(unittest.TestCase):
                             connection.settimeout(2)
                             self.assertEqual(
                                 json.loads(connection.recv(4096)),
-                                {"event": "PreToolUse"},
+                                self.EVENT,
                             )
                             for chunk in chunks:
                                 if delay:
@@ -51,10 +64,8 @@ class SocketResponseTests(unittest.TestCase):
                 worker = threading.Thread(target=respond, daemon=True)
                 worker.start()
                 try:
-                    with patch.object(BRIDGE, "PERMISSION_TIMEOUT", budget):
-                        response = BRIDGE.send_event(
-                            path, {"event": "PreToolUse"}, expect_reply=True
-                        )
+                    with patch.object(self.HOOK, self.TIMEOUT_CONSTANT, budget):
+                        response = self.send(path)
                 finally:
                     worker.join(timeout=3)
                 self.assertFalse(worker.is_alive(), "fixture socket did not close")
@@ -95,9 +106,9 @@ class SocketResponseTests(unittest.TestCase):
 
     def test_response_size_limit_accepts_boundary_and_rejects_overflow(self):
         wire = b'{"decision":"deny","reason":"' + b"x" * 2048 + b'"}'
-        with patch.object(BRIDGE, "MAX_RESPONSE_BYTES", len(wire)):
+        with patch.object(self.HOOK, "MAX_RESPONSE_BYTES", len(wire)):
             self.assertEqual(self.exchange([wire]), json.loads(wire))
-        with patch.object(BRIDGE, "MAX_RESPONSE_BYTES", len(wire) - 1):
+        with patch.object(self.HOOK, "MAX_RESPONSE_BYTES", len(wire) - 1):
             self.assertIsNone(self.exchange([wire]))
 
     def test_incomplete_response_times_out_without_a_decision(self):
@@ -106,8 +117,8 @@ class SocketResponseTests(unittest.TestCase):
     def test_deadline_is_not_extended_when_bytes_keep_arriving(self):
         connection = Mock()
         connection.recv.return_value = b" "
-        with patch.object(BRIDGE.time, "monotonic", side_effect=[10, 10.5, 11]):
-            self.assertIsNone(BRIDGE.read_socket_response(connection, deadline=11))
+        with patch.object(self.HOOK.time, "monotonic", side_effect=[10, 10.5, 11]):
+            self.assertIsNone(self.HOOK.read_socket_response(connection, deadline=11))
         self.assertEqual(connection.recv.call_count, 2)
         self.assertEqual(
             [call.args[0] for call in connection.settimeout.call_args_list],
@@ -116,13 +127,24 @@ class SocketResponseTests(unittest.TestCase):
 
     def test_expired_deadline_does_not_read(self):
         connection = Mock()
-        with patch.object(BRIDGE.time, "monotonic", return_value=12):
-            self.assertIsNone(BRIDGE.read_socket_response(connection, deadline=11))
+        with patch.object(self.HOOK.time, "monotonic", return_value=12):
+            self.assertIsNone(self.HOOK.read_socket_response(connection, deadline=11))
         connection.recv.assert_not_called()
 
     def test_decoder_recursion_failure_returns_no_decision(self):
-        with patch.object(BRIDGE, "read_socket_response", side_effect=RecursionError):
+        with patch.object(self.HOOK, "read_socket_response", side_effect=RecursionError):
             self.assertIsNone(self.exchange([b'{"decision":"allow"}']))
+
+
+class NativeSocketResponseTests(SocketResponseTests):
+    """Run the identical private-socket contract against the bundled Claude hook."""
+    HOOK = NATIVE
+    TIMEOUT_CONSTANT = "PERMISSION_TIMEOUT_SECONDS"
+    EVENT = {"event": "PermissionRequest", "status": "waiting_for_approval"}
+
+    def send(self, path):
+        with patch.object(self.HOOK, "SOCKET_PATH", path):
+            return self.HOOK.send_event(self.EVENT)
 
 
 if __name__ == "__main__":
