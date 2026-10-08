@@ -1,4 +1,5 @@
 //
+//  Modified by lihao505 for Agent Notch, 2026.
 //  AgentTransport.swift
 //  ClaudeIsland
 //
@@ -176,51 +177,7 @@ private struct TmuxAgentTransport: AgentTransport {
     }
 
     private func findTarget(for session: SessionState) async -> TmuxTarget? {
-        // TTYs can change when a terminal is reattached. Prefer the exact TTY,
-        // then fall back to the tracked process and working directory.
-        if let tty = session.tty,
-           let target = await findTarget(tty: tty) {
-            return target
-        }
-        if let pid = session.pid,
-           let target = await TmuxController.shared.findTmuxTarget(
-               forClaudePid: pid
-           ) {
-            return target
-        }
-        if !session.cwd.isEmpty {
-            return await TmuxController.shared.findTmuxTarget(
-                forWorkingDirectory: session.cwd
-            )
-        }
-        return nil
-    }
-
-    private func findTarget(tty: String) async -> TmuxTarget? {
-        guard let tmuxPath = await TmuxPathFinder.shared.getTmuxPath() else {
-            return nil
-        }
-
-        do {
-            let output = try await ProcessExecutor.shared.run(
-                tmuxPath,
-                arguments: [
-                    "list-panes", "-a", "-F",
-                    "#{session_name}:#{window_index}.#{pane_index} #{pane_tty}"
-                ]
-            )
-            for line in output.components(separatedBy: "\n") {
-                let parts = line.components(separatedBy: " ")
-                guard parts.count >= 2 else { continue }
-                let paneTTY = parts[1].replacingOccurrences(of: "/dev/", with: "")
-                if paneTTY == tty {
-                    return TmuxTarget(from: parts[0])
-                }
-            }
-        } catch {
-            return nil
-        }
-        return nil
+        await TmuxTargetFinder.shared.findTarget(for: session)
     }
 }
 
