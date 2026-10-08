@@ -125,6 +125,9 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.lastHookEventAt = lastHookEventAt
         self.lastCodexTurnStartedAt = lastCodexTurnStartedAt
         self.completedAt = completedAt
+        if let completedAt {
+            self.toolTracker.recordTerminalBoundary(completedAt)
+        }
     }
 
     // MARK: - Derived Properties
@@ -244,6 +247,10 @@ nonisolated enum SessionRetentionPolicy {
 
 /// Unified tool tracking - replaces multiple dictionaries in ChatHistoryManager
 struct ToolTracker: Equatable, Sendable {
+    /// Latest accepted Stop/interrupt/exit boundary. Unlike completedAt, this
+    /// survives the next turn so delayed history cannot recreate old spinners.
+    var terminalBoundaryAt: Date?
+
     /// Tools currently in progress, keyed by tool_use_id
     var inProgress: [String: ToolInProgress]
 
@@ -260,12 +267,18 @@ struct ToolTracker: Equatable, Sendable {
         inProgress: [String: ToolInProgress] = [:],
         seenIds: Set<String> = [],
         lastSyncOffset: UInt64 = 0,
-        lastSyncTime: Date? = nil
+        lastSyncTime: Date? = nil,
+        terminalBoundaryAt: Date? = nil
     ) {
         self.inProgress = inProgress
         self.seenIds = seenIds
         self.lastSyncOffset = lastSyncOffset
         self.lastSyncTime = lastSyncTime
+        self.terminalBoundaryAt = terminalBoundaryAt
+    }
+
+    nonisolated mutating func recordTerminalBoundary(_ time: Date) {
+        terminalBoundaryAt = max(terminalBoundaryAt ?? .distantPast, time)
     }
 
     /// Mark a tool ID as seen, returns true if it was new

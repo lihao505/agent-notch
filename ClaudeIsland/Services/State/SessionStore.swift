@@ -39,6 +39,9 @@ actor SessionStore {
         let lastHookEventAt: Date?
         let lastCodexTurnStartedAt: Date?
         let completedAt: Date?
+        // Numeric seconds preserve subsecond ordering; the legacy ISO-8601
+        // date strategy rounds Date fields to seconds during persistence.
+        let toolTerminalBoundaryAt: TimeInterval?
     }
 
     /// Latest privacy-minimized lifecycle observation written by the bridge.
@@ -415,7 +418,7 @@ actor SessionStore {
                 return
             }
             session.pid = nil
-            finalizeDanglingTools(in: &session)
+            finalizeDanglingTools(in: &session, terminalAt: session.completedAt ?? observedAt)
             sessions[sessionId] = session
             cancelPendingSync(sessionId: sessionId)
             await cleanupExternalLifecycle(sessionId: sessionId)
@@ -458,7 +461,7 @@ actor SessionStore {
         }
 
         if shouldApplyLifecycle && isCompletionSignal {
-            finalizeDanglingTools(in: &session)
+            finalizeDanglingTools(in: &session, terminalAt: session.completedAt ?? observedAt)
         } else if shouldApplyLifecycle {
             if event.expectsResponse {
                 registerPendingInteraction(
@@ -1078,7 +1081,9 @@ actor SessionStore {
             }
 
             // Also reset tool tracker
-            session.toolTracker = ToolTracker()
+            session.toolTracker = ToolTracker(
+                terminalBoundaryAt: session.toolTracker.terminalBoundaryAt
+            )
             session.subagentState = SubagentState()
 
             session.needsClearReconciliation = false
@@ -1177,6 +1182,12 @@ actor SessionStore {
             payload: payload,
             session: &session
         )
+        // A tool timestamp alone cannot prove a new turn after completion.
+        // If arbitration still owns a terminal boundary, presentation must
+        // not retain a running spinner even for a later-dated history row.
+        if let completedAt = session.completedAt {
+            finalizeDanglingTools(in: &session, terminalAt: completedAt)
+        }
 
         // Commit all synchronous transcript changes before the subagent parser
         // yields this actor again.
@@ -1347,7 +1358,11 @@ actor SessionStore {
             guard toolTracker.markSeen(tool.id) else { return nil }
 
             let isCompleted = completedTools.contains(tool.id)
-            let status: ToolStatus = isCompleted ? .success : .running
+            let belongsToClosedTurn = toolTracker.terminalBoundaryAt.map {
+                message.timestamp <= $0
+            } ?? false
+            let status: ToolStatus = isCompleted ? .success :
+                (belongsToClosedTurn ? .interrupted : .running)
 
             // Extract result text for completed tools
             var resultText: String? = nil
@@ -1422,7 +1437,8 @@ actor SessionStore {
     /// A terminal turn signal is authoritative even if a PostToolUse row or
     /// hook was dropped. Leaving those placeholders running made every later
     /// idle turn look permanently active.
-    private func finalizeDanglingTools(in session: inout SessionState) {
+    private func finalizeDanglingTools(in session: inout SessionState, terminalAt: Date) {
+        session.toolTracker.recordTerminalBoundary(terminalAt)
         for index in session.chatItems.indices {
             guard case .toolCall(var tool) = session.chatItems[index].type,
                   tool.status == .running ||
@@ -1476,7 +1492,7 @@ actor SessionStore {
             return
         }
         snapshot.applying(to: &session)
-        finalizeDanglingTools(in: &session)
+        finalizeDanglingTools(in: &session, terminalAt: observedAt)
         sessions[sessionId] = session
         await cleanupExternalLifecycle(sessionId: sessionId)
     }
@@ -1517,7 +1533,7 @@ actor SessionStore {
         }
         snapshot.applying(to: &session)
         session.pid = nil
-        finalizeDanglingTools(in: &session)
+        finalizeDanglingTools(in: &session, terminalAt: session.completedAt ?? observedAt)
         sessions[sessionId] = session
         cancelPendingSync(sessionId: sessionId)
         await cleanupExternalLifecycle(sessionId: sessionId)
@@ -1689,6 +1705,9 @@ actor SessionStore {
             ),
             session: &session
         )
+        if let completedAt = session.completedAt {
+            finalizeDanglingTools(in: &session, terminalAt: completedAt)
+        }
 
         sessions[sessionId] = session
     }
@@ -1843,7 +1862,7 @@ actor SessionStore {
                 // Close stale tool placeholders only after the reducer accepts
                 // the evidence; rejected old transcripts remain presentation
                 // data and cannot tear down newer running work.
-                finalizeDanglingTools(in: &session)
+                finalizeDanglingTools(in: &session, terminalAt: snapshot.completedAt ?? observedAt)
             }
         case .remove:
             // Active/completed transcript evidence never removes a session.
@@ -2108,7 +2127,7 @@ actor SessionStore {
             snapshot.applying(to: &session)
             if session.phase == .waitingForInput,
                previousCompletion != session.completedAt {
-                finalizeDanglingTools(in: &session)
+                finalizeDanglingTools(in: &session, terminalAt: snapshot.completedAt ?? now)
             }
             sessions[sessionId] = session
 
@@ -2294,7 +2313,8 @@ actor SessionStore {
                 createdAt: session.createdAt,
                 lastHookEventAt: session.lastHookEventAt,
                 lastCodexTurnStartedAt: session.lastCodexTurnStartedAt,
-                completedAt: session.completedAt
+                completedAt: session.completedAt,
+                toolTerminalBoundaryAt: session.toolTracker.terminalBoundaryAt?.timeIntervalSince1970
             )
         }
 
@@ -2445,6 +2465,9 @@ actor SessionStore {
                     )
                 } ?? false,
                 phase: restoredPhase,
+                toolTracker: ToolTracker(terminalBoundaryAt: item.toolTerminalBoundaryAt.map {
+                    Date(timeIntervalSince1970: $0)
+                }),
                 conversationInfo: ConversationInfo(
                     summary: codexTitle,
                     lastMessage: nil,
