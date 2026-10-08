@@ -19,6 +19,54 @@ final class SessionStoreLifecycleTests: XCTestCase {
         XCTAssertEqual(trace.map(\.hookEventName), [.userPromptSubmit, .stop])
     }
 
+    func testIdleNotificationDoesNotMoveCompletionAndNextTurnGetsNewBoundary() async throws {
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                 externalLifecycleEffectsEnabled: false)
+        let sessionId = "completion-clock-fixture"
+        let completedAt = Date().addingTimeInterval(-120)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "UserPromptSubmit", status: "processing",
+            observedAt: completedAt.addingTimeInterval(-2), source: "claude"
+        )))
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "Stop", status: "waiting_for_input",
+            observedAt: completedAt, source: "claude"
+        )))
+        let idleAt = completedAt.addingTimeInterval(60)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "Notification", status: "waiting_for_input",
+            observedAt: idleAt, notificationType: "idle_prompt", source: "claude"
+        )))
+        var storedSession = await store.session(for: sessionId)
+        var session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .waitingForInput)
+        XCTAssertEqual(try XCTUnwrap(session.completedAt).timeIntervalSince1970,
+                       completedAt.timeIntervalSince1970, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(session.lastHookEventAt).timeIntervalSince1970,
+                       idleAt.timeIntervalSince1970, accuracy: 0.001)
+
+        let resumedAt = idleAt.addingTimeInterval(1)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "UserPromptSubmit", status: "processing",
+            observedAt: resumedAt, source: "claude"
+        )))
+        storedSession = await store.session(for: sessionId)
+        session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .processing)
+        XCTAssertNil(session.completedAt)
+
+        let nextCompletionAt = resumedAt.addingTimeInterval(2)
+        await store.process(.hookReceived(hook(
+            sessionId: sessionId, event: "Stop", status: "waiting_for_input",
+            observedAt: nextCompletionAt, source: "claude"
+        )))
+        storedSession = await store.session(for: sessionId)
+        session = try XCTUnwrap(storedSession)
+        XCTAssertEqual(session.phase, .waitingForInput)
+        XCTAssertEqual(try XCTUnwrap(session.completedAt).timeIntervalSince1970,
+                       nextCompletionAt.timeIntervalSince1970, accuracy: 0.001)
+    }
+
     private func hook(
         sessionId: String,
         event: String,

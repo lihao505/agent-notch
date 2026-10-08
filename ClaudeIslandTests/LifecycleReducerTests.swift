@@ -437,6 +437,60 @@ final class LifecycleReducerTests: XCTestCase {
         XCTAssertEqual(next.completedAt, completionAt)
     }
 
+    func testLaterCompletionHooksPreserveFirstTerminalBoundary() throws {
+        let completedAt = Date(timeIntervalSince1970: 13_500)
+        var current = snapshot(
+            phase: .waitingForInput,
+            lastActivity: completedAt,
+            lastHookEventAt: completedAt,
+            turnStartedAt: completedAt.addingTimeInterval(-10),
+            completedAt: completedAt
+        )
+        for (offset, event) in [(60.0, "Notification"), (120.0, "Stop")] {
+            let observedAt = completedAt.addingTimeInterval(offset)
+            let transition = reduce(
+                current: current,
+                observation: SessionLifecycleObservation(
+                    sessionId: "codex-session", cwd: "/tmp/project",
+                    source: .codex, origin: .hook,
+                    evidence: .hook(.completed),
+                    requestedPhase: .waitingForInput, hookEventName: event,
+                    observedAt: observedAt, receivedAt: observedAt
+                )
+            )
+            guard case .update(let next) = transition.mutation else {
+                return XCTFail("Expected fresh hook ordering metadata")
+            }
+            XCTAssertEqual(next.completedAt, completedAt)
+            XCTAssertEqual(next.lastHookEventAt, observedAt)
+            XCTAssertEqual(next.lastActivity, observedAt)
+            XCTAssertEqual(next.phase, .waitingForInput)
+            current = next
+        }
+    }
+
+    func testStopAfterTranscriptCompletionPreservesTerminalBoundary() throws {
+        let completedAt = Date(timeIntervalSince1970: 13_600)
+        let stopAt = completedAt.addingTimeInterval(2)
+        let transition = reduce(
+            current: snapshot(
+                phase: .waitingForInput,
+                lastActivity: completedAt,
+                lastHookEventAt: completedAt.addingTimeInterval(-3),
+                completedAt: completedAt
+            ),
+            observation: observation(
+                .hook(.completed), observedAt: stopAt, receivedAt: stopAt,
+                origin: .hook, requestedPhase: .waitingForInput
+            )
+        )
+        guard case .update(let next) = transition.mutation else {
+            return XCTFail("Expected fresh Stop metadata")
+        }
+        XCTAssertEqual(next.completedAt, completedAt)
+        XCTAssertEqual(next.lastHookEventAt, stopAt)
+    }
+
     func testHookRemovalCannotCrossNewerLifecycleBoundary() {
         let activeAt = Date(timeIntervalSince1970: 14_000)
         let current = snapshot(

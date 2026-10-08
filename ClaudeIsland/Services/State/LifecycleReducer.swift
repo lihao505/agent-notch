@@ -739,10 +739,11 @@ nonisolated enum LifecycleReducer {
                 next.lastHookEventAt ?? .distantPast,
                 observedAt
             )
-            next.completedAt = max(
-                next.completedAt ?? .distantPast,
-                observedAt
-            )
+            // Stop, StopFailure and idle_prompt can all close the same turn.
+            // Keep its first accepted terminal boundary; a later reminder is
+            // fresh hook evidence, not a new completion or retention deadline.
+            // Active hooks clear completedAt when a new generation resumes.
+            next.completedAt = next.completedAt ?? observedAt
             guard next != previous else {
                 return LifecycleTransition(
                     mutation: .none,
