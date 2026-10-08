@@ -429,6 +429,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func navigateSessionFromKeyboard(_ direction: SessionNavigationDirection) {
+        guard canPresentOnCurrentSpace() else { return }
         let currentID: String?
         if case .chat(let session) = contentType {
             currentID = session.sessionId
@@ -462,7 +463,7 @@ class NotchViewModel: ObservableObject {
     }
 
     func notchPop() {
-        guard status == .closed else { return }
+        guard canPresentOnCurrentSpace(), status == .closed else { return }
         status = .popping
     }
 
@@ -494,6 +495,9 @@ class NotchViewModel: ObservableObject {
     /// Open a permission request in a smaller, scrollable conversation panel.
     /// The normal chat size remains available when the user opens it manually.
     func showApproval(for session: SessionState) {
+        // Validate before replacing the saved conversation or presentation
+        // generation. Window-level rejection happens too late to preserve them.
+        guard canPresentOnCurrentSpace() else { return }
         hoverTimer?.cancel()
         hoverTimer = nil
         presentationGeneration += 1

@@ -116,4 +116,28 @@ final class SessionNavigationTests: XCTestCase {
         XCTAssertEqual(viewModel.openReason, .click)
         XCTAssertEqual(viewModel.presentationGeneration, generation)
     }
+
+    func testExcludedSpaceNavigationIsANoopAndPreservesSavedChat() async {
+        let a = session("a"), b = session("b")
+        for direction in [SessionNavigationDirection.next, .previous] {
+            let viewModel = model([a, b])
+            viewModel.navigateSessionFromKeyboard(.next)
+            viewModel.notchClose()
+            let generation = viewModel.presentationGeneration
+            let reason = viewModel.openReason
+            viewModel.canPresentOnCurrentSpace = { false }
+
+            viewModel.navigateSessionFromKeyboard(direction)
+            XCTAssertEqual(viewModel.status, .closed)
+            XCTAssertEqual(viewModel.contentType, .instances)
+            XCTAssertEqual(viewModel.openReason, reason)
+            XCTAssertEqual(viewModel.presentationGeneration, generation)
+
+            viewModel.canPresentOnCurrentSpace = { true }
+            viewModel.openFromAccessibility()
+            XCTAssertEqual(viewModel.contentType, .chat(a))
+            viewModel.navigateSessionFromKeyboard(.next)
+            XCTAssertEqual(viewModel.contentType, .chat(b))
+        }
+    }
 }

@@ -73,6 +73,50 @@ final class NotchPointerInteractionTests: XCTestCase {
         XCTAssertEqual(model.contentType, .chat(session))
     }
 
+    func testExcludedSpaceRejectsApprovalWithoutReplacingSavedChat() async {
+        let model = makeViewModel(EventMonitors(startMonitors: false))
+        let original = SessionState(sessionId: "original-chat", cwd: "/tmp/original")
+        let approval = SessionState(
+            sessionId: "incoming-approval", cwd: "/tmp/approval",
+            phase: .waitingForApproval(PermissionContext(
+                toolUseId: "approval-in-excluded-space", toolName: "Bash",
+                toolInput: nil, receivedAt: Date()
+            ))
+        )
+        model.notchOpen(reason: .click)
+        model.showChat(for: original)
+        model.notchClose()
+        let generation = model.presentationGeneration
+        let reason = model.openReason
+        model.canPresentOnCurrentSpace = { false }
+
+        model.showApproval(for: approval)
+
+        XCTAssertEqual(model.status, .closed)
+        XCTAssertEqual(model.contentType, .instances)
+        XCTAssertEqual(model.openReason, reason)
+        XCTAssertEqual(model.presentationGeneration, generation)
+        model.canPresentOnCurrentSpace = { true }
+        model.openFromAccessibility()
+        XCTAssertEqual(model.contentType, .chat(original))
+        // A fresh eligible approval must still use its actionable conversation.
+        model.showApproval(for: approval)
+        XCTAssertEqual(model.status, .opened)
+        XCTAssertEqual(model.contentType, .chat(approval))
+    }
+
+    func testExcludedSpaceRejectsCompactPop() async {
+        let model = makeViewModel(EventMonitors(startMonitors: false))
+        model.canPresentOnCurrentSpace = { false }
+        let generation = model.presentationGeneration
+        model.notchPop()
+        XCTAssertEqual(model.status, .closed)
+        XCTAssertEqual(model.presentationGeneration, generation)
+        model.canPresentOnCurrentSpace = { true }
+        model.notchPop()
+        XCTAssertEqual(model.status, .popping)
+    }
+
     func testInsideClickClaimsHoverPreviewBeforePointerExit() async throws {
         let events = EventMonitors(startMonitors: false)
         let model = makeViewModel(events)
