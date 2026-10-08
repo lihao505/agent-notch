@@ -117,6 +117,7 @@ actor SessionStore {
     private let persistenceURL: URL
     private let bridgeSnapshotDirectory: URL
     private let interruptWatcher: (any SessionInterruptWatching)?
+    private let processTreeProvider: @Sendable (Bool) -> [Int: ProcessInfo]
 
     // MARK: - Published State (for UI)
 
@@ -140,7 +141,10 @@ actor SessionStore {
         statusCheckIntervalSeconds: UInt64 = 1,
         persistenceURL: URL? = nil,
         bridgeSnapshotDirectory: URL? = nil,
-        interruptWatcher: (any SessionInterruptWatching)? = nil
+        interruptWatcher: (any SessionInterruptWatching)? = nil,
+        processTreeProvider: @escaping @Sendable (Bool) -> [Int: ProcessInfo] = {
+            ProcessTreeBuilder.shared.buildTree(forceRefresh: $0)
+        }
     ) {
         self.persistenceEnabled = persistenceEnabled
         self.fileSyncEnabled = fileSyncEnabled
@@ -150,6 +154,7 @@ actor SessionStore {
         self.persistenceURL = persistenceURL ?? Self.defaultPersistenceURL
         self.bridgeSnapshotDirectory = bridgeSnapshotDirectory ?? Self.defaultBridgeSnapshotDirectory
         self.interruptWatcher = interruptWatcher
+        self.processTreeProvider = processTreeProvider
     }
 
     // MARK: - Event Processing
@@ -366,24 +371,33 @@ actor SessionStore {
                 of: "/dev/",
                 with: ""
             )
-            let pidChanged = session.pid != event.pid
+            // Optional hook metadata is a partial update, not an instruction
+            // to forget the known process when resolution temporarily fails.
+            let pidChanged = event.pid.map { session.pid != $0 } ?? false
             let ttyChanged = normalizedTTY.map { session.tty != $0 } ?? false
-            session.pid = event.pid
+            if let pid = event.pid {
+                session.pid = pid
+            }
             if event.source != nil {
                 session.source = AgentSource(hookValue: event.source)
             }
             // Process ancestry is topology, not lifecycle state. Resolve it
-            // only when the session first appears or its PID/TTY changes;
-            // periodic reconciliation remains the fallback for a missed race.
-            if let pid = event.pid,
+            // only when the session first appears or its PID/TTY changes.
+            // Every such identity change needs fresh topology; a cached tree
+            // from the previous terminal cannot resolve a new TTY safely.
+            if let pid = session.pid,
                isNewSession || pidChanged || ttyChanged {
-                let tree = ProcessTreeBuilder.shared.buildTree(
-                    forceRefresh: isNewSession || pidChanged
-                )
+                let tree = processTreeProvider(true)
                 session.isInTmux = ProcessTreeBuilder.shared.isInTmux(
                     pid: pid,
                     tree: tree
                 )
+                if normalizedTTY == nil && (isNewSession || pidChanged) {
+                    // A new process must never inherit the old terminal's
+                    // routing key. Use its fresh ps record, or clear the TTY
+                    // if no record is available so transport can fail safely.
+                    session.tty = tree[pid]?.tty
+                }
             }
             if let normalizedTTY {
                 session.tty = normalizedTTY
