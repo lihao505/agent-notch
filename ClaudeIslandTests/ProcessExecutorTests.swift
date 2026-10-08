@@ -2,6 +2,14 @@ import CryptoKit
 import XCTest
 @testable import Agent_Notch
 
+private final class ReaderLifetimeProbe: @unchecked Sendable {}
+
+private final class ReaderLifetimeObservation {
+    weak var probe: ReaderLifetimeProbe?
+
+    init(_ probe: ReaderLifetimeProbe) { self.probe = probe }
+}
+
 final class ProcessExecutorTests: XCTestCase {
     private let noisyScript = """
     import os
@@ -174,5 +182,107 @@ final class ProcessExecutorTests: XCTestCase {
             XCTAssertEqual(code, 7)
             XCTAssertEqual(stderr, "configuration rejected")
         } catch { XCTFail("Unexpected error: \(error)") }
+    }
+
+    private let inheritedOutputScript = """
+    import os, time
+    os.write(1, b'ROOT_DONE\\n')
+    os.write(2, b'ROOT_WARNING')
+    if os.fork() == 0:
+        os.close(0)
+        time.sleep(5)
+        os._exit(0)
+    os._exit(0)
+    """
+
+    private func runWithReaderLifetimeObservation() async throws -> (String, ReaderLifetimeObservation) {
+        let probe = ReaderLifetimeProbe()
+        let observation = ReaderLifetimeObservation(probe)
+        let output = try await ProcessExecutor.shared.runCapturingOutput(
+            "/usr/bin/python3",
+            arguments: ["-c", inheritedOutputScript],
+            timeoutSeconds: 10,
+            onStdoutChunk: { _ in withExtendedLifetime(probe) {} }
+        )
+        return (output, observation)
+    }
+
+    func testExitedRootRetiresOutputReaderWithoutWaitingForDescendant() async throws {
+        // The child holds stdout/stderr without writing and self-exits after 5s.
+        // Observe the production reader callback's lifetime, not just the result.
+        let startedAt = Date()
+        let (output, observation) = try await runWithReaderLifetimeObservation()
+        XCTAssertEqual(output, "ROOT_DONE\n")
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(observation.probe, "Completed invocation still retains its output reader callback")
+    }
+
+    func testOutputCleanupHonorsDeadlineAfterRootHasExited() async {
+        let startedAt = Date()
+        let result = await ProcessExecutor.shared.runWithResult(
+            "/usr/bin/python3",
+            arguments: ["-c", inheritedOutputScript],
+            timeoutSeconds: 0.3
+        )
+        guard case .failure(.timedOut) = result else {
+            return XCTFail("Expected the full invocation deadline, got \(result)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.5)
+    }
+
+    func testSyncOutputCleanupHonorsDeadlineAfterRootHasExited() {
+        let startedAt = Date()
+        let result = ProcessExecutor.shared.runSync(
+            "/usr/bin/python3",
+            arguments: ["-c", inheritedOutputScript],
+            timeoutSeconds: 0.3
+        )
+        guard case .failure(.timedOut) = result else {
+            return XCTFail("Expected the full sync invocation deadline, got \(result)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.5)
+    }
+
+    func testOutputCleanupRespondsToCancellationAfterRootHasExited() async {
+        let ready = expectation(description: "Descendant confirmed root exit")
+        let script = """
+        import os, time
+        root_pid = os.getpid()
+        if os.fork() == 0:
+            os.close(0)
+            deadline = time.monotonic() + 2
+            while os.getppid() == root_pid and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if os.getppid() != root_pid:
+                os.write(1, b'ROOT_EXITED')
+            time.sleep(5)
+            os._exit(0)
+        os._exit(0)
+        """
+        let task = Task {
+            try await ProcessExecutor.shared.runCapturingOutput(
+                "/usr/bin/python3",
+                arguments: ["-c", script],
+                timeoutSeconds: 10,
+                onStdoutChunk: { data in
+                    if String(decoding: data, as: UTF8.self).contains("ROOT_EXITED") {
+                        ready.fulfill()
+                    }
+                }
+            )
+        }
+        await fulfillment(of: [ready], timeout: 3)
+        let startedAt = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation during inherited-output cleanup")
+        } catch let error as ProcessExecutorError {
+            guard case .cancelled = error else {
+                return XCTFail("Expected cancellation, got \(error)")
+            }
+        } catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.5)
     }
 }

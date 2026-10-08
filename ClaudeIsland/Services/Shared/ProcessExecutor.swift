@@ -276,19 +276,26 @@ private final class ProcessCaptureState: @unchecked Sendable {
 
     /// Wait for both readers on every exit path. If a descendant inherited a
     /// pipe and did not exit, close our read descriptors after a bounded wait
-    /// so no GCD worker or callback remains retained indefinitely.
+    /// so no GCD worker or callback remains retained indefinitely. Cancellation
+    /// and the invocation deadline can end that drain window early.
     nonisolated func finishReading(
         _ readGroup: DispatchGroup,
         stdoutPipe: Pipe,
         stderrPipe: Pipe,
         timeout: TimeInterval = 2
     ) {
-        guard readGroup.wait(timeout: .now() + timeout) == .timedOut else {
-            return
+        let deadline = DispatchTime.now() + timeout
+        while readGroup.wait(timeout: .now() + 0.05) == .timedOut {
+            lock.lock()
+            let invocationStopped = timedOut || cancelled
+            lock.unlock()
+            if invocationStopped || DispatchTime.now() >= deadline {
+                try? stdoutPipe.fileHandleForReading.close()
+                try? stderrPipe.fileHandleForReading.close()
+                _ = readGroup.wait(timeout: .now() + 0.25)
+                return
+            }
         }
-        try? stdoutPipe.fileHandleForReading.close()
-        try? stderrPipe.fileHandleForReading.close()
-        _ = readGroup.wait(timeout: .now() + 0.25)
     }
 
     private nonisolated func processForTerminationLocked() -> Process? {
@@ -527,11 +534,12 @@ actor ProcessExecutor {
                     if timeoutSeconds > 0 {
                         DispatchQueue.global(qos: .utility).asyncAfter(
                             deadline: .now() + timeoutSeconds
-                        ) { [weak capture, weak process] in
-                            guard let capture, let process, process.isRunning else {
-                                return
-                            }
-                            capture.markTimedOutAndTerminate()
+                        ) { [weak capture] in
+                            // The invocation includes stdin/output cleanup, not
+                            // just the root's lifetime. Completed captures ignore
+                            // this timer, and termination never signals an exited
+                            // root merely because descendants retain its pipes.
+                            capture?.markTimedOutAndTerminate()
                         }
                     }
 
@@ -661,11 +669,8 @@ actor ProcessExecutor {
             if timeoutSeconds > 0 {
                 DispatchQueue.global(qos: .utility).asyncAfter(
                     deadline: .now() + timeoutSeconds
-                ) { [weak capture, weak process] in
-                    guard let capture, let process, process.isRunning else {
-                        return
-                    }
-                    capture.markTimedOutAndTerminate()
+                ) { [weak capture] in
+                    capture?.markTimedOutAndTerminate()
                 }
             }
             process.waitUntilExit()
