@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import Agent_Notch
 
@@ -66,5 +67,112 @@ final class ProcessExecutorTests: XCTestCase {
             return XCTFail("Expected timeout, got \(result)")
         }
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
+    }
+
+    func testExitedRootCannotLeaveStandardInputWriterWaitingForDescendant() async {
+        // The fixture child owns only inherited stdin and self-exits. It never
+        // reads input or accesses user files; stdout/stderr close immediately.
+        let script = """
+        import os, time
+        if os.fork() == 0:
+            os.close(1)
+            os.close(2)
+            time.sleep(4)
+            os._exit(0)
+        os._exit(0)
+        """
+        let startedAt = Date()
+        do {
+            _ = try await ProcessExecutor.shared.runCapturingOutput(
+                "/usr/bin/python3",
+                arguments: ["-c", script],
+                standardInput: String(repeating: "x", count: 4 * 1_024 * 1_024),
+                timeoutSeconds: 3
+            )
+            XCTFail("The exited root cannot accept the complete input")
+        } catch let error as ProcessExecutorError {
+            guard case .standardInputFailed = error else {
+                return XCTFail("Expected interrupted input delivery, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected input error: \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 2)
+    }
+
+    func testStandardInputIsCompletelyDeliveredAcrossPartialWrites() async throws {
+        let input = String(repeating: "你好-input\n", count: 64_000)
+        let output = try await ProcessExecutor.shared.runCapturingOutput(
+            "/usr/bin/python3",
+            arguments: ["-c", "import sys, hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"],
+            standardInput: input,
+            timeoutSeconds: 10
+        )
+        // Calculate the expected digest in-process, independently of the writer.
+        let expected = SHA256.hash(data: Data(input.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(output.trimmingCharacters(in: .whitespacesAndNewlines),
+                       expected)
+    }
+
+    func testNonReadingStandardInputHonorsTimeout() async {
+        let startedAt = Date()
+        do {
+            _ = try await ProcessExecutor.shared.runCapturingOutput(
+                "/usr/bin/python3",
+                arguments: ["-c", "import time; time.sleep(5)"],
+                standardInput: String(repeating: "x", count: 4 * 1_024 * 1_024),
+                timeoutSeconds: 0.2
+            )
+            XCTFail("Expected timeout for a full stdin pipe")
+        } catch let error as ProcessExecutorError {
+            guard case .timedOut = error else {
+                return XCTFail("Expected timeout, got \(error)")
+            }
+        } catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
+    }
+
+    func testNonReadingStandardInputHonorsCancellation() async {
+        let ready = expectation(description: "Child launched without reading stdin")
+        let task = Task {
+            try await ProcessExecutor.shared.runCapturingOutput(
+                "/usr/bin/python3",
+                arguments: ["-c", "import os, time; os.write(1, b'READY'); time.sleep(5)"],
+                standardInput: String(repeating: "x", count: 4 * 1_024 * 1_024),
+                timeoutSeconds: 10,
+                onStdoutChunk: { _ in ready.fulfill() }
+            )
+        }
+        await fulfillment(of: [ready], timeout: 3)
+        let startedAt = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation for a full stdin pipe")
+        } catch let error as ProcessExecutorError {
+            guard case .cancelled = error else {
+                return XCTFail("Expected cancellation, got \(error)")
+            }
+        } catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
+    }
+
+    func testEarlyExitPreservesActionableStderrDespiteUndeliveredInput() async {
+        do {
+            _ = try await ProcessExecutor.shared.runCapturingOutput(
+                "/usr/bin/python3",
+                arguments: ["-c", "import os; os.write(2, b'configuration rejected'); os._exit(7)"],
+                standardInput: String(repeating: "x", count: 4 * 1_024 * 1_024),
+                timeoutSeconds: 10
+            )
+            XCTFail("Expected the child's actionable error")
+        } catch let error as ProcessExecutorError {
+            guard case .executionFailed(_, let code, let stderr) = error else {
+                return XCTFail("Expected execution failure, got \(error)")
+            }
+            XCTAssertEqual(code, 7)
+            XCTAssertEqual(stderr, "configuration rejected")
+        } catch { XCTFail("Unexpected error: \(error)") }
     }
 }

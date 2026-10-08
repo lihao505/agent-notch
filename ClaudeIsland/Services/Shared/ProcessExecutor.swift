@@ -148,14 +148,69 @@ private final class ProcessCaptureState: @unchecked Sendable {
         }
     }
 
-    /// Atomically decide whether stdin may begin writing. Cancellation that
-    /// happened before this point therefore cannot race into a post-terminate
-    /// write. A cancellation after this point is safe because the descriptor is
-    /// configured with F_SETNOSIGPIPE and the throwing FileHandle API is used.
+    /// Check before every bounded stdin write, including retries after a full
+    /// pipe. F_SETNOSIGPIPE protects a cancellation racing this check from
+    /// terminating the app; O_NONBLOCK prevents inherited readers from holding
+    /// a writer indefinitely after the root process has exited.
     nonisolated func beginStandardInputWrite() -> Bool {
         lock.lock()
         defer { lock.unlock() }
         return !timedOut && !cancelled && !completed && standardInputFailure == nil
+    }
+
+    nonisolated func writeStandardInput(_ data: Data, to handle: FileHandle, process: Process) {
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard fcntl(descriptor, F_SETNOSIGPIPE, 1) == 0,
+              flags >= 0,
+              fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            markStandardInputFailedAndTerminate(
+                "Could not configure a nonblocking, signal-safe stdin pipe (errno \(errno))"
+            )
+            return
+        }
+
+        data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                guard beginStandardInputWrite() else { return }
+                guard process.isRunning else {
+                    markStandardInputFailedAndTerminate(
+                        "Process exited before all standard input was delivered"
+                    )
+                    return
+                }
+
+                let written = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    min(64 * 1_024, bytes.count - offset)
+                )
+                if written > 0 {
+                    offset += written
+                    continue
+                }
+                let writeError = errno
+                if written < 0, writeError == EINTR { continue }
+                if written < 0, writeError == EAGAIN || writeError == EWOULDBLOCK {
+                    // Wait only briefly, then recheck invocation state and the
+                    // root. A descendant may retain stdin without consuming it.
+                    var readiness = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+                    if poll(&readiness, 1, 50) < 0, errno != EINTR {
+                        markStandardInputFailedAndTerminate(
+                            "Could not wait for stdin readiness (errno \(errno))"
+                        )
+                        return
+                    }
+                    continue
+                }
+                markStandardInputFailedAndTerminate(
+                    written == 0 ? "Stdin write made no progress" : "Stdin write failed (errno \(writeError))"
+                )
+                return
+            }
+        }
     }
 
     nonisolated func markTimedOutAndTerminate() {
@@ -481,38 +536,19 @@ actor ProcessExecutor {
                     }
 
                     if let standardInput, let inputPipe {
-                        // Keep a blocked stdin consumer off the ProcessExecutor
-                        // actor. terminationHandler waits for this group, while
-                        // timeout/cancellation closes the child side and lets
-                        // the throwing write finish deterministically.
+                        // Keep stdin delivery off the actor. Nonblocking writes
+                        // recheck stop/exit state even if descendants retain the
+                        // child side; terminationHandler waits for this group.
                         DispatchQueue.global(qos: .userInitiated).async {
                             defer { startupGroup.leave() }
                             let inputHandle = inputPipe.fileHandleForWriting
                             defer { try? inputHandle.close() }
 
-                            // Prevent EPIPE from terminating Agent Notch. The
-                            // throwing write then turns a child that closed stdin
-                            // early into a normal, reportable command error.
-                            let noSigPipe = fcntl(
-                                inputHandle.fileDescriptor,
-                                F_SETNOSIGPIPE,
-                                1
-                            ) == 0
-                            if !noSigPipe {
-                                capture.markStandardInputFailedAndTerminate(
-                                    "Could not configure a signal-safe stdin pipe (errno \(errno))"
-                                )
-                            } else if capture.beginStandardInputWrite() {
-                                do {
-                                    try inputHandle.write(
-                                        contentsOf: Data(standardInput.utf8)
-                                    )
-                                } catch {
-                                    capture.markStandardInputFailedAndTerminate(
-                                        error.localizedDescription
-                                    )
-                                }
-                            }
+                            capture.writeStandardInput(
+                                Data(standardInput.utf8),
+                                to: inputHandle,
+                                process: process
+                            )
                         }
                     } else {
                         startupGroup.leave()

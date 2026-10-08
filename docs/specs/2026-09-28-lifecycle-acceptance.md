@@ -115,3 +115,11 @@ PermissionRequest。真实 JSONL 的请求、Hook 决策和工具结果 ID 精�
 新增 3 项隔离测试，本地 Swift 总数 256；Bridge 88、verifier 30 和发布闸门通过。
 Mac 锁屏阻止真实双请求界面验收，未尝试绕过，测试 CLI 未提交请求便正常退出。
 本轮不安装或宣称端到端通过，完整边界见[渲染审批绑定](2026-10-09-rendered-approval-binding.md)。
+
+## 2026-10-09 补充：stdin 非阻塞收尾
+
+真实 OS 子进程夹具复现主进程退出后，继承 stdin 的子进程拖住写入的问题：
+设置 3 秒超时仍约 4.09 秒才返回。改为有界非阻塞写入并检查主进程退出后，
+相同回归整条用例约 0.096 秒；新增完整输入、取消、超时及原始 stderr 保留测试。
+全套 Swift 261 项、Bridge 88 项、verifier 30 项通过，不替代上表真实 Agent/UI 验收。
+未安装，详见[进程输入收尾](2026-10-09-nonblocking-process-input.md)。
