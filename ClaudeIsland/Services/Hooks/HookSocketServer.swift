@@ -135,6 +135,7 @@ typealias PermissionFailureHandler = @Sendable (_ sessionId: String, _ toolUseId
 @MainActor
 protocol SessionPermissionCancelling: AnyObject {
     func cancelPendingPermission(sessionId: String, toolUseId: String, completedAt: Date?)
+    func cancelPendingPermissions(sessionId: String, completedAt: Date?)
 }
 
 /// Keep UI-facing injection on the main actor without making the GCD socket
@@ -148,6 +149,10 @@ final class HookPermissionCanceller: SessionPermissionCancelling {
 
     func cancelPendingPermission(sessionId: String, toolUseId: String, completedAt: Date?) {
         server.cancelPendingPermission(sessionId: sessionId, toolUseId: toolUseId, completedAt: completedAt)
+    }
+
+    func cancelPendingPermissions(sessionId: String, completedAt: Date?) {
+        server.cancelPendingPermissions(sessionId: sessionId, completedAt: completedAt)
     }
 }
 
@@ -440,9 +445,9 @@ class HookSocketServer {
     }
 
     /// Cancel all pending permissions for a session (when Claude stops waiting)
-    func cancelPendingPermissions(sessionId: String) {
+    func cancelPendingPermissions(sessionId: String, completedAt: Date? = nil) {
         queue.async { [weak self] in
-            self?.cleanupPendingPermissions(sessionId: sessionId)
+            self?.cleanupPendingPermissions(sessionId: sessionId, completedAt: completedAt)
         }
     }
 
@@ -484,14 +489,9 @@ class HookSocketServer {
             permissionsLock.unlock()
             return
         }
-        if let completedAt {
-            // Evaluate on the socket queue immediately before deletion, not
-            // before the actor hop. The same key may now hold a newer request.
-            let requestAt = pending.event.lifecycleObservedDate(receivedAt: pending.receivedAt)
-            guard completedAt.timeIntervalSince1970.isFinite, requestAt <= completedAt else {
-                permissionsLock.unlock()
-                return
-            }
+        guard Self.permissionIsWithinBoundary(pending, completedAt: completedAt) else {
+            permissionsLock.unlock()
+            return
         }
         pendingPermissions.removeValue(forKey: key)
         permissionsLock.unlock()
@@ -500,9 +500,19 @@ class HookSocketServer {
         close(pending.clientSocket)
     }
 
-    private func cleanupPendingPermissions(sessionId: String) {
+    private nonisolated static func permissionIsWithinBoundary(_ pending: PendingPermission, completedAt: Date?) -> Bool {
+        guard let completedAt else { return true } // Explicit internal unconditional cleanup.
+        guard completedAt.timeIntervalSince1970.isFinite else { return false }
+        return pending.event.lifecycleObservedDate(receivedAt: pending.receivedAt) <= completedAt
+    }
+
+    private func cleanupPendingPermissions(sessionId: String, completedAt: Date?) {
         permissionsLock.lock()
-        let matching = pendingPermissions.filter { $0.key.sessionId == sessionId }
+        // Inspect the currently registered requests under the same lock used
+        // by replacement. Actor/queue suspension must not retarget old cleanup.
+        let matching = pendingPermissions.filter {
+            $0.key.sessionId == sessionId && Self.permissionIsWithinBoundary($0.value, completedAt: completedAt)
+        }
         for (key, pending) in matching {
             logger.debug("Cleaning up stale permission for \(sessionId.prefix(8), privacy: .public) tool:\(key.toolUseId.prefix(12), privacy: .public)")
             close(pending.clientSocket)

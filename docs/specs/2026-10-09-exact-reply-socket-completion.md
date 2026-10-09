@@ -62,3 +62,6 @@ Bridge 88 项、permission verifier 30 项和发布闸门通过；日志
 同 ID、同源时间的不同执行无法凭时间区分；任意跨源时钟偏差也没有保证。
 整个会话结束时的批量 cancelPendingPermissions 仍是独立边界，本轮不宣称
 已解决该批量取消与下一回合并发到达的所有竞态。
+
+后续批量清理的边界修复与私有连接证据见
+[会话终止边界](2026-10-09-bounded-session-socket-cleanup.md)，仍不替代真实 CLI 验收。

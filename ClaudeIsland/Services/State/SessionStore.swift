@@ -282,7 +282,7 @@ actor SessionStore {
         ) {
             sessions.removeValue(forKey: sessionId)
             cancelPendingSync(sessionId: sessionId)
-            await cleanupExternalLifecycle(sessionId: sessionId)
+            await cleanupExternalLifecycle(sessionId: sessionId, completedAt: observedAt)
             return
         }
 
@@ -353,7 +353,7 @@ actor SessionStore {
             case .remove:
                 sessions.removeValue(forKey: sessionId)
                 cancelPendingSync(sessionId: sessionId)
-                await cleanupExternalLifecycle(sessionId: sessionId)
+                await cleanupExternalLifecycle(sessionId: sessionId, completedAt: observedAt)
                 Self.logger.info(
                     "Hook lifecycle \(transition.reason.rawValue, privacy: .public) for \(sessionId.prefix(8), privacy: .public)"
                 )
@@ -431,7 +431,7 @@ actor SessionStore {
             finalizeDanglingTools(in: &session, terminalAt: session.completedAt ?? observedAt)
             sessions[sessionId] = session
             cancelPendingSync(sessionId: sessionId)
-            await cleanupExternalLifecycle(sessionId: sessionId)
+            await cleanupExternalLifecycle(sessionId: sessionId, completedAt: observedAt)
             return
         }
 
@@ -513,7 +513,7 @@ actor SessionStore {
         sessions[sessionId] = session
 
         if shouldApplyLifecycle && isCompletionSignal {
-            await cleanupExternalLifecycle(sessionId: sessionId)
+            await cleanupExternalLifecycle(sessionId: sessionId, completedAt: session.completedAt ?? observedAt)
         }
 
         if shouldApplyLifecycle,
@@ -1503,7 +1503,7 @@ actor SessionStore {
         snapshot.applying(to: &session)
         finalizeDanglingTools(in: &session, terminalAt: observedAt)
         sessions[sessionId] = session
-        await cleanupExternalLifecycle(sessionId: sessionId)
+        await cleanupExternalLifecycle(sessionId: sessionId, completedAt: observedAt)
     }
 
     private func processProcessExit(
@@ -1545,7 +1545,7 @@ actor SessionStore {
         finalizeDanglingTools(in: &session, terminalAt: session.completedAt ?? observedAt)
         sessions[sessionId] = session
         cancelPendingSync(sessionId: sessionId)
-        await cleanupExternalLifecycle(sessionId: sessionId)
+        await cleanupExternalLifecycle(sessionId: sessionId, completedAt: observedAt)
     }
 
     // MARK: - Clear Processing
@@ -1568,19 +1568,22 @@ actor SessionStore {
     // MARK: - Session End Processing
 
     private func processSessionEnd(sessionId: String) async {
+        let completedAt = Date()
         sessions.removeValue(forKey: sessionId)
         cancelPendingSync(sessionId: sessionId)
-        await cleanupExternalLifecycle(sessionId: sessionId)
+        await cleanupExternalLifecycle(sessionId: sessionId, completedAt: completedAt)
     }
 
     // External listeners and reply sockets are lifecycle resources. They may
     // only be changed after the same reducer decision that updates the card;
     // otherwise a delayed row can tear down a newer active turn.
-    private func cleanupExternalLifecycle(sessionId: String) async {
-        if externalLifecycleEffectsEnabled {
+    private func cleanupExternalLifecycle(sessionId: String, completedAt: Date) async {
+        if externalLifecycleEffectsEnabled || permissionCanceller != nil {
+            let injectedCanceller = permissionCanceller
             await MainActor.run {
-                HookSocketServer.shared.cancelPendingPermissions(
-                    sessionId: sessionId
+                let canceller = injectedCanceller ?? HookPermissionCanceller.shared
+                canceller.cancelPendingPermissions(
+                    sessionId: sessionId, completedAt: completedAt
                 )
             }
         }

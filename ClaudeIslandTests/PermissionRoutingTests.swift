@@ -2,6 +2,24 @@ import Darwin
 import XCTest
 @testable import Agent_Notch
 
+@MainActor
+private final class BufferedBatchCanceller: SessionPermissionCancelling {
+    let server: HookSocketServer
+    private(set) var batches: [(sessionId: String, completedAt: Date?)] = []
+    init(server: HookSocketServer) { self.server = server }
+    func cancelPendingPermission(sessionId: String, toolUseId: String, completedAt: Date?) {
+        server.cancelPendingPermission(sessionId: sessionId, toolUseId: toolUseId, completedAt: completedAt)
+    }
+    func cancelPendingPermissions(sessionId: String, completedAt: Date?) {
+        batches.append((sessionId, completedAt))
+    }
+    func flush() {
+        for batch in batches {
+            server.cancelPendingPermissions(sessionId: batch.sessionId, completedAt: batch.completedAt)
+        }
+    }
+}
+
 final class PermissionRoutingTests: XCTestCase {
     @MainActor
     func testRenderedButtonBindingsDoNotRetargetWhenQueueAdvances() {
@@ -371,5 +389,156 @@ final class PermissionRoutingTests: XCTestCase {
         }
         await fulfillment(of: [delivered], timeout: 3)
         XCTAssertEqual(try readResponse(client: client).decision, "deny")
+    }
+
+    @MainActor
+    private func batchStore(canceller: any SessionPermissionCancelling) throws -> SessionStore {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-notch-batch-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                            conversationParser: ConversationParser(codexSessionsRoot: root, claudeProjectsRoot: root),
+                            permissionCanceller: canceller, processTreeProvider: { _ in [:] })
+    }
+
+    private func lifecycleHook(_ event: String, at time: Date, pid: Int? = nil) -> SessionEvent {
+        .hookReceived(HookEvent(sessionId: "fixture", cwd: "/tmp/agent-notch-permission-tests", event: event,
+                                status: event == "SessionEnd" ? "ended" : (event == "Stop" ? "waiting_for_input" : "processing"),
+                                observedAt: time.timeIntervalSince1970, source: "claude", pid: pid, tty: nil,
+                                tool: nil, toolInput: nil, toolUseId: nil, notificationType: nil, message: nil))
+    }
+
+    @MainActor
+    func testBatchCancellationClosesOldRequestsButPreservesNewAndOtherSession() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "mixed batch registered")
+        received.expectedFulfillmentCount = 4
+        await startPrivateServer(server, path: path, received: received)
+        let clients = try (0..<4).map { _ in try connect(to: path) }
+        defer { clients.forEach { close($0) } }
+        let base = Date().addingTimeInterval(-30)
+        try sendPermission(client: clients[0], sessionId: "fixture", toolUseId: "old-1", observedAt: base)
+        try sendPermission(client: clients[1], sessionId: "fixture", toolUseId: "old-2", observedAt: base.addingTimeInterval(1))
+        try sendPermission(client: clients[2], sessionId: "fixture", toolUseId: "new", observedAt: base.addingTimeInterval(4))
+        try sendPermission(client: clients[3], sessionId: "other", toolUseId: "old-1", observedAt: base)
+        await fulfillment(of: [received], timeout: 3)
+        server.cancelPendingPermissions(sessionId: "fixture", completedAt: base.addingTimeInterval(2))
+        assertEOF(client: clients[0])
+        assertEOF(client: clients[1])
+        for (client, session, tool) in [(clients[2], "fixture", "new"), (clients[3], "other", "old-1")] {
+            let delivered = expectation(description: "protected request delivered")
+            server.respondToPermission(toolUseId: tool, sessionId: session, decision: "deny") { success in
+                XCTAssertTrue(success); delivered.fulfill()
+            }
+            await fulfillment(of: [delivered], timeout: 3)
+            XCTAssertEqual((try? readResponse(client: client))?.decision, "deny")
+        }
+    }
+
+    @MainActor
+    func testAcceptedStopInterruptExitAndSessionEndKeepNewerRawRequest() async throws {
+        for kind in ["Stop", "interrupt", "exit", "SessionEnd"] {
+            let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+            let server = HookSocketServer(socketPath: path)
+            defer { server.stop(); unlink(path) }
+            let received = expectation(description: "terminal race: \(kind)")
+            received.expectedFulfillmentCount = 2
+            await startPrivateServer(server, path: path, received: received)
+            let old = try connect(to: path), new = try connect(to: path)
+            defer { close(old); close(new) }
+            let base = Date().addingTimeInterval(-30)
+            let oldEvent = try sendPermission(client: old, sessionId: "fixture", toolUseId: "old", observedAt: base.addingTimeInterval(1), source: "claude")
+            try sendPermission(client: new, sessionId: "fixture", toolUseId: "new", observedAt: base.addingTimeInterval(4), source: "claude")
+            await fulfillment(of: [received], timeout: 3)
+            let store = try batchStore(canceller: HookPermissionCanceller(server: server))
+            await store.process(lifecycleHook("UserPromptSubmit", at: base, pid: 12345))
+            await store.process(.hookReceived(oldEvent))
+            switch kind {
+            case "interrupt": await store.process(.interruptDetected(sessionId: "fixture", observedAt: base.addingTimeInterval(2)))
+            case "exit": await store.process(.processExited(sessionId: "fixture", pid: 12345, observedAt: base.addingTimeInterval(2)))
+            default: await store.process(lifecycleHook(kind, at: base.addingTimeInterval(2)))
+            }
+            assertEOF(client: old)
+            let delivered = expectation(description: "new request remains after \(kind)")
+            server.respondToPermission(toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
+                XCTAssertTrue(success); delivered.fulfill()
+            }
+            await fulfillment(of: [delivered], timeout: 3)
+            XCTAssertEqual((try? readResponse(client: new))?.decision, "deny")
+        }
+    }
+
+    @MainActor
+    func testDuplicateStopUsesFirstCompletionForBatchCleanup() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "new raw request registered")
+        await startPrivateServer(server, path: path, received: received)
+        let client = try connect(to: path)
+        defer { close(client) }
+        let base = Date().addingTimeInterval(-30)
+        let store = try batchStore(canceller: HookPermissionCanceller(server: server))
+        await store.process(lifecycleHook("UserPromptSubmit", at: base))
+        await store.process(lifecycleHook("Stop", at: base.addingTimeInterval(2)))
+        try sendPermission(client: client, sessionId: "fixture", toolUseId: "new", observedAt: base.addingTimeInterval(3), source: "claude")
+        await fulfillment(of: [received], timeout: 3)
+        await store.process(lifecycleHook("Stop", at: base.addingTimeInterval(4)))
+        let state = await store.session(for: "fixture")
+        let firstWireTime = Date(timeIntervalSince1970: base.addingTimeInterval(2).timeIntervalSince1970)
+        XCTAssertEqual(state?.completedAt, firstWireTime)
+        let delivered = expectation(description: "duplicate Stop keeps newer socket")
+        server.respondToPermission(toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
+            XCTAssertTrue(success); delivered.fulfill()
+        }
+        await fulfillment(of: [delivered], timeout: 3)
+        XCTAssertEqual((try? readResponse(client: client))?.decision, "deny")
+    }
+
+    @MainActor
+    func testLocalSessionEndCapturedBeforeDelayedCleanupPreservesLaterRequest() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "old and later requests registered")
+        received.expectedFulfillmentCount = 2
+        await startPrivateServer(server, path: path, received: received)
+        let old = try connect(to: path), new = try connect(to: path)
+        defer { close(old); close(new) }
+        let oldEvent = try sendPermission(client: old, sessionId: "fixture", toolUseId: "old", observedAt: Date().addingTimeInterval(-1), source: "claude")
+        let deadline = Date().addingTimeInterval(3)
+        while !server.hasPendingPermission(sessionId: "fixture") && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(server.hasPendingPermission(sessionId: "fixture"))
+        let buffered = BufferedBatchCanceller(server: server)
+        let store = try batchStore(canceller: buffered)
+        await store.process(.hookReceived(oldEvent))
+        let before = Date()
+        await store.process(.sessionEnded(sessionId: "fixture"))
+        let after = Date()
+        XCTAssertEqual(buffered.batches.count, 1)
+        let boundary = buffered.batches.first?.completedAt
+        XCTAssertNotNil(boundary)
+        if let boundary {
+            XCTAssertGreaterThanOrEqual(boundary, before)
+            XCTAssertLessThanOrEqual(boundary, after)
+        }
+        let newEvent = try sendPermission(client: new, sessionId: "fixture", toolUseId: "new", source: "claude")
+        await fulfillment(of: [received], timeout: 3)
+        if let boundary { XCTAssertGreaterThan(newEvent.observedAt ?? 0, boundary.timeIntervalSince1970) }
+        await store.process(.hookReceived(newEvent))
+        buffered.flush()
+        assertEOF(client: old)
+        let recreated = await store.session(for: "fixture")
+        XCTAssertEqual(recreated?.pendingInteractions.toolUseIds, ["new"])
+        let delivered = expectation(description: "later request survives delayed local end")
+        server.respondToPermission(toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
+            XCTAssertTrue(success); delivered.fulfill()
+        }
+        await fulfillment(of: [delivered], timeout: 3)
+        XCTAssertEqual((try? readResponse(client: new))?.decision, "deny")
     }
 }
