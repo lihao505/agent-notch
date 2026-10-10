@@ -35,14 +35,16 @@ nonisolated struct PendingInteractionQueue: Equatable, Sendable {
         if let index = items.firstIndex(where: {
             $0.toolUseId == context.toolUseId
         }) {
-            // Preserve FIFO position while refreshing richer input from a later
-            // correlated PermissionRequest for the same tool.
+            // Preserve FIFO position, but never inherit input from a replaced
+            // connection. Only a refresh of this exact request may fill gaps.
             let existing = items[index]
+            let isSameRequest = existing.requestID == context.requestID
             items[index] = PermissionContext(
                 toolUseId: context.toolUseId,
                 toolName: context.toolName,
-                toolInput: context.toolInput ?? existing.toolInput,
-                receivedAt: min(existing.receivedAt, context.receivedAt)
+                toolInput: isSameRequest ? context.toolInput ?? existing.toolInput : context.toolInput,
+                receivedAt: isSameRequest ? min(existing.receivedAt, context.receivedAt) : context.receivedAt,
+                requestID: context.requestID
             )
         } else {
             items.append(context)

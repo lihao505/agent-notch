@@ -15,12 +15,21 @@ struct PermissionContext: Sendable {
     let toolName: String
     let toolInput: [String: AnyCodable]?
     let receivedAt: Date
+    var requestID: UUID? = nil
 
     /// Bind a rendered button to this request, not to mutable SwiftUI State.
     /// An outgoing card can remain clickable while its removal animates.
     func bindAction(_ action: @escaping (String) -> Void) -> () -> Void {
         let renderedToolUseId = toolUseId
         return { action(renderedToolUseId) }
+    }
+
+    /// Capture the native connection identity too: tool IDs can be reused even
+    /// when the outgoing and replacement cards have identical source times.
+    func bindRequestAction(_ action: @escaping (String, UUID?) -> Void) -> () -> Void {
+        let renderedToolUseId = toolUseId
+        let renderedRequestID = requestID
+        return { action(renderedToolUseId, renderedRequestID) }
     }
 
     /// Format tool input for display
@@ -73,7 +82,8 @@ extension PermissionContext: Equatable {
         // Compare by identity fields only (AnyCodable doesn't conform to Equatable)
         lhs.toolUseId == rhs.toolUseId &&
         lhs.toolName == rhs.toolName &&
-        lhs.receivedAt == rhs.receivedAt
+        lhs.receivedAt == rhs.receivedAt &&
+        lhs.requestID == rhs.requestID
     }
 }
 

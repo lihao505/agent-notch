@@ -61,11 +61,12 @@ class ClaudeSessionMonitor: ObservableObject {
             onEvent: { event in
                 continuation.yield(.hookReceived(event))
             },
-            onPermissionFailure: { sessionId, toolUseId in
+            onPermissionFailure: { sessionId, toolUseId, requestID, resolvedAt in
                 continuation.yield(.permissionSocketFailed(
                     sessionId: sessionId,
                     toolUseId: toolUseId,
-                    resolvedAt: Date()
+                    resolvedAt: resolvedAt,
+                    requestID: requestID
                 ))
             }
         )
@@ -93,12 +94,15 @@ class ClaudeSessionMonitor: ObservableObject {
     func approvePermission(
         sessionId: String,
         expectedToolUseId: String,
+        expectedRequestID: UUID?,
         enableAutoApproval: Bool = false
     ) {
         let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
-                  let permission = session.activePermission else {
+                  let permission = session.activePermission,
+                  let requestID = expectedRequestID,
+                  permission.requestID == requestID else {
                 return
             }
             if permission.toolUseId != expectedToolUseId {
@@ -116,6 +120,7 @@ class ClaudeSessionMonitor: ObservableObject {
             HookSocketServer.shared.respondToPermission(
                 toolUseId: toolUseId,
                 sessionId: sessionId,
+                expectedRequestID: requestID,
                 decision: "allow"
             ) { delivered in
                 Task {
@@ -124,12 +129,14 @@ class ClaudeSessionMonitor: ObservableObject {
                             ? .permissionApproved(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                             : .permissionSocketFailed(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                     )
                 }
@@ -140,12 +147,15 @@ class ClaudeSessionMonitor: ObservableObject {
     func denyPermission(
         sessionId: String,
         expectedToolUseId: String,
+        expectedRequestID: UUID?,
         reason: String?
     ) {
         let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
-                  let permission = session.activePermission else {
+                  let permission = session.activePermission,
+                  let requestID = expectedRequestID,
+                  permission.requestID == requestID else {
                 return
             }
             if permission.toolUseId != expectedToolUseId {
@@ -156,6 +166,7 @@ class ClaudeSessionMonitor: ObservableObject {
             HookSocketServer.shared.respondToPermission(
                 toolUseId: toolUseId,
                 sessionId: sessionId,
+                expectedRequestID: requestID,
                 decision: "deny",
                 reason: reason
             ) { delivered in
@@ -166,12 +177,14 @@ class ClaudeSessionMonitor: ObservableObject {
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
                                 reason: reason,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                             : .permissionSocketFailed(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                     )
                 }
@@ -185,6 +198,7 @@ class ClaudeSessionMonitor: ObservableObject {
     func answerQuestions(
         sessionId: String,
         expectedToolUseId: String,
+        expectedRequestID: UUID?,
         expectedQuestions: [InteractiveQuestion],
         answers: [String: String]
     ) {
@@ -192,6 +206,8 @@ class ClaudeSessionMonitor: ObservableObject {
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
+                  let requestID = expectedRequestID,
+                  permission.requestID == requestID,
                   permission.toolName == "AskUserQuestion",
                   permission.toolUseId == expectedToolUseId,
                   InteractiveQuestionSubmissionPolicy.canSubmit(
@@ -207,6 +223,7 @@ class ClaudeSessionMonitor: ObservableObject {
             HookSocketServer.shared.respondToPermission(
                 toolUseId: toolUseId,
                 sessionId: sessionId,
+                expectedRequestID: requestID,
                 decision: "allow",
                 updatedInput: updatedInput
             ) { delivered in
@@ -216,12 +233,14 @@ class ClaudeSessionMonitor: ObservableObject {
                             ? .permissionApproved(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                             : .permissionSocketFailed(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                     )
                 }
@@ -231,11 +250,13 @@ class ClaudeSessionMonitor: ObservableObject {
 
     /// ExitPlanMode also requires an echoed updatedInput when it is handled
     /// through a PreToolUse integration.
-    func approvePlan(sessionId: String, expectedToolUseId: String) {
+    func approvePlan(sessionId: String, expectedToolUseId: String, expectedRequestID: UUID?) {
         let resolvedAt = Date()
         Task {
             guard let session = await SessionStore.shared.session(for: sessionId),
                   let permission = session.activePermission,
+                  let requestID = expectedRequestID,
+                  permission.requestID == requestID,
                   permission.toolName == "ExitPlanMode",
                   permission.toolUseId == expectedToolUseId else {
                 return
@@ -245,6 +266,7 @@ class ClaudeSessionMonitor: ObservableObject {
             HookSocketServer.shared.respondToPermission(
                 toolUseId: toolUseId,
                 sessionId: sessionId,
+                expectedRequestID: requestID,
                 decision: "allow",
                 updatedInput: permission.toolInput ?? [:]
             ) { delivered in
@@ -254,12 +276,14 @@ class ClaudeSessionMonitor: ObservableObject {
                             ? .permissionApproved(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                             : .permissionSocketFailed(
                                 sessionId: sessionId,
                                 toolUseId: toolUseId,
-                                resolvedAt: resolvedAt
+                                resolvedAt: resolvedAt,
+                                requestID: requestID
                             )
                     )
                 }

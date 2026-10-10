@@ -30,6 +30,8 @@ struct HookEvent: Codable, Sendable {
     let notificationType: String?
     let message: String?
     let responseTimeoutSeconds: Double?
+    /// Assigned by the native server, never decoded from or encoded onto the wire.
+    var permissionRequestID: UUID? = nil
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
@@ -73,7 +75,8 @@ struct HookEvent: Codable, Sendable {
                 toolUseId: toolUseId ?? "",
                 toolName: tool ?? "unknown",
                 toolInput: toolInput,
-                receivedAt: Date()
+                receivedAt: Date(),
+                requestID: permissionRequestID
             ))
         case "waiting_for_input":
             return .waitingForInput
@@ -130,7 +133,7 @@ private struct PendingPermissionKey: Hashable, Sendable {
 typealias HookEventHandler = @Sendable (HookEvent) -> Void
 
 /// Callback for permission response failures (socket died)
-typealias PermissionFailureHandler = @Sendable (_ sessionId: String, _ toolUseId: String) -> Void
+typealias PermissionFailureHandler = @Sendable (_ sessionId: String, _ toolUseId: String, _ requestID: UUID, _ resolvedAt: Date) -> Void
 
 @MainActor
 protocol SessionPermissionCancelling: AnyObject {
@@ -423,6 +426,7 @@ class HookSocketServer {
     func respondToPermission(
         toolUseId: String,
         sessionId: String,
+        expectedRequestID: UUID,
         decision: String,
         reason: String? = nil,
         updatedInput: [String: AnyCodable]? = nil,
@@ -436,6 +440,7 @@ class HookSocketServer {
             let sent = self.sendPermissionResponse(
                 toolUseId: toolUseId,
                 sessionId: sessionId,
+                expectedRequestID: expectedRequestID,
                 decision: decision,
                 reason: reason,
                 updatedInput: updatedInput
@@ -679,7 +684,7 @@ class HookSocketServer {
 
             logger.debug("Permission request - keeping socket open for \(event.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
 
-            let updatedEvent = HookEvent(
+            var updatedEvent = HookEvent(
                 sessionId: event.sessionId,
                 cwd: event.cwd,
                 event: event.event,
@@ -695,6 +700,8 @@ class HookSocketServer {
                 message: event.message,
                 responseTimeoutSeconds: event.responseTimeoutSeconds
             )
+            let requestID = UUID()
+            updatedEvent.permissionRequestID = requestID
 
             let receivedAt = Date()
             let responseTimeout = max(1, event.responseTimeoutSeconds ?? 90)
@@ -721,7 +728,7 @@ class HookSocketServer {
             queue.asyncAfter(deadline: .now() + responseTimeout + 2) { [weak self] in
                 self?.expirePendingPermission(
                     key: key,
-                    receivedAt: receivedAt
+                    requestID: requestID
                 )
             }
 
@@ -738,6 +745,7 @@ class HookSocketServer {
     private func sendPermissionResponse(
         toolUseId: String,
         sessionId: String,
+        expectedRequestID: UUID,
         decision: String,
         reason: String?,
         updatedInput: [String: AnyCodable]? = nil
@@ -757,6 +765,11 @@ class HookSocketServer {
             } else {
                 logger.debug("No pending permission for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
             }
+            return false
+        }
+        guard pending.event.permissionRequestID == expectedRequestID else {
+            permissionsLock.unlock()
+            logger.debug("Rejected replaced permission response for \(sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
             return false
         }
         pendingPermissions.removeValue(forKey: key)
@@ -786,11 +799,11 @@ class HookSocketServer {
     /// the notch can keep displaying an approval whose client no longer exists.
     private func expirePendingPermission(
         key: PendingPermissionKey,
-        receivedAt: Date
+        requestID: UUID
     ) {
         permissionsLock.lock()
         guard let pending = pendingPermissions[key],
-              pending.receivedAt == receivedAt,
+              pending.event.permissionRequestID == requestID,
               pending.expiresAt <= Date() else {
             permissionsLock.unlock()
             return
@@ -800,7 +813,9 @@ class HookSocketServer {
 
         close(pending.clientSocket)
         logger.info("Expired unanswered permission for \(pending.sessionId.prefix(8), privacy: .public) tool:\(key.toolUseId.prefix(12), privacy: .public)")
-        permissionFailureHandler?(pending.sessionId, key.toolUseId)
+        if let requestID = pending.event.permissionRequestID {
+            permissionFailureHandler?(pending.sessionId, key.toolUseId, requestID, Date())
+        }
     }
 
     /// Permission clients wait in recv(), so switch their accepted socket back

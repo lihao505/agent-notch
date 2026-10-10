@@ -2,6 +2,35 @@ import Darwin
 import XCTest
 @testable import Agent_Notch
 
+/// Server callbacks run on its GCD queue; tests deliberately delay delivery to
+/// the store without blocking that queue or touching the live application.
+private final class PermissionSocketFixtureEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hooks: [String: [String: HookEvent]] = [:]
+    private var failures: [(String, String, UUID, Date)] = []
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        hooks.removeAll(); failures.removeAll()
+    }
+    func record(_ event: HookEvent) {
+        guard let tool = event.toolUseId else { return }
+        lock.lock(); defer { lock.unlock() }
+        hooks[event.sessionId, default: [:]][tool] = event
+    }
+    func latest(session: String, tool: String) -> HookEvent? {
+        lock.lock(); defer { lock.unlock() }
+        return hooks[session]?[tool]
+    }
+    func fail(session: String, tool: String, request: UUID, at time: Date) {
+        lock.lock(); defer { lock.unlock() }
+        failures.append((session, tool, request, time))
+    }
+    func failureEvents() -> [SessionEvent] {
+        lock.lock(); defer { lock.unlock() }
+        return failures.map { .permissionSocketFailed(sessionId: $0.0, toolUseId: $0.1, resolvedAt: $0.3, requestID: $0.2) }
+    }
+}
+
 @MainActor
 private final class BufferedBatchCanceller: SessionPermissionCancelling {
     let server: HookSocketServer
@@ -21,6 +50,313 @@ private final class BufferedBatchCanceller: SessionPermissionCancelling {
 }
 
 final class PermissionRoutingTests: XCTestCase {
+    private let socketEvents = PermissionSocketFixtureEvents()
+
+    @MainActor
+    func testRenderedBindingsCaptureRequestIdentityWhenToolIdIsReused() {
+        let oldID = UUID(), newID = UUID(), base = Date()
+        var displayed = PermissionContext(toolUseId: "same", toolName: "Bash", toolInput: nil,
+                                           receivedAt: base, requestID: oldID)
+        var calls: [(String, UUID?)] = []
+        let approve = displayed.bindRequestAction { calls.append(($0, $1)) }
+        let autoApprove = displayed.bindRequestAction { calls.append(($0, $1)) }
+        let deny = displayed.bindRequestAction { calls.append(($0, $1)) }
+        displayed = PermissionContext(toolUseId: "same", toolName: "Bash", toolInput: nil,
+                                      receivedAt: base, requestID: newID)
+        let nextApprove = displayed.bindRequestAction { calls.append(($0, $1)) }
+        approve(); autoApprove(); deny(); nextApprove()
+        XCTAssertEqual(calls.map { $0.0 }, ["same", "same", "same", "same"])
+        XCTAssertEqual(calls.map { $0.1 }, [oldID, oldID, oldID, newID])
+    }
+
+    private func respondToPermission(
+        server: HookSocketServer, toolUseId: String, sessionId: String, decision: String,
+        completion: @escaping @Sendable (Bool) -> Void
+    ) {
+        guard let requestID = socketEvents.latest(session: sessionId, tool: toolUseId)?.permissionRequestID else {
+            // Cross-session rejection is intentionally tested with no such request.
+            server.respondToPermission(toolUseId: toolUseId, sessionId: sessionId,
+                                       expectedRequestID: UUID(), decision: decision, completion: completion)
+            return
+        }
+        server.respondToPermission(toolUseId: toolUseId, sessionId: sessionId,
+                                   expectedRequestID: requestID, decision: decision, completion: completion)
+    }
+    @MainActor
+    func testReplacementRefreshesRequestIdentityWithoutChangingFIFOPosition() {
+        let oldID = UUID(), newID = UUID(), base = Date()
+        var queue = PendingInteractionQueue()
+        queue.enqueue(PermissionContext(toolUseId: "same", toolName: "Bash", toolInput: ["command": AnyCodable("old")],
+                                        receivedAt: base, requestID: oldID))
+        queue.enqueue(PermissionContext(toolUseId: "next", toolName: "Read", toolInput: nil,
+                                        receivedAt: base))
+        queue.enqueue(PermissionContext(toolUseId: "same", toolName: "Bash", toolInput: nil,
+                                        receivedAt: base.addingTimeInterval(1), requestID: newID))
+        XCTAssertEqual(queue.toolUseIds, ["same", "next"])
+        XCTAssertEqual(queue.current?.requestID, newID)
+        XCTAssertEqual(queue.current?.receivedAt, base.addingTimeInterval(1))
+        XCTAssertNil(queue.current?.toolInput)
+        queue.enqueue(PermissionContext(toolUseId: "same", toolName: "Bash", toolInput: ["command": AnyCodable("new")],
+                                        receivedAt: base.addingTimeInterval(2), requestID: newID))
+        queue.enqueue(PermissionContext(toolUseId: "same", toolName: "Bash", toolInput: nil,
+                                        receivedAt: base.addingTimeInterval(3), requestID: newID))
+        XCTAssertEqual(queue.current?.formattedInput, "new")
+        XCTAssertEqual(queue.current?.receivedAt, base.addingTimeInterval(1))
+    }
+
+    @MainActor
+    func testLateCallbacksCannotResolveReplacementClearOrRecreatedRequest() async throws {
+        for mode in ["replacement", "clear", "recreate"] {
+            for signal in ["allow", "deny", "failure", "untagged"] {
+                let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                         processTreeProvider: { _ in [:] })
+                let base = Date().addingTimeInterval(-10)
+                let oldID = UUID(), newID = UUID()
+                var old = HookEvent(sessionId: "fixture", cwd: "/tmp/agent-notch-permission-tests", event: "PermissionRequest",
+                                status: "waiting_for_approval", observedAt: base.timeIntervalSince1970,
+                                source: "claude", pid: nil, tty: nil, tool: "Bash", toolInput: nil,
+                                toolUseId: "same", notificationType: nil, message: nil)
+                old.permissionRequestID = oldID
+                await store.process(.hookReceived(old))
+                if mode == "clear" { await store.process(.clearDetected(sessionId: "fixture")) }
+                if mode == "recreate" { await store.process(.sessionEnded(sessionId: "fixture")) }
+                var newer = old
+                newer.permissionRequestID = newID
+                await store.process(.hookReceived(newer))
+                let beforeSnapshot = await store.session(for: "fixture")
+                let before = try XCTUnwrap(beforeSnapshot)
+                let resolvedAt = Date()
+                let event: SessionEvent
+                switch signal {
+                case "allow": event = .permissionApproved(sessionId: "fixture", toolUseId: "same", resolvedAt: resolvedAt, requestID: oldID)
+                case "deny": event = .permissionDenied(sessionId: "fixture", toolUseId: "same", reason: nil, resolvedAt: resolvedAt, requestID: oldID)
+                case "failure": event = .permissionSocketFailed(sessionId: "fixture", toolUseId: "same", resolvedAt: resolvedAt, requestID: oldID)
+                default: event = .permissionSocketFailed(sessionId: "fixture", toolUseId: "same", resolvedAt: resolvedAt)
+                }
+                await store.process(event)
+                let afterSnapshot = await store.session(for: "fixture")
+                let after = try XCTUnwrap(afterSnapshot)
+                XCTAssertEqual(after.pendingInteractions, before.pendingInteractions, "\(mode): \(signal)")
+                XCTAssertEqual(after.phase, before.phase, "\(mode): \(signal)")
+                XCTAssertEqual(after.lastHookEventAt, before.lastHookEventAt)
+            }
+        }
+    }
+
+    @MainActor
+    func testMatchingTaggedCallbacksResolveOnlyTheirQueuedRequest() async throws {
+        for signal in ["allow", "deny", "failure"] {
+            let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                     processTreeProvider: { _ in [:] })
+            let base = Date().addingTimeInterval(-10)
+            let firstID = UUID(), secondID = UUID()
+            for (tool, token) in [("first", firstID), ("second", secondID)] {
+                var event = HookEvent(sessionId: "fixture", cwd: "/tmp/agent-notch-permission-tests",
+                                      event: "PermissionRequest", status: "waiting_for_approval",
+                                      observedAt: base.timeIntervalSince1970, source: "claude", pid: nil,
+                                      tty: nil, tool: "Bash", toolInput: nil, toolUseId: tool,
+                                      notificationType: nil, message: nil)
+                event.permissionRequestID = token
+                await store.process(.hookReceived(event))
+            }
+            let resolution: SessionEvent
+            switch signal {
+            case "allow": resolution = .permissionApproved(sessionId: "fixture", toolUseId: "second", resolvedAt: Date(), requestID: secondID)
+            case "deny": resolution = .permissionDenied(sessionId: "fixture", toolUseId: "second", reason: nil, resolvedAt: Date(), requestID: secondID)
+            default: resolution = .permissionSocketFailed(sessionId: "fixture", toolUseId: "second", resolvedAt: Date(), requestID: secondID)
+            }
+            await store.process(resolution)
+            let snapshot = await store.session(for: "fixture")
+            let session = try XCTUnwrap(snapshot)
+            XCTAssertEqual(session.pendingInteractions.toolUseIds, ["first"])
+            XCTAssertEqual(session.activePermission?.requestID, firstID)
+            let item = try XCTUnwrap(session.chatItems.first { $0.id == "second" })
+            guard case .toolCall(let tool) = item.type else { return XCTFail("Missing tool") }
+            XCTAssertEqual(tool.status, signal == "allow" ? .running : .error)
+        }
+    }
+
+    func testNativeRequestIdentityIsNotEncodedOrAcceptedFromWire() throws {
+        var event = HookEvent(sessionId: "fixture", cwd: "/tmp", event: "PermissionRequest",
+                              status: "waiting_for_approval", observedAt: nil, source: "claude", pid: nil,
+                              tty: nil, tool: "Bash", toolInput: nil, toolUseId: "same",
+                              notificationType: nil, message: nil)
+        event.permissionRequestID = UUID()
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any])
+        XCTAssertNil(payload["permissionRequestID"])
+        XCTAssertNil(payload["permission_request_id"])
+        payload["permissionRequestID"] = UUID().uuidString
+        payload["permission_request_id"] = UUID().uuidString
+        let decoded = try JSONDecoder().decode(HookEvent.self, from: JSONSerialization.data(withJSONObject: payload))
+        XCTAssertNil(decoded.permissionRequestID)
+    }
+
+    private func waitForHook(session: String = "fixture", tool: String = "same", replacing: UUID? = nil) async throws -> HookEvent {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let event = socketEvents.latest(session: session, tool: tool),
+               let token = event.permissionRequestID, token != replacing { return event }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Private permission did not arrive")
+        throw POSIXError(.ETIMEDOUT)
+    }
+
+    @MainActor
+    func testReplacedPrivateSocketRejectsOldIdentityEvenWithoutSourceTime() async throws {
+        for sourceTime in [Date().addingTimeInterval(-30), nil] as [Date?] {
+            let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+            let server = HookSocketServer(socketPath: path)
+            defer { server.stop(); unlink(path) }
+            let received = expectation(description: "same-key replacements")
+            received.expectedFulfillmentCount = 2
+            await startPrivateServer(server, path: path, received: received)
+            let old = try connect(to: path), newer = try connect(to: path)
+            defer { close(old); close(newer) }
+            try sendPermission(client: old, sessionId: "fixture", toolUseId: "same", observedAt: sourceTime, source: "claude")
+            let oldEvent = try await waitForHook()
+            let oldID = try XCTUnwrap(oldEvent.permissionRequestID)
+            try sendPermission(client: newer, sessionId: "fixture", toolUseId: "same", observedAt: sourceTime, source: "claude")
+            let newEvent = try await waitForHook(replacing: oldID)
+            await fulfillment(of: [received], timeout: 3)
+            assertEOF(client: old)
+            let rejected = expectation(description: "old identity rejected")
+            server.respondToPermission(toolUseId: "same", sessionId: "fixture", expectedRequestID: oldID, decision: "allow") { delivered in
+                XCTAssertFalse(delivered); rejected.fulfill()
+            }
+            await fulfillment(of: [rejected], timeout: 3)
+            XCTAssertTrue(server.hasPendingPermission(sessionId: "fixture"))
+            let accepted = expectation(description: "new identity delivered")
+            server.respondToPermission(toolUseId: "same", sessionId: "fixture", expectedRequestID: try XCTUnwrap(newEvent.permissionRequestID), decision: "deny") { delivered in
+                XCTAssertTrue(delivered); accepted.fulfill()
+            }
+            await fulfillment(of: [accepted], timeout: 3)
+            XCTAssertEqual(try readResponse(client: newer).decision, "deny")
+        }
+    }
+
+    @MainActor
+    func testDelayedDeliveredOrFailedResponseDoesNotResolveReplacement() async throws {
+        for delivery in [true, false] {
+            let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+            let server = HookSocketServer(socketPath: path)
+            defer { server.stop(); unlink(path) }
+            let received = expectation(description: "response race registrations")
+            received.expectedFulfillmentCount = 2
+            await startPrivateServer(server, path: path, received: received)
+            var old = try connect(to: path)
+            var newer: Int32 = -1
+            defer { if old >= 0 { close(old) }; if newer >= 0 { close(newer) } }
+            let base = Date().addingTimeInterval(-30)
+            try sendPermission(client: old, sessionId: "fixture", toolUseId: "same", observedAt: base, source: "claude")
+            let oldEvent = try await waitForHook()
+            let oldID = try XCTUnwrap(oldEvent.permissionRequestID)
+            let store = try batchStore(canceller: HookPermissionCanceller(server: server))
+            await store.process(.hookReceived(oldEvent))
+            if !delivery { shutdown(old, SHUT_RDWR); close(old); old = -1 }
+            let responded = expectation(description: "old response callback captured")
+            server.respondToPermission(toolUseId: "same", sessionId: "fixture", expectedRequestID: oldID, decision: "allow") { success in
+                XCTAssertEqual(success, delivery); responded.fulfill()
+            }
+            await fulfillment(of: [responded], timeout: 3)
+            if delivery { XCTAssertEqual(try readResponse(client: old).decision, "allow") }
+            newer = try connect(to: path)
+            try sendPermission(client: newer, sessionId: "fixture", toolUseId: "same", observedAt: base, source: "claude")
+            let newEvent = try await waitForHook(replacing: oldID)
+            await fulfillment(of: [received], timeout: 3)
+            await store.process(.hookReceived(newEvent))
+            await store.process(delivery
+                ? .permissionApproved(sessionId: "fixture", toolUseId: "same", resolvedAt: Date(), requestID: oldID)
+                : .permissionSocketFailed(sessionId: "fixture", toolUseId: "same", resolvedAt: Date(), requestID: oldID))
+            let snapshot = await store.session(for: "fixture")
+            XCTAssertEqual(snapshot?.activePermission?.requestID, newEvent.permissionRequestID)
+            let accepted = expectation(description: "replacement response delivered")
+            respondToPermission(server: server, toolUseId: "same", sessionId: "fixture", decision: "deny") { success in
+                XCTAssertTrue(success); accepted.fulfill()
+            }
+            await fulfillment(of: [accepted], timeout: 3)
+            XCTAssertEqual(try readResponse(client: newer).decision, "deny")
+            await store.process(.permissionDenied(sessionId: "fixture", toolUseId: "same", reason: nil,
+                                                 resolvedAt: Date(), requestID: newEvent.permissionRequestID))
+            let resolved = await store.session(for: "fixture")
+            XCTAssertTrue(resolved?.pendingInteractions.items.isEmpty == true)
+        }
+    }
+
+    @MainActor
+    func testExpiredCallbackCarriesIdentityAndCannotConsumeReplacement() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "expiry race registrations")
+        received.expectedFulfillmentCount = 2
+        let expired = expectation(description: "actual old socket expiry")
+        await startPrivateServer(server, path: path, received: received, failed: expired)
+        let old = try connect(to: path)
+        var newer: Int32 = -1
+        defer { close(old); if newer >= 0 { close(newer) } }
+        let base = Date().addingTimeInterval(-30)
+        try sendPermission(client: old, sessionId: "fixture", toolUseId: "same", observedAt: base, source: "claude", responseTimeout: 1)
+        let oldEvent = try await waitForHook()
+        let oldID = try XCTUnwrap(oldEvent.permissionRequestID)
+        let store = try batchStore(canceller: HookPermissionCanceller(server: server))
+        await store.process(.hookReceived(oldEvent))
+        await fulfillment(of: [expired], timeout: 5)
+        assertEOF(client: old)
+        let failure = try XCTUnwrap(socketEvents.failureEvents().first)
+        guard case .permissionSocketFailed(_, _, let resolvedAt, let requestID) = failure else { return XCTFail("Missing failure") }
+        XCTAssertEqual(requestID, oldID)
+        XCTAssertGreaterThan(resolvedAt, base)
+        // The exact same failure still consumes its own current request.
+        let immediate = try batchStore(canceller: HookPermissionCanceller(server: server))
+        await immediate.process(.hookReceived(oldEvent))
+        await immediate.process(failure)
+        let expiredSnapshot = await immediate.session(for: "fixture")
+        XCTAssertTrue(expiredSnapshot?.pendingInteractions.items.isEmpty == true)
+        newer = try connect(to: path)
+        try sendPermission(client: newer, sessionId: "fixture", toolUseId: "same", observedAt: base, source: "claude")
+        let newEvent = try await waitForHook(replacing: oldID)
+        await fulfillment(of: [received], timeout: 3)
+        await store.process(.hookReceived(newEvent))
+        await store.process(failure)
+        let snapshot = await store.session(for: "fixture")
+        XCTAssertEqual(snapshot?.activePermission?.requestID, newEvent.permissionRequestID)
+        let accepted = expectation(description: "replacement remains responsive after expired callback")
+        respondToPermission(server: server, toolUseId: "same", sessionId: "fixture", decision: "deny") { delivered in
+            XCTAssertTrue(delivered); accepted.fulfill()
+        }
+        await fulfillment(of: [accepted], timeout: 3)
+        XCTAssertEqual(try readResponse(client: newer).decision, "deny")
+    }
+
+    @MainActor
+    func testObsoleteExpiryTimerDoesNotCloseReplacement() async throws {
+        let path = "/tmp/agent-notch-test-\(UUID().uuidString).sock"
+        let server = HookSocketServer(socketPath: path)
+        defer { server.stop(); unlink(path) }
+        let received = expectation(description: "expiry replacement registered")
+        received.expectedFulfillmentCount = 2
+        let noFailure = expectation(description: "obsolete timer cannot report replacement failure")
+        noFailure.isInverted = true
+        await startPrivateServer(server, path: path, received: received, failed: noFailure)
+        let old = try connect(to: path), newer = try connect(to: path)
+        defer { close(old); close(newer) }
+        try sendPermission(client: old, sessionId: "fixture", toolUseId: "same", source: "claude", responseTimeout: 1)
+        let oldEvent = try await waitForHook()
+        try sendPermission(client: newer, sessionId: "fixture", toolUseId: "same", source: "claude")
+        _ = try await waitForHook(replacing: try XCTUnwrap(oldEvent.permissionRequestID))
+        await fulfillment(of: [received], timeout: 3)
+        assertEOF(client: old)
+        await fulfillment(of: [noFailure], timeout: 3.5)
+        XCTAssertTrue(socketEvents.failureEvents().isEmpty)
+        let accepted = expectation(description: "replacement survives old timer")
+        respondToPermission(server: server, toolUseId: "same", sessionId: "fixture", decision: "deny") { delivered in
+            XCTAssertTrue(delivered); accepted.fulfill()
+        }
+        await fulfillment(of: [accepted], timeout: 3)
+        XCTAssertEqual(try readResponse(client: newer).decision, "deny")
+    }
+
     @MainActor
     func testRenderedButtonBindingsDoNotRetargetWhenQueueAdvances() {
         var displayed = PermissionContext(
@@ -58,6 +394,8 @@ final class PermissionRoutingTests: XCTestCase {
     private func connect(to path: String) throws -> Int32 {
         let client = socket(AF_UNIX, SOCK_STREAM, 0)
         guard client >= 0 else { throw POSIXError(.ENOTSOCK) }
+        var noSignal: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -90,7 +428,8 @@ final class PermissionRoutingTests: XCTestCase {
         sessionId: String,
         toolUseId: String,
         observedAt: Date? = Date(),
-        source: String = "codex"
+        source: String = "codex",
+        responseTimeout: Double = 10
     ) throws -> HookEvent {
         let event = HookEvent(
             sessionId: sessionId,
@@ -106,7 +445,7 @@ final class PermissionRoutingTests: XCTestCase {
             toolUseId: toolUseId,
             notificationType: nil,
             message: nil,
-            responseTimeoutSeconds: 10
+            responseTimeoutSeconds: responseTimeout
         )
         let data = try JSONEncoder().encode(event)
         try data.withUnsafeBytes { rawBuffer in
@@ -162,7 +501,9 @@ final class PermissionRoutingTests: XCTestCase {
 
         let received = expectation(description: "all permissions received")
         received.expectedFulfillmentCount = 3
+        let events = socketEvents
         server.start(onEvent: { event in
+            events.record(event)
             if event.expectsResponse { received.fulfill() }
         })
 
@@ -201,7 +542,7 @@ final class PermissionRoutingTests: XCTestCase {
         XCTAssertNotNil(pending.lastEventAt)
 
         let rejected = expectation(description: "cross-session response rejected")
-        server.respondToPermission(
+        respondToPermission(server: server,
             toolUseId: "tool-A2",
             sessionId: "session-B",
             decision: "allow"
@@ -220,7 +561,7 @@ final class PermissionRoutingTests: XCTestCase {
             ("tool-A2", "session-A", "deny"),
             ("shared-tool", "session-A", "allow")
         ] {
-            server.respondToPermission(
+            respondToPermission(server: server,
                 toolUseId: request.0,
                 sessionId: request.1,
                 decision: request.2
@@ -242,8 +583,17 @@ final class PermissionRoutingTests: XCTestCase {
         XCTAssertFalse(stopped.ownsSocket)
     }
 
-    private func startPrivateServer(_ server: HookSocketServer, path: String, received: XCTestExpectation) async {
-        server.start(onEvent: { event in if event.expectsResponse { received.fulfill() } })
+    private func startPrivateServer(_ server: HookSocketServer, path: String, received: XCTestExpectation,
+                                    failed: XCTestExpectation? = nil) async {
+        let events = socketEvents
+        events.reset()
+        server.start(onEvent: { event in
+            events.record(event)
+            if event.expectsResponse { received.fulfill() }
+        }, onPermissionFailure: { session, tool, request, time in
+            events.fail(session: session, tool: tool, request: request, at: time)
+            failed?.fulfill()
+        })
         let deadline = Date().addingTimeInterval(3)
         while (access(path, F_OK) != 0 || !server.diagnosticsInput().isRunning) && Date() < deadline {
             try? await Task.sleep(for: .milliseconds(10))
@@ -300,7 +650,7 @@ final class PermissionRoutingTests: XCTestCase {
             XCTAssertEqual(state?.pendingInteractions.toolUseIds, ["second"])
             assertEOF(client: first)
             let delivered = expectation(description: "next request remains deliverable")
-            server.respondToPermission(toolUseId: "second", sessionId: "fixture", decision: "deny") { success in
+            respondToPermission(server: server, toolUseId: "second", sessionId: "fixture", decision: "deny") { success in
                 XCTAssertTrue(success)
                 delivered.fulfill()
             }
@@ -327,7 +677,7 @@ final class PermissionRoutingTests: XCTestCase {
         assertEOF(client: old)
         server.cancelPendingPermission(sessionId: "fixture", toolUseId: "same", completedAt: base.addingTimeInterval(2))
         let delivered = expectation(description: "replacement survives old completion")
-        server.respondToPermission(toolUseId: "same", sessionId: "fixture", decision: "deny") { success in
+        respondToPermission(server: server, toolUseId: "same", sessionId: "fixture", decision: "deny") { success in
             XCTAssertTrue(success)
             delivered.fulfill()
         }
@@ -360,7 +710,7 @@ final class PermissionRoutingTests: XCTestCase {
             let state = await store.session(for: "fixture")
             XCTAssertEqual(state?.pendingInteractions.toolUseIds, ["pending"])
             let delivered = expectation(description: "rejected result leaves socket usable")
-            server.respondToPermission(toolUseId: "pending", sessionId: "fixture", decision: "deny") { success in
+            respondToPermission(server: server, toolUseId: "pending", sessionId: "fixture", decision: "deny") { success in
                 XCTAssertTrue(success)
                 delivered.fulfill()
             }
@@ -383,7 +733,7 @@ final class PermissionRoutingTests: XCTestCase {
         server.cancelPendingPermission(sessionId: "fixture", toolUseId: "pending", completedAt: Date().addingTimeInterval(-30))
         server.cancelPendingPermission(sessionId: "fixture", toolUseId: "pending", completedAt: Date(timeIntervalSince1970: .nan))
         let delivered = expectation(description: "request survives invalid boundaries")
-        server.respondToPermission(toolUseId: "pending", sessionId: "fixture", decision: "deny") { success in
+        respondToPermission(server: server, toolUseId: "pending", sessionId: "fixture", decision: "deny") { success in
             XCTAssertTrue(success)
             delivered.fulfill()
         }
@@ -429,7 +779,7 @@ final class PermissionRoutingTests: XCTestCase {
         assertEOF(client: clients[1])
         for (client, session, tool) in [(clients[2], "fixture", "new"), (clients[3], "other", "old-1")] {
             let delivered = expectation(description: "protected request delivered")
-            server.respondToPermission(toolUseId: tool, sessionId: session, decision: "deny") { success in
+            respondToPermission(server: server, toolUseId: tool, sessionId: session, decision: "deny") { success in
                 XCTAssertTrue(success); delivered.fulfill()
             }
             await fulfillment(of: [delivered], timeout: 3)
@@ -462,7 +812,7 @@ final class PermissionRoutingTests: XCTestCase {
             }
             assertEOF(client: old)
             let delivered = expectation(description: "new request remains after \(kind)")
-            server.respondToPermission(toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
+            respondToPermission(server: server, toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
                 XCTAssertTrue(success); delivered.fulfill()
             }
             await fulfillment(of: [delivered], timeout: 3)
@@ -490,7 +840,7 @@ final class PermissionRoutingTests: XCTestCase {
         let firstWireTime = Date(timeIntervalSince1970: base.addingTimeInterval(2).timeIntervalSince1970)
         XCTAssertEqual(state?.completedAt, firstWireTime)
         let delivered = expectation(description: "duplicate Stop keeps newer socket")
-        server.respondToPermission(toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
+        respondToPermission(server: server, toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
             XCTAssertTrue(success); delivered.fulfill()
         }
         await fulfillment(of: [delivered], timeout: 3)
@@ -535,7 +885,7 @@ final class PermissionRoutingTests: XCTestCase {
         let recreated = await store.session(for: "fixture")
         XCTAssertEqual(recreated?.pendingInteractions.toolUseIds, ["new"])
         let delivered = expectation(description: "later request survives delayed local end")
-        server.respondToPermission(toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
+        respondToPermission(server: server, toolUseId: "new", sessionId: "fixture", decision: "deny") { success in
             XCTAssertTrue(success); delivered.fulfill()
         }
         await fulfillment(of: [delivered], timeout: 3)

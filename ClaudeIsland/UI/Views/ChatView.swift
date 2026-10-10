@@ -864,9 +864,9 @@ struct ChatView: View {
         ChatApprovalBar(
             tool: permission.toolName,
             toolInput: permission.formattedInput,
-            onApproveOnce: permission.bindAction { approvePermission(expectedToolUseId: $0) },
-            onAutoApprove: permission.bindAction { autoApprovePermission(expectedToolUseId: $0) },
-            onDeny: permission.bindAction { denyPermission(expectedToolUseId: $0) }
+            onApproveOnce: permission.bindRequestAction { approvePermission(expectedToolUseId: $0, expectedRequestID: $1) },
+            onAutoApprove: permission.bindRequestAction { autoApprovePermission(expectedToolUseId: $0, expectedRequestID: $1) },
+            onDeny: permission.bindRequestAction { denyPermission(expectedToolUseId: $0, expectedRequestID: $1) }
         )
     }
 
@@ -885,6 +885,7 @@ struct ChatView: View {
                     sessionMonitor.answerQuestions(
                         sessionId: sessionId,
                         expectedToolUseId: permission.toolUseId,
+                        expectedRequestID: permission.requestID,
                         expectedQuestions: permission.interactiveQuestions,
                         answers: answers
                     )
@@ -892,10 +893,11 @@ struct ChatView: View {
                 onApprovePlan: {
                     sessionMonitor.approvePlan(
                         sessionId: sessionId,
-                        expectedToolUseId: permission.toolUseId
+                        expectedToolUseId: permission.toolUseId,
+                        expectedRequestID: permission.requestID
                     )
                 },
-                onDeny: permission.bindAction { denyPermission(expectedToolUseId: $0) },
+                onDeny: permission.bindRequestAction { denyPermission(expectedToolUseId: $0, expectedRequestID: $1) },
                 onGoToTerminal: { focusTerminal() }
             )
         }
@@ -936,25 +938,28 @@ struct ChatView: View {
         }
     }
 
-    private func approvePermission(expectedToolUseId: String) {
-        sessionMonitor.approvePermission(
-            sessionId: sessionId,
-            expectedToolUseId: expectedToolUseId
-        )
-    }
-
-    private func autoApprovePermission(expectedToolUseId: String) {
+    private func approvePermission(expectedToolUseId: String, expectedRequestID: UUID?) {
         sessionMonitor.approvePermission(
             sessionId: sessionId,
             expectedToolUseId: expectedToolUseId,
+            expectedRequestID: expectedRequestID
+        )
+    }
+
+    private func autoApprovePermission(expectedToolUseId: String, expectedRequestID: UUID?) {
+        sessionMonitor.approvePermission(
+            sessionId: sessionId,
+            expectedToolUseId: expectedToolUseId,
+            expectedRequestID: expectedRequestID,
             enableAutoApproval: true
         )
     }
 
-    private func denyPermission(expectedToolUseId: String) {
+    private func denyPermission(expectedToolUseId: String, expectedRequestID: UUID?) {
         sessionMonitor.denyPermission(
             sessionId: sessionId,
             expectedToolUseId: expectedToolUseId,
+            expectedRequestID: expectedRequestID,
             reason: nil
         )
     }

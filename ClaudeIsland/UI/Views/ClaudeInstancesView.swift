@@ -166,7 +166,8 @@ struct ClaudeInstancesView: View {
               let toolUseId = session.pendingToolId else { return }
         sessionMonitor.approvePermission(
             sessionId: session.sessionId,
-            expectedToolUseId: toolUseId
+            expectedToolUseId: toolUseId,
+            expectedRequestID: session.activePermission?.requestID
         )
     }
 
@@ -175,6 +176,7 @@ struct ClaudeInstancesView: View {
         sessionMonitor.denyPermission(
             sessionId: session.sessionId,
             expectedToolUseId: toolUseId,
+            expectedRequestID: session.activePermission?.requestID,
             reason: nil
         )
     }

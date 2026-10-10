@@ -176,26 +176,29 @@ actor SessionStore {
         case .hookReceived(let hookEvent):
             await processHookEvent(hookEvent)
 
-        case .permissionApproved(let sessionId, let toolUseId, let resolvedAt):
+        case .permissionApproved(let sessionId, let toolUseId, let resolvedAt, let requestID):
             await processPermissionApproved(
                 sessionId: sessionId,
                 toolUseId: toolUseId,
-                resolvedAt: resolvedAt
+                resolvedAt: resolvedAt,
+                requestID: requestID
             )
 
-        case .permissionDenied(let sessionId, let toolUseId, let reason, let resolvedAt):
+        case .permissionDenied(let sessionId, let toolUseId, let reason, let resolvedAt, let requestID):
             await processPermissionDenied(
                 sessionId: sessionId,
                 toolUseId: toolUseId,
                 reason: reason,
-                resolvedAt: resolvedAt
+                resolvedAt: resolvedAt,
+                requestID: requestID
             )
 
-        case .permissionSocketFailed(let sessionId, let toolUseId, let resolvedAt):
+        case .permissionSocketFailed(let sessionId, let toolUseId, let resolvedAt, let requestID):
             await processSocketFailure(
                 sessionId: sessionId,
                 toolUseId: toolUseId,
-                resolvedAt: resolvedAt
+                resolvedAt: resolvedAt,
+                requestID: requestID
             )
 
         case .fileUpdated(let payload):
@@ -580,7 +583,8 @@ actor SessionStore {
             toolUseId: toolUseId,
             toolName: toolName,
             toolInput: event.toolInput,
-            receivedAt: observedAt
+            receivedAt: observedAt,
+            requestID: event.permissionRequestID
         )
         session.pendingInteractions.enqueue(context)
         session.toolTracker.startTool(id: toolUseId, name: toolName)
@@ -858,10 +862,13 @@ actor SessionStore {
     private func processPermissionApproved(
         sessionId: String,
         toolUseId: String,
-        resolvedAt: Date
+        resolvedAt: Date,
+        requestID: UUID?
     ) async {
         guard var session = sessions[sessionId],
-              session.pendingInteractions.contains(toolUseId: toolUseId) else {
+              session.pendingInteractions.items.contains(where: {
+                  $0.toolUseId == toolUseId && $0.requestID == requestID
+              }) else {
             return
         }
 
@@ -969,10 +976,13 @@ actor SessionStore {
         sessionId: String,
         toolUseId: String,
         reason: String?,
-        resolvedAt: Date
+        resolvedAt: Date,
+        requestID: UUID?
     ) async {
         guard var session = sessions[sessionId],
-              session.pendingInteractions.contains(toolUseId: toolUseId) else {
+              session.pendingInteractions.items.contains(where: {
+                  $0.toolUseId == toolUseId && $0.requestID == requestID
+              }) else {
             return
         }
 
@@ -997,10 +1007,13 @@ actor SessionStore {
     private func processSocketFailure(
         sessionId: String,
         toolUseId: String,
-        resolvedAt: Date
+        resolvedAt: Date,
+        requestID: UUID?
     ) async {
         guard var session = sessions[sessionId],
-              session.pendingInteractions.contains(toolUseId: toolUseId) else {
+              session.pendingInteractions.items.contains(where: {
+                  $0.toolUseId == toolUseId && $0.requestID == requestID
+              }) else {
             return
         }
 
