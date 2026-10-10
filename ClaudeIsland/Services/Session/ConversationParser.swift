@@ -2254,8 +2254,8 @@ actor ConversationParser {
     /// Prefer the nested path; fall back to the flat path if only it exists
     /// (cross-version compatibility). If neither exists yet (file still being
     /// created) we return the nested path as the modern default.
-    nonisolated static func subagentFilePath(sessionId: String, agentId: String, projectDir: String) -> String {
-        let base = ClaudePaths.projectsDir.path + "/" + projectDir
+    nonisolated static func subagentFilePath(sessionId: String, agentId: String, projectDir: String, projectsRoot: URL? = nil) -> String {
+        let base = (projectsRoot ?? ClaudePaths.projectsDir).path + "/" + projectDir
         let nested = base + "/" + sessionId + "/subagents/agent-" + agentId + ".jsonl"
         let flat = base + "/agent-" + agentId + ".jsonl"
 
@@ -2695,7 +2695,10 @@ actor ConversationParser {
         guard !agentId.isEmpty else { return [] }
 
         let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
-        let agentFile = Self.subagentFilePath(sessionId: sessionId, agentId: agentId, projectDir: projectDir)
+        let agentFile = Self.subagentFilePath(
+            sessionId: sessionId, agentId: agentId, projectDir: projectDir,
+            projectsRoot: claudeProjectsRootOverride
+        )
 
         guard FileManager.default.fileExists(atPath: agentFile),
               let content = try? String(contentsOfFile: agentFile, encoding: .utf8) else {

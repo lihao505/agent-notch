@@ -119,6 +119,127 @@ final class SessionStoreTerminalToolTests: XCTestCase {
         XCTAssertEqual(session.phase, .processing)
     }
 
+    private func nestedStatuses(in session: SessionState?, parentID: String = "child") throws -> [String: ToolStatus] {
+        let parent = try XCTUnwrap(session?.chatItems.first(where: { $0.id == parentID }))
+        guard case .toolCall(let tool) = parent.type else {
+            XCTFail("Missing container tool")
+            return [:]
+        }
+        return Dictionary(uniqueKeysWithValues: tool.subagentTools.map { ($0.id, $0.status) })
+    }
+
+    func testTerminalTurnClosesNestedRunningToolsAndPreservesKnownResults() async throws {
+        for interrupts in [false, true] {
+            let store = try store()
+            let start = Date().addingTimeInterval(-60)
+            await store.process(hook("UserPromptSubmit", at: start))
+            await store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+            for (offset, id) in ["done", "failed", "dangling"].enumerated() {
+                await store.process(toolHook("PreToolUse", tool: "Read", id: id, at: start.addingTimeInterval(Double(offset + 2))))
+            }
+            await store.process(toolHook("PostToolUse", tool: "Read", id: "done", at: start.addingTimeInterval(5)))
+            await store.process(toolHook("PostToolUseFailure", tool: "Read", id: "failed", at: start.addingTimeInterval(6)))
+            if interrupts {
+                await store.process(.interruptDetected(sessionId: sessionID, observedAt: start.addingTimeInterval(7)))
+            } else {
+                await store.process(hook("Stop", at: start.addingTimeInterval(7)))
+            }
+            let session = await store.session(for: sessionID)
+            XCTAssertEqual(try nestedStatuses(in: session), ["done": .success, "failed": .error, "dangling": .interrupted])
+            XCTAssertEqual(session?.phase, interrupts ? .idle : .waitingForInput)
+            XCTAssertFalse(try XCTUnwrap(session).subagentState.hasActiveSubagent)
+        }
+    }
+
+    func testTerminalTurnClosesNestedPlaceholderEvenWhenParentAlreadySucceeded() async throws {
+        let store = try store()
+        let start = Date().addingTimeInterval(-60)
+        await store.process(hook("UserPromptSubmit", at: start))
+        await store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+        await store.process(toolHook("PreToolUse", tool: "Read", id: "missing-result", at: start.addingTimeInterval(2)))
+        await store.process(toolHook("PostToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(3)))
+        await store.process(hook("Stop", at: start.addingTimeInterval(4)))
+        let session = await store.session(for: sessionID)
+        XCTAssertEqual(status("child", in: session), .success)
+        XCTAssertEqual(try nestedStatuses(in: session)["missing-result"], .interrupted)
+    }
+
+    func testLateSubagentFileCannotRestoreRunningToolsAcrossTerminalBoundary() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-notch-nested-file-\(UUID().uuidString)")
+        let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
+        let directory = root.appendingPathComponent(projectDir).appendingPathComponent(sessionID).appendingPathComponent("subagents")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let start = Date().addingTimeInterval(-60)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let rows: [[String: Any]] = [
+            ["timestamp": formatter.string(from: start.addingTimeInterval(2)), "message": ["content": [
+                ["type": "tool_use", "id": "file-done", "name": "Read", "input": [:]],
+                ["type": "tool_use", "id": "file-dangling", "name": "Read", "input": [:]]
+            ]]],
+            ["message": ["content": [["type": "tool_result", "tool_use_id": "file-done", "content": "fixture result"]]]]
+        ]
+        let data = try rows.reduce(into: Data()) { data, row in
+            data.append(try JSONSerialization.data(withJSONObject: row))
+            data.append(0x0A)
+        }
+        try data.write(to: directory.appendingPathComponent("agent-file-fixture.jsonl"))
+        let parser = ConversationParser(codexSessionsRoot: root, claudeProjectsRoot: root)
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                 conversationParser: parser, processTreeProvider: { _ in [:] })
+        let result = ToolResultData.task(TaskResult(agentId: "file-fixture", status: "running", content: "",
+                                                  prompt: nil, totalDurationMs: nil, totalTokens: nil, totalToolUseCount: nil))
+        let info = ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil,
+                                    lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil)
+        let update = SessionEvent.fileUpdated(FileUpdatePayload(
+            sessionId: sessionID, cwd: cwd, messages: [], isIncremental: true,
+            completedToolIds: [], toolResults: [:], structuredResults: ["child": result],
+            conversationInfoSnapshot: info
+        ))
+        await store.process(hook("UserPromptSubmit", at: start))
+        await store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+        await store.process(update)
+        let active = await store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: active), ["file-done": .success, "file-dangling": .running])
+        await store.process(hook("Stop", at: start.addingTimeInterval(3)))
+        await store.process(update)
+        let stopped = await store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: stopped), ["file-done": .success, "file-dangling": .interrupted])
+        XCTAssertEqual(stopped?.phase, .waitingForInput)
+        // A genuine next turn may run its own tools, but loading the old
+        // parent's file must not undo that parent's terminal placeholder.
+        await store.process(hook("UserPromptSubmit", at: start.addingTimeInterval(4)))
+        await store.process(toolHook("PreToolUse", tool: "Read", id: "next-tool", at: start.addingTimeInterval(5)))
+        await store.process(update)
+        let resumed = await store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: resumed)["file-dangling"], .interrupted)
+        XCTAssertEqual(status("next-tool", in: resumed), .running)
+        XCTAssertEqual(resumed?.phase, .processing)
+
+        var refreshedData = data
+        refreshedData.append(try JSONSerialization.data(withJSONObject: [
+            "timestamp": formatter.string(from: start.addingTimeInterval(6)),
+            "message": ["content": [["type": "tool_use", "id": "current-inner", "name": "Read", "input": [:]]]]
+        ]))
+        refreshedData.append(0x0A)
+        try refreshedData.write(to: directory.appendingPathComponent("agent-file-fixture.jsonl"))
+        await store.process(toolHook("PreToolUse", tool: "Agent", id: "fresh-child", at: start.addingTimeInterval(6)))
+        await store.process(.fileUpdated(FileUpdatePayload(
+            sessionId: sessionID, cwd: cwd, messages: [], isIncremental: true,
+            completedToolIds: [], toolResults: [:], structuredResults: ["child": result, "fresh-child": result],
+            conversationInfoSnapshot: info
+        )))
+        let current = await store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: current)["current-inner"], .interrupted,
+                       "A later file row is not permission to reopen a closed container")
+        XCTAssertEqual(try nestedStatuses(in: current, parentID: "fresh-child"),
+                       ["file-done": .success, "file-dangling": .interrupted, "current-inner": .running],
+                       "An active container must keep its post-boundary tools running")
+        XCTAssertEqual(status("fresh-child", in: current), .running)
+        XCTAssertEqual(current?.phase, .processing)
+    }
+
     func testLateHistoryCannotCreateRunningToolAfterStop() async throws {
         let store = try store()
         let start = Date().addingTimeInterval(-60)

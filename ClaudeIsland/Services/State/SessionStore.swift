@@ -1244,6 +1244,12 @@ actor SessionStore {
                 continue
             }
             tool.subagentTools = decoration.tools
+            closeUnfinishedSubagentTools(
+                in: &tool,
+                through: latestSession.toolTracker.terminalBoundaryAt,
+                closesAll: latestSession.completedAt != nil ||
+                    (tool.status != .running && tool.status != .waitingForApproval)
+            )
             latestSession.chatItems[index] = ChatHistoryItem(
                 id: decoration.taskToolId,
                 type: .toolCall(tool),
@@ -1464,13 +1470,17 @@ actor SessionStore {
     private func finalizeDanglingTools(in session: inout SessionState, terminalAt: Date) {
         session.toolTracker.recordTerminalBoundary(terminalAt)
         for index in session.chatItems.indices {
-            guard case .toolCall(var tool) = session.chatItems[index].type,
-                  tool.status == .running ||
-                    tool.status == .waitingForApproval else {
+            guard case .toolCall(var tool) = session.chatItems[index].type else {
                 continue
             }
-            tool.status = .interrupted
-            tool.isTerminalPlaceholder = true
+            // A completed container can still contain an unfinished child
+            // placeholder if its result was dropped. Close nested indicators
+            // without changing the container's known success/failure.
+            closeUnfinishedSubagentTools(in: &tool, through: terminalAt, closesAll: true)
+            if tool.status == .running || tool.status == .waitingForApproval {
+                tool.status = .interrupted
+                tool.isTerminalPlaceholder = true
+            }
             session.chatItems[index] = ChatHistoryItem(
                 id: session.chatItems[index].id,
                 type: .toolCall(tool),
@@ -1480,6 +1490,23 @@ actor SessionStore {
         session.toolTracker.inProgress.removeAll()
         session.subagentState = SubagentState()
         session.pendingInteractions.removeAll()
+    }
+
+    /// Apply the latest accepted boundary after awaited file reads as well as
+    /// at terminal events. Actual completed results remain authoritative.
+    private func closeUnfinishedSubagentTools(
+        in tool: inout ToolCallItem,
+        through terminalAt: Date?,
+        closesAll: Bool
+    ) {
+        for index in tool.subagentTools.indices {
+            let nested = tool.subagentTools[index]
+            guard nested.status == .running || nested.status == .waitingForApproval,
+                  closesAll || terminalAt.map({ nested.timestamp <= $0 }) == true else {
+                continue
+            }
+            tool.subagentTools[index].status = .interrupted
+        }
     }
 
     // MARK: - Interrupt Processing
