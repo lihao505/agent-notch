@@ -1243,7 +1243,28 @@ actor SessionStore {
             }), case .toolCall(var tool) = latestSession.chatItems[index].type else {
                 continue
             }
-            tool.subagentTools = decoration.tools
+            let knownTools = Dictionary(
+                tool.subagentTools.map { ($0.id, $0) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+            var mergedTools = decoration.tools.map { parsed in
+                var merged = parsed
+                // Missing JSONL results are not evidence that a hook's known
+                // completion or terminal placeholder became running again.
+                if parsed.status == .running,
+                   let known = knownTools[parsed.id],
+                   known.status != .running && known.status != .waitingForApproval {
+                    merged.status = known.status
+                }
+                return merged
+            }
+            var mergedIDs = Set(mergedTools.map(\.id))
+            // A file snapshot may predate hooks for additional inner tools.
+            // Only explicit parent/history reconciliation may remove them.
+            for known in tool.subagentTools where mergedIDs.insert(known.id).inserted {
+                mergedTools.append(knownTools[known.id] ?? known)
+            }
+            tool.subagentTools = mergedTools
             closeUnfinishedSubagentTools(
                 in: &tool,
                 through: latestSession.toolTracker.terminalBoundaryAt,
@@ -1317,7 +1338,7 @@ actor SessionStore {
                     id: info.id,
                     name: info.name,
                     input: info.input,
-                    status: info.isCompleted ? .success : .running,
+                    status: info.status,
                     timestamp: parseTimestamp(info.timestamp) ?? Date()
                 )
             }

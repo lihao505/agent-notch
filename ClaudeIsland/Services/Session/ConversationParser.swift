@@ -2704,12 +2704,17 @@ actor ConversationParser {
               let content = try? String(contentsOfFile: agentFile, encoding: .utf8) else {
             return []
         }
+        return Self.parseSubagentToolContent(content)
+    }
 
+    /// Both actor and watcher reads share result classification and tool order.
+    nonisolated private static func parseSubagentToolContent(_ content: String) -> [SubagentToolInfo] {
         var tools: [SubagentToolInfo] = []
         var seenToolIds: Set<String> = []
-        var completedToolIds: Set<String> = []
+        var completionStatuses: [String: ToolStatus] = [:]
+        let lines = content.components(separatedBy: "\n")
 
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
+        for line in lines where !line.isEmpty {
             if line.contains("\"tool_result\""),
                let lineData = line.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
@@ -2718,13 +2723,23 @@ actor ConversationParser {
                 for block in contentArray {
                     if block["type"] as? String == "tool_result",
                        let toolUseId = block["tool_use_id"] as? String {
-                        completedToolIds.insert(toolUseId)
+                        let resultContent = block["content"] as? String ??
+                            (block["content"] as? [[String: Any]])?.compactMap {
+                                $0["type"] as? String == "text" ? $0["text"] as? String : nil
+                            }.joined(separator: "\n")
+                        let result = ToolResult(
+                            content: resultContent, stdout: nil, stderr: nil,
+                            isError: block["is_error"] as? Bool ?? false
+                        )
+                        completionStatuses[toolUseId] = ToolCompletionResult.from(
+                            parserResult: result, structuredResult: nil
+                        ).status
                     }
                 }
             }
         }
 
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
+        for line in lines where !line.isEmpty {
             guard line.contains("\"tool_use\""),
                   let lineData = line.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
@@ -2756,14 +2771,13 @@ actor ConversationParser {
                     }
                 }
 
-                let isCompleted = completedToolIds.contains(toolId)
                 let timestamp = json["timestamp"] as? String
 
                 tools.append(SubagentToolInfo(
                     id: toolId,
                     name: toolName,
                     input: input,
-                    isCompleted: isCompleted,
+                    completionStatus: completionStatuses[toolId],
                     timestamp: timestamp
                 ))
             }
@@ -2778,89 +2792,28 @@ struct SubagentToolInfo: Sendable {
     let id: String
     let name: String
     let input: [String: String]
-    let isCompleted: Bool
+    let completionStatus: ToolStatus?
     let timestamp: String?
+
+    nonisolated var isCompleted: Bool { completionStatus != nil }
+    nonisolated var status: ToolStatus { completionStatus ?? .running }
 }
 
 // MARK: - Static Subagent Tools Parsing
 
 extension ConversationParser {
     /// Parse subagent tools from an agent JSONL file (static, synchronous version)
-    nonisolated static func parseSubagentToolsSync(sessionId: String, agentId: String, cwd: String) -> [SubagentToolInfo] {
+    nonisolated static func parseSubagentToolsSync(sessionId: String, agentId: String, cwd: String, projectsRoot: URL? = nil) -> [SubagentToolInfo] {
         guard !agentId.isEmpty else { return [] }
 
         let projectDir = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
-        let agentFile = subagentFilePath(sessionId: sessionId, agentId: agentId, projectDir: projectDir)
+        let agentFile = subagentFilePath(sessionId: sessionId, agentId: agentId, projectDir: projectDir, projectsRoot: projectsRoot)
 
         guard FileManager.default.fileExists(atPath: agentFile),
               let content = try? String(contentsOfFile: agentFile, encoding: .utf8) else {
             return []
         }
 
-        var tools: [SubagentToolInfo] = []
-        var seenToolIds: Set<String> = []
-        var completedToolIds: Set<String> = []
-
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
-            if line.contains("\"tool_result\""),
-               let lineData = line.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-               let messageDict = json["message"] as? [String: Any],
-               let contentArray = messageDict["content"] as? [[String: Any]] {
-                for block in contentArray {
-                    if block["type"] as? String == "tool_result",
-                       let toolUseId = block["tool_use_id"] as? String {
-                        completedToolIds.insert(toolUseId)
-                    }
-                }
-            }
-        }
-
-        for line in content.components(separatedBy: "\n") where !line.isEmpty {
-            guard line.contains("\"tool_use\""),
-                  let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let messageDict = json["message"] as? [String: Any],
-                  let contentArray = messageDict["content"] as? [[String: Any]] else {
-                continue
-            }
-
-            for block in contentArray {
-                guard block["type"] as? String == "tool_use",
-                      let toolId = block["id"] as? String,
-                      let toolName = block["name"] as? String,
-                      !seenToolIds.contains(toolId) else {
-                    continue
-                }
-
-                seenToolIds.insert(toolId)
-
-                var input: [String: String] = [:]
-                if let inputDict = block["input"] as? [String: Any] {
-                    for (key, value) in inputDict {
-                        if let strValue = value as? String {
-                            input[key] = strValue
-                        } else if let intValue = value as? Int {
-                            input[key] = String(intValue)
-                        } else if let boolValue = value as? Bool {
-                            input[key] = boolValue ? "true" : "false"
-                        }
-                    }
-                }
-
-                let isCompleted = completedToolIds.contains(toolId)
-                let timestamp = json["timestamp"] as? String
-
-                tools.append(SubagentToolInfo(
-                    id: toolId,
-                    name: toolName,
-                    input: input,
-                    isCompleted: isCompleted,
-                    timestamp: timestamp
-                ))
-            }
-        }
-
-        return tools
+        return parseSubagentToolContent(content)
     }
 }

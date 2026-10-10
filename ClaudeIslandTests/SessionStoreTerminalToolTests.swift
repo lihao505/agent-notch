@@ -128,6 +128,138 @@ final class SessionStoreTerminalToolTests: XCTestCase {
         return Dictionary(uniqueKeysWithValues: tool.subagentTools.map { ($0.id, $0.status) })
     }
 
+    private func resultFixture(ids: [String], results: [[String: Any]] = []) throws ->
+        (store: SessionStore, file: URL, update: SessionEvent, parser: ConversationParser, root: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-notch-child-results-\(UUID().uuidString)")
+        let project = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
+        let directory = root.appendingPathComponent(project).appendingPathComponent(sessionID).appendingPathComponent("subagents")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let rows: [[String: Any]] = [
+            ["timestamp": formatter.string(from: Date().addingTimeInterval(-30)), "message": ["content": ids.map {
+                ["type": "tool_use", "id": $0, "name": "Read", "input": [:]] as [String: Any]
+            }]],
+            ["message": ["content": results]]
+        ]
+        let data = try rows.reduce(into: Data()) { data, row in
+            data.append(try JSONSerialization.data(withJSONObject: row)); data.append(0x0A)
+        }
+        let file = directory.appendingPathComponent("agent-result-fixture.jsonl")
+        try data.write(to: file)
+        let parser = ConversationParser(codexSessionsRoot: root, claudeProjectsRoot: root)
+        let store = SessionStore(persistenceEnabled: false, fileSyncEnabled: false,
+                                 conversationParser: parser, processTreeProvider: { _ in [:] })
+        let info = ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil,
+                                    lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil)
+        let result = ToolResultData.task(TaskResult(agentId: "result-fixture", status: "completed", content: "",
+                                                  prompt: nil, totalDurationMs: nil, totalTokens: nil, totalToolUseCount: nil))
+        let update = SessionEvent.fileUpdated(FileUpdatePayload(
+            sessionId: sessionID, cwd: cwd, messages: [], isIncremental: true,
+            completedToolIds: [], toolResults: [:], structuredResults: ["child": result],
+            conversationInfoSnapshot: info
+        ))
+        return (store, file, update, parser, root)
+    }
+
+    func testSubagentFileDistinguishesFailureInterruptionAndMissingResult() async throws {
+        let fixture = try resultFixture(ids: ["ok", "error", "interrupt", "reject", "quoted", "pending"], results: [
+            ["type": "tool_result", "tool_use_id": "ok", "content": "fixture ok"],
+            ["type": "tool_result", "tool_use_id": "error", "is_error": true, "content": "fixture failed"],
+            ["type": "tool_result", "tool_use_id": "interrupt", "is_error": true, "content": "Interrupted by user"],
+            ["type": "tool_result", "tool_use_id": "reject", "is_error": true, "content": "user doesn't want to proceed"],
+            ["type": "tool_result", "tool_use_id": "quoted", "is_error": false, "content": "Interrupted by user"]
+        ])
+        let start = Date().addingTimeInterval(-60)
+        await fixture.store.process(hook("UserPromptSubmit", at: start))
+        await fixture.store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+        await fixture.store.process(fixture.update)
+        let session = await fixture.store.session(for: sessionID)
+        let statuses = try nestedStatuses(in: session)
+        for (id, expected): (String, ToolStatus) in ["ok": .success, "error": .error, "interrupt": .interrupted,
+                                                   "reject": .interrupted, "quoted": .success, "pending": .running] {
+            XCTAssertEqual(statuses[id], expected, "Wrong status for \(id)")
+        }
+        XCTAssertEqual(session?.phase, .processing)
+    }
+
+    func testResultlessSubagentFileCannotOverwriteKnownHookCompletion() async throws {
+        let fixture = try resultFixture(ids: ["known-ok", "known-error", "unresolved"])
+        let start = Date().addingTimeInterval(-60)
+        await fixture.store.process(hook("UserPromptSubmit", at: start))
+        await fixture.store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+        for (offset, id) in ["known-ok", "known-error", "unresolved", "hook-only"].enumerated() {
+            await fixture.store.process(toolHook("PreToolUse", tool: "Read", id: id, at: start.addingTimeInterval(Double(offset + 2))))
+        }
+        await fixture.store.process(toolHook("PostToolUse", tool: "Read", id: "known-ok", at: start.addingTimeInterval(5)))
+        await fixture.store.process(toolHook("PostToolUseFailure", tool: "Read", id: "known-error", at: start.addingTimeInterval(6)))
+        await fixture.store.process(toolHook("PostToolUse", tool: "Read", id: "hook-only", at: start.addingTimeInterval(7)))
+        await fixture.store.process(fixture.update)
+        let session = await fixture.store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: session), ["known-ok": .success, "known-error": .error,
+                                                      "unresolved": .running, "hook-only": .success])
+        XCTAssertEqual(session?.phase, .processing)
+    }
+
+    func testSubagentParserActorAndSyncAgreeForNestedAndLegacyFiles() async throws {
+        let fixture = try resultFixture(ids: ["error", "array-interrupt", "pending"], results: [
+            ["type": "tool_result", "tool_use_id": "error", "is_error": true, "content": "fixture failure"],
+            ["type": "tool_result", "tool_use_id": "array-interrupt", "is_error": true,
+             "content": [["type": "text", "text": "Interrupted by user"]]]
+        ])
+        let duplicate: [String: Any] = ["message": ["content": [
+            ["type": "tool_use", "id": "error", "name": "Bash", "input": [:]]
+        ]]]
+        var data = try Data(contentsOf: fixture.file)
+        data.append(Data("not JSON\n".utf8))
+        data.append(try JSONSerialization.data(withJSONObject: duplicate)); data.append(0x0A)
+        data.append(Data("{truncated".utf8))
+        try data.write(to: fixture.file)
+        for legacy in [false, true] {
+            if legacy {
+                let project = cwd.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ".", with: "-")
+                try FileManager.default.moveItem(at: fixture.file,
+                    to: fixture.root.appendingPathComponent(project).appendingPathComponent("agent-result-fixture.jsonl"))
+            }
+            let actorTools = await fixture.parser.parseSubagentTools(sessionId: sessionID, agentId: "result-fixture", cwd: cwd)
+            let syncTools = ConversationParser.parseSubagentToolsSync(sessionId: sessionID, agentId: "result-fixture",
+                                                                      cwd: cwd, projectsRoot: fixture.root)
+            XCTAssertEqual(actorTools.map(\.id), ["error", "array-interrupt", "pending"])
+            XCTAssertEqual(syncTools.map(\.id), actorTools.map(\.id))
+            XCTAssertEqual(actorTools.map(\.status), [.error, .interrupted, .running])
+            XCTAssertEqual(syncTools.map(\.status), actorTools.map(\.status))
+            XCTAssertEqual(syncTools.map(\.isCompleted), [true, true, false])
+            XCTAssertEqual(actorTools.first?.name, "Read", "Do not duplicate or replace an existing tool_use ID")
+            XCTAssertNotNil(actorTools.first?.timestamp)
+        }
+    }
+
+    func testActualSubagentFileResultResolvesTerminalPlaceholderWithoutResumingTurn() async throws {
+        let fixture = try resultFixture(ids: ["late-ok", "late-error", "late-interrupt"])
+        let start = Date().addingTimeInterval(-60)
+        await fixture.store.process(hook("UserPromptSubmit", at: start))
+        await fixture.store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+        await fixture.store.process(fixture.update)
+        await fixture.store.process(hook("Stop", at: start.addingTimeInterval(40)))
+        let before = await fixture.store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: before), ["late-ok": .interrupted, "late-error": .interrupted, "late-interrupt": .interrupted])
+        let row: [String: Any] = ["message": ["content": [
+            ["type": "tool_result", "tool_use_id": "late-ok", "content": "fixture success"],
+            ["type": "tool_result", "tool_use_id": "late-error", "is_error": true, "content": "fixture failed"],
+            ["type": "tool_result", "tool_use_id": "late-interrupt", "is_error": true, "content": "Interrupted by user"]
+        ]]]
+        var data = try Data(contentsOf: fixture.file)
+        data.append(try JSONSerialization.data(withJSONObject: row)); data.append(0x0A)
+        try data.write(to: fixture.file)
+        await fixture.store.process(fixture.update)
+        let resolved = await fixture.store.session(for: sessionID)
+        XCTAssertEqual(try nestedStatuses(in: resolved), ["late-ok": .success, "late-error": .error, "late-interrupt": .interrupted])
+        XCTAssertEqual(resolved?.phase, .waitingForInput)
+        XCTAssertEqual(resolved?.completedAt, before?.completedAt)
+        XCTAssertEqual(status("child", in: resolved), .interrupted)
+    }
+
     func testTerminalTurnClosesNestedRunningToolsAndPreservesKnownResults() async throws {
         for interrupts in [false, true] {
             let store = try store()
