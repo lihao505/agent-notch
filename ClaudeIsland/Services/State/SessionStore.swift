@@ -773,9 +773,9 @@ actor SessionStore {
                 syncSubagentToolsToChatItems(session: &session)
             }
 
-        case "PostToolUse":
+        case "PostToolUse", "PostToolUseFailure":
             if ToolCallItem.isSubagentContainerName(event.tool), let toolUseId = event.toolUseId {
-                // Agent tool returned — the subagent has finished. Stop
+                // Either success or failure ends this exact Task/Agent. Stop
                 // tracking so subsequent tools in the parent turn don't get
                 // attached to this dead task.
                 session.subagentState.stopTask(taskToolId: toolUseId)
@@ -784,7 +784,10 @@ actor SessionStore {
                       session.subagentState.hasActiveSubagent {
                 // A subagent's inner tool completed. Update its status in the
                 // parent's subagent list and sync.
-                session.subagentState.updateSubagentToolStatus(toolId: toolUseId, status: .success)
+                session.subagentState.updateSubagentToolStatus(
+                    toolId: toolUseId,
+                    status: event.event == "PostToolUse" ? .success : .error
+                )
                 syncSubagentToolsToChatItems(session: &session)
             }
 

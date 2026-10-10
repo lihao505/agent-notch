@@ -52,6 +52,73 @@ final class SessionStoreTerminalToolTests: XCTestCase {
         return tool.status
     }
 
+    private func toolHook(_ event: String, tool name: String, id: String, at time: Date) -> SessionEvent {
+        .hookReceived(HookEvent(
+            sessionId: sessionID, cwd: cwd, event: event, status: "processing",
+            observedAt: time.timeIntervalSince1970, source: "claude",
+            pid: nil, tty: nil, tool: name, toolInput: nil, toolUseId: id,
+            notificationType: nil, message: nil
+        ))
+    }
+
+    func testFailedSubagentContainerStopsTrackingWithoutCapturingLaterParentTool() async throws {
+        for name in ["Task", "Agent"] {
+            for completion in ["PostToolUse", "PostToolUseFailure"] {
+                let store = try store()
+                let start = Date().addingTimeInterval(-60)
+                await store.process(hook("UserPromptSubmit", at: start))
+                await store.process(toolHook("PreToolUse", tool: name, id: "child", at: start.addingTimeInterval(1)))
+                await store.process(toolHook(completion, tool: name, id: "child", at: start.addingTimeInterval(2)))
+                await store.process(toolHook("PreToolUse", tool: "Read", id: "parent-read", at: start.addingTimeInterval(3)))
+                let session = await store.session(for: sessionID)
+                XCTAssertEqual(status("child", in: session), completion == "PostToolUse" ? .success : .error)
+                XCTAssertFalse(try XCTUnwrap(session).subagentState.hasActiveSubagent)
+                XCTAssertEqual(status("parent-read", in: session), .running,
+                               "The next parent tool must retain its own top-level row")
+                XCTAssertEqual(session?.phase, .processing)
+                XCTAssertNil(session?.completedAt)
+            }
+        }
+    }
+
+    func testFailedInnerToolUpdatesNestedStatusAndKeepsContainerActive() async throws {
+        for completion in ["PostToolUse", "PostToolUseFailure"] {
+            let store = try store()
+            let start = Date().addingTimeInterval(-60)
+            await store.process(hook("UserPromptSubmit", at: start))
+            await store.process(toolHook("PreToolUse", tool: "Agent", id: "child", at: start.addingTimeInterval(1)))
+            await store.process(toolHook("PreToolUse", tool: "Read", id: "inner-read", at: start.addingTimeInterval(2)))
+            await store.process(toolHook(completion, tool: "Read", id: "inner-read", at: start.addingTimeInterval(3)))
+            let stored = await store.session(for: sessionID)
+            let session = try XCTUnwrap(stored)
+            let context = try XCTUnwrap(session.subagentState.activeTasks["child"])
+            XCTAssertEqual(context.subagentTools.first?.status, completion == "PostToolUse" ? .success : .error)
+            let parent = try XCTUnwrap(session.chatItems.first(where: { $0.id == "child" }))
+            guard case .toolCall(let tool) = parent.type else { return XCTFail("Missing Agent row") }
+            XCTAssertEqual(tool.subagentTools.first?.status, completion == "PostToolUse" ? .success : .error)
+            XCTAssertEqual(tool.status, .running)
+            XCTAssertEqual(session.phase, .processing)
+            XCTAssertNil(session.completedAt)
+        }
+    }
+
+    func testFailedContainerDoesNotStopAnotherActiveSubagent() async throws {
+        let store = try store()
+        let start = Date().addingTimeInterval(-60)
+        await store.process(hook("UserPromptSubmit", at: start))
+        await store.process(toolHook("PreToolUse", tool: "Agent", id: "survivor", at: start.addingTimeInterval(1)))
+        await store.process(toolHook("PreToolUse", tool: "Task", id: "failed", at: start.addingTimeInterval(2)))
+        await store.process(toolHook("PostToolUseFailure", tool: "Task", id: "failed", at: start.addingTimeInterval(3)))
+        await store.process(toolHook("PreToolUse", tool: "Read", id: "survivor-read", at: start.addingTimeInterval(4)))
+        let stored = await store.session(for: sessionID)
+        let session = try XCTUnwrap(stored)
+        XCTAssertEqual(Set(session.subagentState.activeTasks.keys), ["survivor"])
+        XCTAssertEqual(session.subagentState.activeTasks["survivor"]?.subagentTools.map(\.id), ["survivor-read"])
+        XCTAssertEqual(status("failed", in: session), .error)
+        XCTAssertEqual(status("survivor", in: session), .running)
+        XCTAssertEqual(session.phase, .processing)
+    }
+
     func testLateHistoryCannotCreateRunningToolAfterStop() async throws {
         let store = try store()
         let start = Date().addingTimeInterval(-60)
