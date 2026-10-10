@@ -65,6 +65,49 @@ Bridge 88 项、permission verifier 30 项、发布闸门通过，日志
 `/tmp/agent-notch-request-identity-release.log`。仍有既有 tmux await 及 AppIntents
 元数据提示；没有新增请求身份的 actor 隔离警告。
 
-Mac 2026-10-10 已由只读界面清单确认解锁；以上提交时还没有安装此版。
+Mac 2026-10-10 已由只读界面清单确认解锁；以上源码提交（c2bb316）时还没有安装此版。
 安装版和真实客户端验收仍须单独记录，不能从私有连接通过推出。
 生命周期完整矩阵继续保持未验收项。
+
+## 2026-10-10 后续安装与真实 CLI 对照
+
+源码 c2bb316 的 Release 已完成本机 ad-hoc 签名与 deep / strict 验证，
+不是公证发行。安装前用进程列表确认旧安装版不在运行、生产 socket 不存在；
+完整旧 bundle 移到 `/tmp/agent-notch-install-backup.OXHCIn/Agent Notch.app`，
+再安装新 bundle，没有删除旧版。该备份位于系统临时目录，不是永久归档。
+签名构建与 `/Applications/Agent Notch.app` 主二进制 SHA-256 一致：
+`5ba0d8b289fda272d552fa6a06b90d24ac8bd705200f54e0cc7e21b9dafc270a`。
+通过原生界面启动，新安装进程及权限为 0600 的生产 socket 随后出现。
+
+Claude Code 2.1.195 的真实交互 CLI 在独立临时目录运行；保留本机默认模型，
+仅提供 Bash 工具，使用子进程环境 `NOTCH_APPROVAL_MODE=ask` 及临时 settings
+对固定验收脚本要求人工审批。脚本只有 allow / deny 两分支，只在自己的临时
+目录建立执行标记并输出固定字符串，不读取项目、用户文件、网络或凭据。
+没有编辑持久化审批策略、Hook 或模型配置；CLI 自己的启动/退出与目录信任
+流程仍按正常交互执行。菜单全局默认保持“完全信任”，不把其显示当作此子进程的审批模式。
+
+| 事件（UTC） | allow 请求 | deny 请求 |
+| --- | --- | --- |
+| 助手 tool_use 记录 | 00:29:04.398 | 00:29:04.557 |
+| 刘海操作 | 允许当前列表中的精确 allow 命令 | 后续卡切到 deny 命令后点击拒绝 |
+| hook_permission_decision | 00:30:15.502，allow | 00:30:22.191，deny |
+| 精确工具结果 | 00:30:15.734，is_error false，固定成功标记 | 00:30:22.192，is_error true，Denied by user via Agent Notch |
+| 执行效果 | allow-executed 目录存在 | deny-executed 不存在 |
+
+原生 UI 直接观察了对应命令、允许后卡片切换、拒绝后审批卡消失。
+独立会话 JSONL 中两项工具 ID 各不相同，决策和结果均与各自工具 ID 精确匹配，
+没有额外工具或重试，最终回复在 00:30:23.346 明确报告允许执行、拒绝未执行。
+用 jq 只读抽取该文件的 tool_use / hook_permission_decision / tool_result /
+最终回复，并检查上述实际标记；不使用既有“双回合两条最终回复”检查器冒充
+这次“同回合双工具”的验证结果，也不提交原始会话日志到 GitHub。
+
+8:31:19 本地原生诊断为 Claude 等待输入、待审批 0、JSONL 监听器 0；
+Stop 已接受，迟到 SubagentStop 已忽略。测试 CLI `/exit` 正常 exit 0；
+8:32:20 刷新确认 SessionEnd 接受、测试会话已移除、待审批与监听均保持 0。
+关闭设置窗口，应用恢复正常紧凑展示；全屏显示选项仍为 on，没有修改该偏好。
+
+这次尝试要求并行输出两条工具，但诊断中只观察到 1 个挂起审批；第二条
+PreToolUse 到 00:30:15.756、第一条结果之后才出现。因此它证明修复版实际
+普通允许/拒绝回写、后续请求显示及完成清理，而不是双请求并存 FIFO。
+实际旧回调延迟、同键替代、发送失败/过期竞态仍仅由前述隔离测试覆盖。
+审批中重启、混合并行超时、全屏所有触发来源、多显示器和逐帧动画仍未完成。
