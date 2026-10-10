@@ -8,8 +8,13 @@
 - 新用户默认开启，保留原有显示行为；选择写入本地偏好，重启恢复。
 - 开关仅改变刘海窗口的全屏空间策略，不停止会话监听、任务或通知声音。
 - 使用 AppKit 的 `fullScreenAuxiliary` / `fullScreenNone`，保留跨桌面、层级与非激活面板行为。
+
 - 空间切换后若窗口不在活动空间，收起展开面板；点击、快捷键、辅助功能和自动展开均受同一展示条件限制，延迟焦点回调也不应再次激活窗口。
 - 返回可展示空间后，手动展开仍能恢复原聊天。
+
+以上记录为 2026-10-01 的实现；2026-10-10 已纠正关闭策略为 `fullScreenPrimary`，
+原因与回归见[全屏空间退出策略](2026-10-10-fullscreen-opt-out.md)。旧 `fullScreenNone`
+仅表示窗口自身不支持全屏，不应把它当作退出其他应用全屏空间的保证。
 
 没有新增全屏窗口扫描、屏幕录制权限、后台轮询或私有 API。
 窗口策略参考 [Apple 的全屏行为说明](https://developer.apple.com/documentation/appkit/nswindow/collectionbehavior-swift.struct/auxiliary)。

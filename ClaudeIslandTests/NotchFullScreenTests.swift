@@ -30,11 +30,15 @@ final class NotchFullScreenTests: XCTestCase {
         let preserved: NSWindow.CollectionBehavior = [
             .stationary, .canJoinAllSpaces, .ignoresCycle
         ]
+        // Cover migration from the old policy as well as both directions of
+        // repeated live preference changes. Never keep conflicting flags.
+        panel.collectionBehavior = preserved.union(.fullScreenNone)
         for shows in [false, true, false, true] {
             panel.setShowsInFullScreen(shows)
             XCTAssertEqual(panel.showsInFullScreen, shows)
             XCTAssertEqual(panel.collectionBehavior.contains(.fullScreenAuxiliary), shows)
-            XCTAssertEqual(panel.collectionBehavior.contains(.fullScreenNone), !shows)
+            XCTAssertEqual(panel.collectionBehavior.contains(.fullScreenPrimary), !shows)
+            XCTAssertFalse(panel.collectionBehavior.contains(.fullScreenNone))
             XCTAssertTrue(panel.collectionBehavior.isSuperset(of: preserved))
             XCTAssertEqual(
                 panel.allowsPresentationOnCurrentSpace,

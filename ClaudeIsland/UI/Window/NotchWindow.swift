@@ -22,8 +22,11 @@ class NotchPanel: NSPanel {
     func setShowsInFullScreen(_ shows: Bool) {
         showsInFullScreen = shows
         var behavior = collectionBehavior
-        behavior.remove([.fullScreenAuxiliary, .fullScreenNone])
-        behavior.insert(shows ? .fullScreenAuxiliary : .fullScreenNone)
+        // fullScreenNone disables this window's own full-screen support; it
+        // does not explicitly opt a floating panel out of another app's Space.
+        // AppKit recommends fullScreenPrimary for that opt-out behavior.
+        behavior.remove([.fullScreenAuxiliary, .fullScreenPrimary, .fullScreenNone])
+        behavior.insert(shows ? .fullScreenAuxiliary : .fullScreenPrimary)
         collectionBehavior = behavior
     }
 
